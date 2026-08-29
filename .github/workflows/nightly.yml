@@ -1,0 +1,57 @@
+name: Nightly
+
+# Test Plan §12.6's nightly gate: 10^6 fuzz seeds (via MUT-KILL-01's
+# directed search, Test Plan §14.2) plus the full ten-mutant matrix
+# (Test Plan §2.8), run on a schedule rather than on every push/PR
+# because a 10^6-trial directed search takes minutes, not seconds — an
+# order of magnitude too slow for the per-PR `ci`/`convergence`/
+# `properties` jobs. `workflow_dispatch` is here so this can be triggered
+# manually to confirm it actually runs, without waiting for the
+# schedule — per Phase 6's Definition of Done, that manual trigger still
+# needs to happen once this workflow is pushed and visible on GitHub;
+# Claude cannot push branches or invoke GitHub Actions itself.
+#
+# "A previously-killed mutant that newly survives is a coverage
+# regression and blocks the next merge" (Phase 6 Goal): enforced by
+# `pnpm test:mutation` itself failing whenever any mutant other than
+# M3_no_case_c survives every suite (see mutation.test.ts) — a red
+# nightly run is the signal; actually wiring that as a GitHub
+# branch-protection required check is the same kind of manual,
+# one-time repo-settings action already noted for the `convergence` and
+# `properties` jobs, and hasn't been done yet.
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  nightly-mutation-matrix:
+    name: Nightly mutation matrix + MUT-KILL-01 (10^6 trials)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Mutation matrix + MUT-KILL-01 at full budget
+        env:
+          MUT_KILL_01_BUDGET: "1000000"
+        run: pnpm test:mutation
+
+      - name: Upload mutation matrix report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-matrix
+          path: docs/mutation-matrix.md
