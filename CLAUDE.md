@@ -82,8 +82,15 @@ packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  seeds) and added src/property/ — the
                                                  five PROP-1..5 fast-check suites, run
                                                  via `pnpm test:properties`, plus a
-                                                 dependency on fast-check. Depends on
-                                                 engine.
+                                                 dependency on fast-check. Phase 5 added
+                                                 src/adversarial/ — all 22 hand-
+                                                 constructed ADV-01..22 cases (Test Plan
+                                                 §2.4) with literal expected outputs, run
+                                                 via `pnpm test:adversarial` (also swept
+                                                 into the default `pnpm test`, since
+                                                 unlike convergence/properties these are
+                                                 fast and deterministic — no isolation
+                                                 needed). Depends on engine.
 ```
 
 `protocol`, `server`, and `client` still each export one placeholder
@@ -265,10 +272,124 @@ test:convergence` passed with all ten invariants active across all
   `getTime` — Engine Spec §10.8 C9 names it explicitly alongside
   `Date.now`/`new Date`/`performance.now`, but neither existing
   mechanism had ever checked for it. Both now do.
+- **Phase 5** — The adversarial suite (Test Plan §2.4, ADV-01…ADV-22; §2.4.1's
+  all-orderings rule). `packages/testkit/src/adversarial/`: `support.ts`
+  (`forEachReplicaOrdering(roleCount, fn)` — generic permutation over N
+  distinct replica ids) and `adversarial.test.ts` — all 22 cases, each
+  with its expected output written as a literal string, not computed.
+
+  **This phase was built in two passes, and that matters for how much to
+  trust it.** The first pass was written without the real Test Plan §2.4
+  text — only a one-line-per-case description was available in that
+  session — so 15 of the 22 cases were Claude's own constructions
+  matching the category name, not the actual spec. The user then
+  supplied the real §2.4 table (case description + expected literal +
+  citation, verbatim) and asked for a case-by-case cross-check. That
+  check found **12 of the 15 self-derived cases were substantively
+  wrong** — wrong base document, wrong operation, or wrong expected
+  literal — and rewrote each one to match the table exactly, re-deriving
+  the correct literal by hand (tracing Case A/B/C and rank) before
+  writing the assertion, the same discipline as the Phase 3 traces. The
+  corrected file passed in full on the first run after rewriting — a
+  fact worth noting but not over-trusting, since a plausible reading of
+  a compact table can still miss a nuance the full source document would
+  have caught; the case-by-case correspondence below is close but has
+  not been independently re-verified against the table a second time.
+
+  **Cases confirmed correct on the first pass (5): ADV-01, 07, 08, 14, 22.**
+  **Cases with cosmetic-only fidelity fixes (4, no logic change):**
+  ADV-02/03 (delivery order changed to a genuine per-replica rotation,
+  matching "different rotation"/"8 distinct arrival rotations" — the
+  expected literal `AabcB`/`AabcdefghB` was already right); ADV-13 (kept
+  the same scenario, added a comment tying the skew value to the table's
+  "±5 minutes" framing — Lamport counters carry no time unit, Engine
+  Spec I0, so this is flavor, not a mechanism); ADV-17 (renamed the
+  dummy ordinary character from `f` to `x` to literally match the
+  table's `éx`, no behavior change).
+  **Cases that were substantively WRONG and rewritten (12):**
+  - ADV-04: was testing a self-invented "2 concurrent inserts + concurrent
+    delete, both orderings" scenario. Real case is Engine Spec §10.3's own
+    HELLO/delete-ELL/insert-x trace → `HxO` (no ordering-sensitivity —
+    delete and insert never compete via rank — so the all-orderings loop
+    was also dropped).
+  - ADV-05: base was `ABCDE` (5 chars); real case needs `ABCDEF` (6
+    chars) with `z` inserted between C and D inside a deleted C–D–E
+    range → `ABzF`, not the `AxE` the wrong base produced.
+  - ADV-06: base was `ABCDE`; real case needs `ABCDEFG` (7 chars) with
+    overlapping deletes B–D and C–E → `AFG`, not `A`.
+  - ADV-09: was backward-typing (`cbaX`) delivered in reverse with no
+    duplicates. Real case is plain forward-typed `ABC` delivered in
+    reverse causal order WITH interleaved duplicates (each op delivered
+    twice before its one missing dependency arrives) → `ABC`, buffer
+    drains to 0.
+  - ADV-10: was 2 replicas → `ab`. Real case is 3 replicas concurrently
+    first-inserting into an empty document → `XYZ`.
+  - ADV-11: was sequential (non-concurrent) inserts on one engine. Real
+    case is two replicas CONCURRENTLY inserting at position 0 and at EOF
+    of a shared base `MID` → `<MID>`.
+  - ADV-12: was a sequential delete-then-insert on one engine → `z`. Real
+    case is a concurrent full-document delete racing an insert of `!` →
+    `!` (the whole base is tombstoned, `!` is the sole survivor).
+  - ADV-15: was 3-way BACKWARD typing with distinct letters
+    (`cbazyx321X`). Real case is 3-way FORWARD typing (append), each
+    replica repeating its OWN letter, from an empty document → `AAABBBCCC`
+    — a materially different mechanism (Case C's break-on-foreign-origin,
+    not Case B's nested-group handling) that happens to share ADV-14's
+    "ascending id ends up leftmost" directionality by coincidence, not
+    because it's the same code path.
+  - ADV-16: was an unrelated "two replicas with incomparable knowledge"
+    scenario (`ApBqCr`). Real case is exactly "B saw half of A's run":
+    A types `ab`, sends it to B, then A continues with `cd` while B
+    concurrently continues with `xy` from the same `ab` → `abxycd`,
+    explicitly exercising Case A line 13's originRight-equality test
+    (which evaluates false here — same left origin, open/null right
+    origins on both sides — correctly falling through to "keep scanning"
+    rather than breaking early).
+  - ADV-18: had an extra, invented third "ordinary character" competitor
+    that isn't in the real scenario. Real case is exactly two concurrent
+    combining marks on one base, nothing else — rewritten to check
+    convergence, both-marks-retained, and base-intact, still in both
+    replica-id orderings per §2.4.1's general rule (order between the two
+    marks depends on id even though the table doesn't print a specific
+    literal for it).
+  - ADV-20: was a self-invented "tangled nested concurrent inserts never
+    invert position" structural-invariant check (result `AprsqZ`). Real
+    case is entirely different: an insert whose originRight-referencing
+    message arrives at a receiver BEFORE its originLeft-referencing
+    message — verified via explicit delivery order, asserting the op sits
+    in `pending` (buffered) until the last dependency arrives, then
+    drains to convergence.
+  - ADV-21: was "undelete restores a deleted node, and is a no-op on an
+    already-visible node" — the opposite semantic. Real case is "undelete
+    of a node LATER deleted again by another user is a no-op": delete →
+    undelete → a causally-LATER second delete wins, net effect unchanged
+    from before the undelete — verified on two replicas receiving the
+    same three operations in different arrival orders, confirming the
+    causal id (not delivery order) decides.
+
+  **DoD verification performed and reverted**: temporarily changed
+  `rank()` in `engine.ts` to `[1, n.id.r]` (dropping the binding
+  component entirely). Re-ran `pnpm test:adversarial`: ADV-17 and ADV-19
+  each failed on exactly one of their two `forEachReplicaOrdering`
+  iterations — the one where the marked/ZWJ role landed on the
+  HIGHER-numbered replica — while the other iteration passed by sheer
+  coincidence (both roles now rank purely by id, and the lower-id role
+  happened to be the mark that time). This is exactly Engine Spec §10.8's
+  documented failure shape, which is the entire reason §2.4.1 mandates
+  testing both orderings rather than one. Reverted immediately after
+  confirming.
+  New command `pnpm test:adversarial`
+  (`packages/testkit/vitest.adversarial.config.ts`). Unlike
+  convergence/properties, NOT excluded from the default `pnpm test` —
+  22 deterministic cases run in under a second, so there's no runtime
+  reason to isolate them, and the file is picked up by both commands.
+  Wired into CI as an explicit named step inside the main `ci` job (not
+  a separate job — no isolated runtime budget to justify one) right
+  after the general `pnpm test` step.
 
 ## Current phase in progress
 
-None — Phase 4 complete, awaiting Phase 5.
+None — Phase 5 complete, awaiting Phase 6.
 
 ## What is explicitly NOT yet built
 
@@ -279,11 +400,24 @@ collection (Phase 21); block run-length encoding (later, alongside GC). No
 wire protocol; no server (no Express app, no WebSocket gateway, no
 database schema, no auth); no client (no React app, no editor binding, no
 DOM rendering); no persistence; no permissions; no offline/reconciliation
-logic; no presence; no version history; no adversarial suite (Phase 5),
-no mutation testing (Phase 6), no 10⁶ nightly fuzz run (Phase 6); no
-Docker setup; no deployed environment.
+logic; no presence; no version history; no mutation testing (Phase 6), no
+10⁶ nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
 
 ## Key technical decisions with source citations
+
+- **Phase 5's adversarial suite was corrected against the real Test Plan
+  §2.4 table after an initial pass built without it.** The first pass
+  (no §2.4 text available that session) guessed 15 of 22 scenarios from
+  one-line category descriptions; a cross-check against the actual table
+  (pasted by the user afterward) found 12 of those 15 substantively
+  wrong — see the Phase 5 completed-phase entry above for the full
+  per-case list of what changed and why. The lesson worth keeping: "all
+  N cases passed on the first run" is NOT evidence a self-invented test
+  matches an unseen spec — it only proves the code and the test agree,
+  which is expected when the same reasoning produced both. Treat a
+  green suite built without the source document as unverified until it's
+  actually been checked against that document, no matter how confident
+  the derivation felt at the time.
 
 - **How each of the ten invariants is actually checked by `assertInvariants()`** — several are NOT a literal restatement of their Engine Spec §5 sentence, because that sentence describes something only checkable with history, or only checkable at prohibitive cost every call:
   - **I0** (clock advances exactly once per mint) is checked by REPLAYING a
@@ -522,13 +656,15 @@ pnpm test              # Vitest, all packages EXCEPT the convergence + property 
 pnpm test:watch        # Vitest, watch mode
 pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each, invariants active
 pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
+pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 ```
 
-`pnpm test` currently passes: 32 tests across 9 files, including
+`pnpm test` currently passes: 54 tests across 10 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
-insert/delete round-trip) and
+insert/delete round-trip), `packages/testkit/src/adversarial/
+adversarial.test.ts` (22 tests — see the Phase 5 entry above), and
 `packages/testkit/src/fuzz/harness.selftest.test.ts`, which proves the
 fuzz harness itself works (detects a deliberately broken toy engine as
 divergent, and completes 10,000 toy-engine seeds in ~2s, well under the
@@ -552,3 +688,10 @@ independent source-grep test confirming `packages/engine/src` contains
 no `Date.now`/`new Date`/`performance.now`/`getTime` (Engine Spec §10.8
 C9). Wired into CI as its own job (`properties`), for the same reasons as
 `convergence` — its own runtime budget, its own named check.
+
+`pnpm test:adversarial` currently PASSES: all 22 ADV-01…22 cases (Test
+Plan §2.4), each asserting a literal expected output. Runs in well under
+a second, so — unlike convergence/properties — it is NOT excluded from
+the default `pnpm test`; it has its own command purely for an isolated,
+unambiguous signal, and is wired into CI as an explicit named step inside
+the main `ci` job (not a separate job).

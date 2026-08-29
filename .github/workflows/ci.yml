@@ -38,6 +38,14 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # Not a separate job (unlike convergence/properties below): the 22
+      # adversarial cases (Test Plan §2.4) are fast and deterministic, so
+      # they already ran as part of `pnpm test` above. This step exists
+      # only to give them their own named, explicit CI signal, per the
+      # Phase 5 Definition of Done, without paying for a second runner.
+      - name: Adversarial suite (ADV-01..22)
+        run: pnpm test:adversarial
+
   # Separate job (not a step in `ci` above) so GitHub reports it as its own
   # named check — that's what a branch-protection "required status check"
   # picker selects from. This suite is EXPECTED to fail until Phase 3

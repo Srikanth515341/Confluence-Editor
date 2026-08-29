@@ -12,13 +12,14 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 4 — invariant assertions and property-based tests.** All ten
-Engine Spec §5 invariants (I0–I9) are now enforced at runtime via
-`assertInvariants()`, checked after every mutating call throughout the
-entire convergence suite (60,000 seeds, zero violations). Five
-fast-check property tests (PROP-1…5 — commutativity, idempotence, order
-independence, partial-knowledge subsequence, clock-skew invariance) each
-run 10,000 generated cases via `pnpm test:properties`.
+🚧 **Phase 5 — the adversarial suite.** All 22 hand-constructed cases
+from Test Plan §2.4 (ADV-01…ADV-22) now pass, each with a literal
+expected output derived by hand rather than computed: concurrent inserts
+at k=2/3/8, tombstone-anchored inserts, split/overlapping deletes,
+reverse-causal delivery, empty-document and boundary edge cases,
+backward-typing runs, combining marks and zero-width joiners (each
+checked in every replica-id ordering, per Test Plan §2.4.1), and
+block-compressible identifier runs.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -85,6 +86,19 @@ partial-knowledge subsequence guarantee, and clock-skew invariance — plus
 an independent source-grep confirming the engine never reads a wall
 clock.
 
+### The adversarial suite
+
+```bash
+pnpm test:adversarial
+```
+
+22 hand-constructed cases (Test Plan §2.4) that randomized fuzzing isn't
+aimed at finding on its own — three-way backward-typing runs, a
+combining mark racing an ordinary character for the same anchor,
+tangled nested concurrent inserts, and more. Fast and deterministic, so
+unlike the two suites above it also runs as part of the default
+`pnpm test`.
+
 ## Feature status
 
 | Area                                    | Status                                                                     |
@@ -93,6 +107,7 @@ clock.
 | Convergence test harness (fuzz)         | ✅ Phase 2 (now passing against the real engine, not just the toy engine)  |
 | OBSEQ convergence engine                | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet) |
 | Invariant assertions + property tests   | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)            |
+| Adversarial suite                       | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)           |
 | Wire protocol                           | ⏳ not started                                                             |
 | Server (coordinator, persistence, auth) | ⏳ not started                                                             |
 | Client (editor binding, presence)       | ⏳ not started                                                             |
