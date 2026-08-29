@@ -9,7 +9,7 @@
 export type { Identifier } from "./identifier.js";
 export { compareIds } from "./identifier.js";
 export type { Node } from "./node.js";
-export type { Operation } from "./operation.js";
+export type { DeleteOperation, InsertOperation, Operation, UndeleteOperation } from "./operation.js";
 export { isClusterContinuing } from "./grapheme.js";
 export { Engine } from "./engine.js";
 export type { EngineStats } from "./engine.js";

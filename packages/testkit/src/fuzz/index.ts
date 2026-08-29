@@ -11,7 +11,7 @@ export {
   ALL_CONFIGS,
 } from "./configs.js";
 export { createToyAdapter } from "./toyAdapter.js";
-export { createEngineAdapter, NotImplementedError } from "./engineAdapter.js";
+export { createEngineAdapter } from "./engineAdapter.js";
 export { runTrial, runFuzzSuite } from "./runTrial.js";
 export type {
   TrialOutcome,

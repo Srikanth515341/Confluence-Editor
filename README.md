@@ -12,13 +12,13 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 2 — the convergence test harness and CI gate.** The randomized
-interleaving harness now exists and is proven against a deliberately wrong
-toy engine — but the real `integrate()` algorithm doesn't exist yet
-(Phase 3), so `pnpm test:convergence` currently and correctly **fails**.
-This ordering is deliberate: the harness was built first, as a working
-oracle, so the algorithm gets written against it rather than the other
-way around.
+🚧 **Phase 3 — operation semantics and origin-bounded integration.** The
+real `integrate()` algorithm (Engine Spec §4.3) now exists: Insert/Delete/
+Undelete operations, causal readiness and buffering, and the origin-bounded
+placement algorithm that resolves concurrent inserts without ever
+consulting arrival order. `pnpm test:convergence` now **passes** — all six
+required configurations converge across 10,000 seeds each, with zero
+divergences and zero stranded operations.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -64,26 +64,23 @@ This is the suite the entire product's correctness claim rests on — see
 the Test Plan (§2) for what "converged" means and how it is checked. It
 runs six required randomized-interleaving configurations (Test Plan §2.2)
 at 10,000 seeds each, and is deliberately kept **separate** from the
-ordinary `pnpm test` run (it has its own vitest config) because, right
-now, it is **expected to fail**: `integrate()` — the algorithm that
-actually makes replicas converge — doesn't exist yet (Phase 3). The
-harness itself is proven correct against a deliberately-wrong toy engine
-in `pnpm test`, so this isn't "the tests are broken" — it's "the harness
-correctly reports that nothing has been built yet."
+ordinary `pnpm test` run (it has its own vitest config). As of Phase 3 it
+**passes**: 60,000 total trials across C1–C6, zero divergences, zero
+stranded (permanently-pending) operations.
 
 ## Feature status
 
-| Area                                    | Status                                                                |
-| --------------------------------------- | --------------------------------------------------------------------- |
-| Repository / toolchain / CI             | ✅ Phase 0                                                            |
-| Convergence test harness (fuzz)         | ✅ Phase 2 (proven against a toy engine; real suite fails on purpose) |
-| OBSEQ convergence engine                | 🔧 Phase 1 (data types + identifiers; no `integrate()` yet)           |
-| Wire protocol                           | ⏳ not started                                                        |
-| Server (coordinator, persistence, auth) | ⏳ not started                                                        |
-| Client (editor binding, presence)       | ⏳ not started                                                        |
-| Offline & reconciliation                | ⏳ not started                                                        |
-| Permissions                             | ⏳ not started                                                        |
-| Version history                         | ⏳ not started                                                        |
+| Area                                    | Status                                                                    |
+| --------------------------------------- | -------------------------------------------------------------------------- |
+| Repository / toolchain / CI             | ✅ Phase 0                                                                |
+| Convergence test harness (fuzz)         | ✅ Phase 2 (now passing against the real engine, not just the toy engine) |
+| OBSEQ convergence engine                | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet) |
+| Wire protocol                           | ⏳ not started                                                            |
+| Server (coordinator, persistence, auth) | ⏳ not started                                                            |
+| Client (editor binding, presence)       | ⏳ not started                                                            |
+| Offline & reconciliation                | ⏳ not started                                                            |
+| Permissions                             | ⏳ not started                                                            |
+| Version history                         | ⏳ not started                                                            |
 
 ## License
 

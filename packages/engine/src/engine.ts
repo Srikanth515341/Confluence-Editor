@@ -1,12 +1,39 @@
 import type { Identifier } from "./identifier.js";
+import { compareIds, serializeId } from "./identifier.js";
 import type { Node } from "./node.js";
-import type { Operation } from "./operation.js";
+import type { DeleteOperation, InsertOperation, Operation, UndeleteOperation } from "./operation.js";
+import { isClusterContinuing } from "./grapheme.js";
 
 /** Structural metrics feeding PRD M8 / RFC §7.8's tombstone-ratio observability. */
 export interface EngineStats {
   readonly totalElements: number;
   readonly tombstones: number;
   readonly visibleLength: number;
+}
+
+/**
+ * Disambiguator rank (Engine Spec Definition 4.2). Binding rank precedes
+ * replica id so a combining mark always sorts nearer its base than a
+ * concurrently-inserted ordinary character. Engine Spec I8; the failure
+ * is order-dependent and invisible in one of two replica-id orderings — §10.8.
+ */
+function rank(n: Node): readonly [number, number] {
+  return [n.bind ? 0 : 1, n.id.r];
+}
+
+/** Negative iff `a` outranks `b` (sorts nearer the left origin). */
+function compareRank(a: Node, b: Node): number {
+  const ra = rank(a);
+  const rb = rank(b);
+  return ra[0] !== rb[0] ? ra[0] - rb[0] : ra[1] - rb[1];
+}
+
+/** Identifier equality, treating `null` (⊥, a structure boundary) as equal only to itself. */
+function sameOrigin(a: Identifier | null, b: Identifier | null): boolean {
+  if (a === null || b === null) {
+    return a === b;
+  }
+  return compareIds(a, b) === 0;
 }
 
 /**
@@ -118,5 +145,257 @@ export class Engine {
       tombstones,
       visibleLength: this.nodes.length - tombstones,
     };
+  }
+
+  private nodeById(id: Identifier | null): Node | null {
+    if (id === null) {
+      return null;
+    }
+    return this.byKey.get(serializeId(id)) ?? null;
+  }
+
+  private isOriginPresent(id: Identifier | null): boolean {
+    return id === null || this.byKey.has(serializeId(id));
+  }
+
+  /**
+   * Index of the node identified by `id` within `this.nodes`. Only ever
+   * called on an origin that `ready()` has already confirmed present —
+   * the thrown error documents that precondition rather than being a
+   * reachable runtime case.
+   */
+  private indexOfOrigin(id: Identifier): number {
+    const node = this.byKey.get(serializeId(id));
+    if (node === undefined) {
+      throw new Error(
+        `integrate(): origin ${serializeId(id)} is not present — ready() must be checked before integrating`,
+      );
+    }
+    return this.nodes.indexOf(node);
+  }
+
+  /** Causal readiness (Engine Spec Definition 4.1). */
+  private ready(op: Operation): boolean {
+    if (op.kind === "insert") {
+      return this.isOriginPresent(op.originLeft) && this.isOriginPresent(op.originRight);
+    }
+    return this.byKey.has(serializeId(op.target));
+  }
+
+  /**
+   * Origin-bounded integration (Engine Spec §4.3). Places `node` into
+   * `this.nodes` at the position the total order requires, scanning only
+   * the region strictly between its origins and resolving every
+   * concurrent insert anchored there without ever consulting arrival
+   * order — see Engine Spec §10.1–§10.8 for the worked traces this
+   * algorithm is checked against.
+   */
+  private integrate(node: Node): void {
+    const leftIndex = node.originLeft === null ? -1 : this.indexOfOrigin(node.originLeft);
+    const rightIndex = node.originRight === null ? this.nodes.length : this.indexOfOrigin(node.originRight);
+
+    if (leftIndex + 1 === rightIndex) {
+      // Nothing currently sits between our origins — no conflict to resolve.
+      this.nodes.splice(leftIndex + 1, 0, node);
+      return;
+    }
+
+    let destIndex = leftIndex + 1;
+    const scanned = new Set<Node>();
+    const conflicting = new Set<Node>();
+
+    for (let i = leftIndex + 1; i < rightIndex; i++) {
+      const other = this.nodes[i];
+      if (!other) {
+        break;
+      }
+      scanned.add(other);
+      conflicting.add(other);
+
+      if (sameOrigin(node.originLeft, other.originLeft)) {
+        // Case A: `other` was anchored at the same left origin as `node`.
+        if (compareRank(other, node) < 0) {
+          destIndex = i + 1;
+          conflicting.clear();
+        } else if (sameOrigin(node.originRight, other.originRight)) {
+          // Case A line 13: the originRight equality test. This is what prevents two users'
+          // concurrently-typed runs from interleaving character-by-character. Without it,
+          // the RFC's prototype produced "[zcybxa]" instead of "[cbazyx]" — convergent but
+          // intention-violating. Engine Spec §4.3, resolved as RFC NQ-2; trace at §10.7.
+          break;
+        }
+        // else: same left origin, different right origin, `other` outranks `node` —
+        // still undetermined, keep scanning without moving destIndex.
+      } else {
+        const otherOriginNode = this.nodeById(other.originLeft);
+        if (otherOriginNode !== null && scanned.has(otherOriginNode)) {
+          // Case B (nested inside scanned region): the group set test.
+          if (!conflicting.has(otherOriginNode)) {
+            destIndex = i + 1;
+            conflicting.clear();
+          }
+          // else: `other`'s origin is itself still an undetermined member of the
+          // current conflict group — stays undecided, keep scanning.
+        } else {
+          // Case C: `other`'s origin lies outside this conflict group entirely.
+          break;
+        }
+      }
+    }
+
+    this.nodes.splice(destIndex, 0, node);
+  }
+
+  private applyInsert(op: InsertOperation): void {
+    const node: Node = {
+      id: op.id,
+      value: op.value,
+      originLeft: op.originLeft,
+      originRight: op.originRight,
+      bind: op.bind,
+      deleted: false,
+      deletedBy: null,
+    };
+    this.byKey.set(serializeId(op.id), node);
+    this.integrate(node);
+  }
+
+  /**
+   * Causally-latest deletedBy rule (Engine Spec §4.5 line 3): concurrent
+   * deletes of the same node all tombstone it, but attribution — needed
+   * for undo's resurrection question, §9.3 — goes to whichever delete is
+   * causally latest under the identifier total order, never to whichever
+   * delete simply arrived last.
+   */
+  private applyDelete(op: DeleteOperation): void {
+    const node = this.nodeById(op.target);
+    if (node === null) {
+      throw new Error(`applyDelete(): target ${serializeId(op.target)} is not present`);
+    }
+    node.deleted = true;
+    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
+      node.deletedBy = op.id;
+    }
+  }
+
+  /**
+   * Structural inverse of applyDelete, using the same causally-latest
+   * comparison. Full resurrection semantics (interaction with redo
+   * history) are Phase 36 (Engine Spec §9.3) — this is deliberately the
+   * minimal shape that makes the operation type usable end to end.
+   */
+  private applyUndelete(op: UndeleteOperation): void {
+    const node = this.nodeById(op.target);
+    if (node === null) {
+      throw new Error(`applyUndelete(): target ${serializeId(op.target)} is not present`);
+    }
+    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
+      node.deleted = false;
+      node.deletedBy = null;
+    }
+  }
+
+  private doApply(op: Operation): void {
+    this.observe(op.id.c);
+    switch (op.kind) {
+      case "insert":
+        this.applyInsert(op);
+        break;
+      case "delete":
+        this.applyDelete(op);
+        break;
+      case "undelete":
+        this.applyUndelete(op);
+        break;
+    }
+    this.applied.add(serializeId(op.id));
+  }
+
+  /**
+   * Drains `pending` to a fixpoint. Applying one operation can satisfy the
+   * causal dependency of another that arrived earlier and was buffered, so
+   * a single pass is not sufficient (Engine Spec §4.2) — this loop keeps
+   * sweeping until a full pass makes no progress.
+   */
+  private drain(): void {
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (let i = this.pending.length - 1; i >= 0; i--) {
+        const op = this.pending[i];
+        if (!op) {
+          continue;
+        }
+        if (this.applied.has(serializeId(op.id))) {
+          // Already applied via another (duplicate) delivery — discard.
+          this.pending.splice(i, 1);
+          progressed = true;
+        } else if (this.ready(op)) {
+          this.doApply(op);
+          this.pending.splice(i, 1);
+          progressed = true;
+        }
+      }
+    }
+  }
+
+  /**
+   * Applies a remote operation. Idempotent: re-delivering an operation
+   * whose id has already been applied is a no-op (Engine Spec §6.3).
+   * `buffered: true` means the operation's causal dependencies were unmet
+   * and it was queued rather than applied — normal, never an error
+   * (Engine Spec §4.2).
+   */
+  applyRemote(op: Operation): { readonly buffered: boolean } {
+    if (this.applied.has(serializeId(op.id))) {
+      return { buffered: false };
+    }
+    if (this.ready(op)) {
+      this.doApply(op);
+      this.drain();
+      return { buffered: false };
+    }
+    this.pending.push(op);
+    return { buffered: true };
+  }
+
+  /** Mints and applies a local insert, returning the operation to broadcast (API Spec §1.4). */
+  localInsert(visibleIndex: number, value: number, bind: boolean = isClusterContinuing(value)): InsertOperation {
+    const vis = this.visible();
+    const leftNode = visibleIndex > 0 ? vis[visibleIndex - 1] : undefined;
+    const rightNode = visibleIndex < vis.length ? vis[visibleIndex] : undefined;
+    const op: InsertOperation = {
+      kind: "insert",
+      id: this.mint(),
+      value,
+      originLeft: leftNode ? leftNode.id : null,
+      originRight: rightNode ? rightNode.id : null,
+      bind,
+    };
+    this.applyInsert(op);
+    this.applied.add(serializeId(op.id));
+    return op;
+  }
+
+  /**
+   * Mints and applies up to `count` local deletes starting at
+   * `visibleIndex` (against the visible sequence as it stood when this
+   * call began), returning one operation per removed unit with
+   * consecutive counters in return order (API Spec §1.4).
+   */
+  localDelete(visibleIndex: number, count: number): readonly DeleteOperation[] {
+    const vis = this.visible();
+    const ops: DeleteOperation[] = [];
+    for (let k = 0; k < count; k++) {
+      const target = vis[visibleIndex + k];
+      if (!target) {
+        break;
+      }
+      const op: DeleteOperation = { kind: "delete", id: this.mint(), target: target.id };
+      this.applyDelete(op);
+      this.applied.add(serializeId(op.id));
+      ops.push(op);
+    }
+    return ops;
   }
 }
