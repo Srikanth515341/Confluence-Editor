@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
     "test:convergence": "vitest run --config vitest.convergence.config.ts",
-    "test:properties": "vitest run --config vitest.properties.config.ts"
+    "test:properties": "vitest run --config vitest.properties.config.ts",
+    "test:adversarial": "vitest run --config vitest.adversarial.config.ts"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*"
