@@ -12,10 +12,11 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 0 — repository and process foundation.** No feature code exists
-yet. This phase establishes the monorepo, the toolchain, and the structural
-boundaries (engine purity, DomWriter chokepoint, append-only log, etc.) that
-every later phase is built against.
+🚧 **Phase 1 — engine core: nodes, identifiers, and the clock.** The
+OBSEQ engine's data types (`Identifier`, `Node`) and identifier generation
+(`mint()`/`observe()`, Engine Spec §3) now exist and are unit-tested. The
+actual `integrate()` algorithm — the part that makes two replicas converge —
+is not built yet; that's Phase 3.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -65,16 +66,16 @@ Test Plan (§2) for what "converged" means and how it is checked.
 
 ## Feature status
 
-| Area                                    | Status         |
-| --------------------------------------- | -------------- |
-| Repository / toolchain / CI             | ✅ Phase 0     |
-| OBSEQ convergence engine                | ⏳ not started |
-| Wire protocol                           | ⏳ not started |
-| Server (coordinator, persistence, auth) | ⏳ not started |
-| Client (editor binding, presence)       | ⏳ not started |
-| Offline & reconciliation                | ⏳ not started |
-| Permissions                             | ⏳ not started |
-| Version history                         | ⏳ not started |
+| Area                                    | Status                                                      |
+| --------------------------------------- | ----------------------------------------------------------- |
+| Repository / toolchain / CI             | ✅ Phase 0                                                  |
+| OBSEQ convergence engine                | 🔧 Phase 1 (data types + identifiers; no `integrate()` yet) |
+| Wire protocol                           | ⏳ not started                                              |
+| Server (coordinator, persistence, auth) | ⏳ not started                                              |
+| Client (editor binding, presence)       | ⏳ not started                                              |
+| Offline & reconciliation                | ⏳ not started                                              |
+| Permissions                             | ⏳ not started                                              |
+| Version history                         | ⏳ not started                                              |
 
 ## License
 
