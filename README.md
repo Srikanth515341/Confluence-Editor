@@ -12,26 +12,22 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 7 — binary wire codec.** `packages/protocol` implements the
-full OPS-channel binary format, verified field-by-field against the real
-API/Protocol/Data Spec v1.0 text after an initial pass built without it
-(§1.3–§1.4, §3.1, §3.2, §3.5) — several mismatches were found and fixed,
-including an invented frame-level flags byte that isn't in the spec.
-LEB128 varints, the stamp/string/uuid/scalar primitives, the exact
-3-byte envelope (protocolVersion, channel, messageType — payload starts
-immediately at offset 3, no extra byte), and all seven OPS message types
-with spec-exact numeric values, including OP_INSERT_RUN/OP_DELETE_BATCH
-expansion into real engine operations and OP_ACK/OP_REJECT as
-server-only batch messages. There is no separate operation UUID anywhere
-on the wire — the OBSEQ identifier itself (`counter`, `replica`) is the
-operation's identity. Malformed frames (reserved flag bits, a nonzero
-client `seq`, a client-origin OP_ACK/OP_REJECT, a run/batch below its
-minimum count, an unknown message type or reject reason,
-truncated/trailing bytes) are rejected with a specific, typed error,
-never a crash. A single insert at counters near 50,000 measures exactly
-18 bytes, matching spec §1.3. CONTROL/PRESENCE message types and the
-socket itself are still not built (Phases 9, 31, 8) — nothing yet sends
-a frame anywhere.
+🚧 **Phase 8 — WebSocket gateway and Document Coordinator (in-memory).**
+`packages/server` now runs an Express + WebSocket server: the gateway
+accepts connections at `/v1/rt` (subprotocol `obseq.v1`, binary frames
+only — a text frame closes with code 1003), binds each socket to one
+document, and routes every inbound operation through a per-document
+`DocumentCoordinator` running the same OBSEQ engine as clients (replica
+id 0, reserved for the server). Operations are decoded, applied,
+re-stamped with a server-assigned sequence number, and broadcast to
+every other connected peer — proved with real `ws` client connections
+(no browser, no mocks) exchanging operations and converging. Each
+connection maintains three fully separate physical send queues — OPS,
+CONTROL, PRESENCE — drained in strict priority order, never a single
+FIFO with a priority field. Persistence, acks, auth, presence, and the
+real connection handshake are still not built (Phases 9, 15-17, 26-29,
+31) — state is in-memory only and lost on restart, which is correct for
+this phase.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -139,8 +135,8 @@ runs this at full scale on a schedule.
 | Adversarial suite                       | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)           |
 | Mutation testing + nightly CI gate      | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th) |
 | Binary wire codec (OPS channel)         | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)       |
-| Socket / CONTROL / PRESENCE channels    | ⏳ not started (Phases 8, 9, 31)                                          |
-| Server (coordinator, persistence, auth) | ⏳ not started                                                             |
+| WebSocket gateway + Document Coordinator| ✅ Phase 8 (in-memory; real handshake/CONTROL/PRESENCE not built yet)     |
+| Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
 | Client (editor binding, presence)       | ⏳ not started                                                             |
 | Offline & reconciliation                | ⏳ not started                                                             |
 | Permissions                             | ⏳ not started                                                             |
