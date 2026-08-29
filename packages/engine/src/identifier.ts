@@ -26,3 +26,8 @@ export function compareIds(a: Identifier, b: Identifier): number {
   }
   return a.r - b.r;
 }
+
+/** Serializes an identifier to a stable map key. Engine Spec §2.2's K map is keyed on exactly this. */
+export function serializeId(id: Identifier): string {
+  return `${id.c}:${id.r}`;
+}

@@ -31,18 +31,27 @@ GitHub Actions (CI).
 
 ## Current architecture state
 
-Monorepo (pnpm workspaces), five packages, all currently placeholder
-scaffolding only — no feature code exists yet:
+Monorepo (pnpm workspaces), five packages. `engine` and `testkit` now
+contain real feature code (Phases 1–3); `protocol`, `server`, and `client`
+are still placeholder scaffolding only:
 
 ```
 packages/engine      @collab-editor/engine    — OBSEQ. Phase 1 built the data types
                                                  (Identifier, Node), MINT/OBSERVE,
                                                  isClusterContinuing, and the Engine
-                                                 class shell (visible/text/stats; no
-                                                 integrate() yet). Pure: no DOM, no
-                                                 network, no storage, no clock. Only
-                                                 package whose tsconfig excludes "DOM"
-                                                 from lib.
+                                                 class shell. Phase 3 built the
+                                                 Insert/Delete/Undelete operation
+                                                 union, ready()/applyRemote()/drain()
+                                                 (causal readiness + buffering to a
+                                                 fixpoint), integrate() (the
+                                                 origin-bounded placement algorithm,
+                                                 Engine Spec §4.3, Cases A/B/C), and
+                                                 localInsert()/localDelete(). No index
+                                                 (§8.5) yet — position lookup during
+                                                 integrate() is a linear scan. Pure: no
+                                                 DOM, no network, no storage, no clock.
+                                                 Only package whose tsconfig excludes
+                                                 "DOM" from lib.
 packages/protocol    @collab-editor/protocol  — binary wire codec + message types,
                                                  shared by client and server.
 packages/server      @collab-editor/server    — Express + WebSocket gateway,
@@ -56,12 +65,18 @@ packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
                                                  randomized-interleaving convergence
-                                                 harness (src/fuzz/). Depends on engine.
+                                                 harness (src/fuzz/). Phase 3 wired
+                                                 engineAdapter.ts to the real Engine
+                                                 (no more NotImplementedError) — the
+                                                 convergence suite now runs against a
+                                                 real, not throwaway, oracle. Depends
+                                                 on engine.
 ```
 
-Each package currently exports one placeholder constant and has one trivial
-passing test, purely to prove the toolchain (build/lint/typecheck/test)
-works end-to-end across the whole workspace before any real code is written.
+`protocol`, `server`, and `client` still each export one placeholder
+constant with one trivial passing test, purely proving the toolchain
+(build/lint/typecheck/test) works end-to-end across the whole workspace
+ahead of their own real code.
 
 ## Completed phases
 
@@ -121,18 +136,76 @@ is not implemented yet`). `tests/regression/README.md` documents the
   never-built `dist/`, because Phase 2 was the first phase to actually
   import one workspace package from another (`testkit` → `engine`) and
   that import failed typecheck until this was fixed.
+- **Phase 3** — Operation semantics and origin-bounded integration: the
+  intellectual core of the system. In `packages/engine/src/operation.ts`:
+  the real `Insert`/`Delete`/`Undelete` operation union (Engine Spec
+  §4.1) — no operation carries a numeric index; inserts anchor on
+  `originLeft`/`originRight` identifiers, deletes/undeletes on a
+  `target` identifier. In `packages/engine/src/engine.ts`: `ready(op)`
+  (Definition 4.1 — an insert needs both origins present, a delete/
+  undelete needs its target present); `applyRemote(op)` (idempotent via
+  the `applied` id set, buffers into `pending` when not ready);
+  `drain()` (sweeps `pending` to a fixpoint — one pass is not enough,
+  since applying one op can ready another); `integrate(node)` (Engine
+  Spec §4.3's origin-bounded placement algorithm — Cases A/B/C below);
+  `applyDelete`/`applyUndelete` (§4.5's causally-latest `deletedBy` rule
+  — every concurrent delete tombstones the node, but attribution goes to
+  whichever delete is causally latest under `compareIds`, never
+  whichever arrived last); `localInsert()`/`localDelete()` (mint +
+  apply + return the broadcast operation(s), consecutive counters in
+  return order). `rank(n) = [n.bind ? 0 : 1, n.id.r]` per Definition 4.2.
+  `packages/engine/src/identifier.ts` gained `serializeId()`, the map-key
+  function `byKey`/`applied` are keyed on. `packages/testkit/src/fuzz/
+  engineAdapter.ts` now wires `localInsert`/`localDelete`/`applyRemote`
+  straight through to the real `Engine` — `NotImplementedError` is gone
+  from the codebase entirely (deleted from `engineAdapter.ts` and its
+  re-export in `fuzz/index.ts`), because there is no longer anything for
+  it to guard. 5 new hand-verification tests added to
+  `packages/engine/src/engine.test.ts`, one per named worked trace: §10.1
+  (`AabB`, concurrent same-window inserts), §10.3 (`HxO`, concurrent
+  delete-heavy + insert), §10.7 (`cbazyxX`, backward-typing contiguity —
+  the trace the Case A originRight-equality test exists for), §10.5
+  (reverse-causal delivery with duplicates drains to zero pending), plus
+  one longer round-trip sanity check. `pnpm test:convergence` now
+  **passes**: 60,000 trials (10,000 seeds × 6 configs), 0 divergences, 0
+  stuck-pending, 0 errors. No fuzz failure was encountered during this
+  phase, so `tests/regression/` gained no new entries.
+
+  The origin-bounded integration algorithm (Cases A/B/C, Engine Spec
+  §4.3), implemented as a linear scan over `nodes` between the new
+  node's origin indices:
+  - **Case A** (`other`'s `originLeft` equals the new node's
+    `originLeft`): a direct sibling in the same conflict window. If
+    `other` outranks the new node (`rank(other) < rank(new)`), the new
+    node's destination advances past it. Otherwise, if `other`'s
+    `originRight` ALSO equals the new node's `originRight` — the
+    originRight equality test — the two are anchored at the exact same
+    (left, right) pair, so rank alone decides and scanning stops there.
+    If the right origins differ, the outcome is still undetermined
+    (`other` outranks us but was anchored more narrowly) and the scan
+    continues without moving the destination.
+  - **Case B** (`other`'s own `originLeft` is a node already scanned in
+    this pass — nested inside our conflict window): tests membership in
+    the `conflicting` set (the "group set test"). If `other`'s origin
+    was already resolved out of that set (lost an earlier comparison),
+    `other` inherits that resolution and the destination advances past
+    it too — this is what keeps a whole nested run (e.g. a growing
+    backward-typed chain) moving together as one group rather than
+    letting a later single item re-litigate the group's position.
+  - **Case C** (`other`'s `originLeft` lies outside the conflict window
+    entirely — neither Case A nor Case B applies): the scan has walked
+    past this conflict group's boundary; stop and insert here.
 
 ## Current phase in progress
 
-None — Phase 2 complete, awaiting Phase 3.
+None — Phase 3 complete, awaiting Phase 4.
 
 ## What is explicitly NOT yet built
 
-OBSEQ's `integrate()` algorithm and the Insert/Delete/Undelete operation
-records (Phase 3 — the convergence suite, `pnpm test:convergence`, is
-wired up and currently failing for exactly this reason, on purpose); the
-indexed position structure (Phase 19); garbage collection (Phase 21);
-undo/redo (Phase 36); block run-length encoding (later, alongside GC). No
+Undo/redo's real resurrection semantics beyond Undelete's structural
+inverse (Phase 36); the indexed position structure (Phase 19) — integrate()
+currently locates origins via a linear `indexOf` scan, not an index; garbage
+collection (Phase 21); block run-length encoding (later, alongside GC). No
 wire protocol; no server (no Express app, no WebSocket gateway, no
 database schema, no auth); no client (no React app, no editor binding, no
 DOM rendering); no persistence; no permissions; no offline/reconciliation
@@ -142,16 +215,60 @@ nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
 
 ## Key technical decisions with source citations
 
-- **The convergence harness was built before `integrate()` exists, and is
-  deliberately kept OUT of the default `pnpm test` run.** `convergence.test.ts`
-  has its own vitest config (`packages/testkit/vitest.convergence.config.ts`)
-  and its own command (`pnpm test:convergence`), excluded from root
-  `vitest.config.ts`'s default include. Reason: until Phase 3 implements
-  `integrate()`, every trial in that suite is EXPECTED to fail (currently:
-  6/6 configs, 0/10,000 seeds converged each, all erroring with
-  `NotImplementedError`), and that must not turn the ordinary `pnpm test`
-  loop red for every phase between Phase 2 and Phase 3. — Test Plan
-  §2.2/§12.6, PRD M1(a)/C-7.
+- **Case A's tie-break requires BOTH `originLeft` equality (to enter the
+  branch) AND `originRight` equality (to actually stop scanning) — checking
+  only `originLeft` is the exact historical bug.** A node reached mid-scan
+  with the same `originLeft` as the new node but a DIFFERENT `originRight`
+  is only a partial conflict — its own window is anchored more narrowly (or
+  more widely) than ours, and letting rank decide immediately, without the
+  originRight check, is what let the RFC's prototype produce `"zcybxa"`
+  instead of `"cbazyx"` on backward-typed concurrent runs — convergent, but
+  not intention-preserving: it destroyed each user's own typing order.
+  Engine Spec §4.3, resolved as RFC NQ-2; worked trace at §10.7, reproduced
+  as a unit test in `engine.test.ts`.
+- **Case B decides using set MEMBERSHIP of the scanned node's origin, not
+  the scanned node itself.** `conflicting.has(otherOriginNode)` — never
+  `conflicting.has(other)`. This is what lets a whole nested run (e.g. a
+  three-character backward-typed chain) move together as one group when its
+  anchor point loses a comparison, rather than re-litigating each nested
+  member's position independently against the incoming node. Engine Spec
+  §4.3 Case B.
+- **`applyRemote()`'s idempotence check and `drain()`'s duplicate-discard
+  both key off the OPERATION's own id (`op.id`), never off the identifier
+  of the node/target it touches.** Two different delete operations can
+  legally target the same node (concurrent deletes); collapsing on the
+  target id would silently drop the second one instead of tombstoning
+  twice and picking the causally-latest `deletedBy`. Engine Spec §4.5, §6.3.
+- **`localDelete()` snapshots `visible()` once at the start of the call and
+  indexes into that snapshot for every unit removed, rather than
+  recomputing `visible()` after each tombstone.** `deleted` mutation
+  removes a node from `vis(S)` immediately, which would shift every
+  subsequent index if recomputed mid-loop — the caller's `(visibleIndex,
+  count)` describes a contiguous range in the sequence AS IT STOOD when the
+  call began, not a moving target. API Spec §1.4.
+- **`integrate()` throws if an origin isn't present in `byKey`, rather than
+  silently treating it as document-start/end.** This can only happen if a
+  caller integrates an operation that `ready()` did not first confirm ready
+  — a caller bug, not a reachable runtime state once `applyRemote()`/
+  `drain()` are the only callers. The thrown error documents the
+  precondition instead of masking a violation as a silently-wrong position.
+- **`preSkewClock()` in `engineAdapter.ts` is implemented via `observe()`,
+  never a direct clock-set.** `observe()` only ever advances the clock
+  (Invariant I0), so a negative skew delta from config C6 is a deliberate
+  no-op rather than a new clock-mutation path that would bypass mint()/
+  observe()'s independence. The adapter contract already documents skew as
+  additive/optional for exactly this reason.
+- **The convergence harness was built before `integrate()` existed, and
+  stays OUT of the default `pnpm test` run even now that it passes.**
+  `convergence.test.ts` has its own vitest config (`packages/testkit/
+vitest.convergence.config.ts`) and its own command (`pnpm
+test:convergence`), excluded from root `vitest.config.ts`'s default
+  include. Historical reason: between Phase 2 and Phase 3, every trial was
+  EXPECTED to fail (`NotImplementedError`), and that had to not turn the
+  ordinary `pnpm test` loop red. As of Phase 3 the suite passes — 6/6
+  configs, 10,000/10,000 seeds converged each — but it stays separate
+  going forward too, simply because 60,000 fuzz trials belong in their own
+  gate, not the fast inner-loop suite. — Test Plan §2.2/§12.6, PRD M1(a)/C-7.
 - **The harness is written against `ReplicaAdapter<Op>`, an engine-agnostic
   interface, never against the concrete `Engine` class directly.** `Op` is
   generic and opaque to the harness — it never inspects an operation's
@@ -161,15 +278,16 @@ nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
   harness detects divergence) and the real engine (proving Phase 3 must be
   written against a working oracle), without the harness knowing which. —
   mirrors Engine Spec §11.2's upward interface.
-- **The real-engine adapter throws `NotImplementedError` from its mutating
-  methods rather than being typed to call methods that don't exist.**
-  Calling a genuinely-nonexistent method on `Engine` would fail `tsc
---noEmit` (a compile error), breaking `pnpm typecheck` project-wide for
-  every phase until Phase 3 — not just the one gate that's SUPPOSED to be
-  red. Instead, the adapter's methods conform to the interface's types
-  cleanly and throw a clear, deliberate error at runtime, so only
-  `pnpm test:convergence` fails, and it fails with an unambiguous message
-  rather than an obscure crash.
+- **The real-engine adapter threw `NotImplementedError` from its mutating
+  methods pre-Phase-3, rather than being typed to call methods that didn't
+  exist yet — Phase 3 deleted `NotImplementedError` entirely once it had
+  nothing left to guard.** Calling a genuinely-nonexistent method on
+  `Engine` would have failed `tsc --noEmit`, breaking `pnpm typecheck`
+  project-wide for every phase between Phase 2 and 3 — not just the one
+  gate that was supposed to be red. As of Phase 3, `engineAdapter.ts`'s
+  `localInsert`/`localDelete`/`applyRemote` call straight through to the
+  real `Engine.localInsert()`/`localDelete()`/`applyRemote()` — no
+  wrapper, no error class, nothing left to remove in a later phase.
 - **`pendingCount() === 0` is asserted SEPARATELY from text equality, never
   folded into one check.** A replica that silently dropped an operation
   instead of buffering it can still produce matching text if the drop
@@ -179,7 +297,7 @@ nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
   `compareIds` is plain lexicographic order on `(counter, replica)` and the
   identifiers themselves are NOT dense — OBSEQ does not need Logoot/LSEQ-style
   variable-length dense identifiers, because a node's position is determined
-  by its `originLeft`/`originRight` plus the (Phase 3) `INTEGRATE` rule, not
+  by its `originLeft`/`originRight` plus the `integrate()` rule (Phase 3), not
   by where its identifier value falls numerically. Insertion between any two
   adjacent nodes is always possible by anchoring to their identifiers,
   regardless of the numeric relationship between counters. This is what
@@ -246,20 +364,23 @@ pnpm test:watch        # Vitest, watch mode
 pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each
 ```
 
-`pnpm test` currently passes: 27 tests across 9 files, including
+`pnpm test` currently passes: 32 tests across 9 files, including
+`packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
+tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
+§10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
+insert/delete round-trip) and
 `packages/testkit/src/fuzz/harness.selftest.test.ts`, which proves the
 fuzz harness itself works (detects a deliberately broken toy engine as
 divergent, and completes 10,000 toy-engine seeds in ~2s, well under the
 30s bar).
 
-`pnpm test:convergence` currently FAILS, on purpose, for all six required
-configs (Test Plan §2.2): 0/10,000 seeds converge in each, every one
-erroring with `Engine.localInsert() is not implemented yet — integrate()
-and applyRemote() land in Phase 3`. This is correct and expected until
-Phase 3 lands — do not try to make it pass by weakening the suite. It is
-wired into CI as its own job (`.github/workflows/ci.yml`, job
-`convergence`), separate from the main `ci` job, so GitHub reports it as
-its own named check — but actually marking that check as a
-branch-protection-required status is a manual, one-time GitHub Settings
-action that hasn't been done yet (and shouldn't be, until Phase 3 makes
-it meaningful to enforce).
+`pnpm test:convergence` currently PASSES for all six required configs
+(Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),
+zero divergences, zero stuck-pending, zero errors. Total wall time on the
+reference machine was ~510s (C5-wide, at 8 replicas, is the slowest single
+config at ~280s — this is a fuzz-suite runtime, not a hot-path
+correctness concern). It is wired into CI as its own job
+(`.github/workflows/ci.yml`, job `convergence`), separate from the main
+`ci` job, so GitHub reports it as its own named check — but actually
+marking that check as a branch-protection-required status is still a
+manual, one-time GitHub Settings action that hasn't been done yet.
