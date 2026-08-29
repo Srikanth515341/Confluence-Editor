@@ -59,7 +59,36 @@ packages/engine      @collab-editor/engine    — OBSEQ. Phase 1 built the data 
                                                  no clock. Only package whose tsconfig
                                                  excludes "DOM" from lib.
 packages/protocol    @collab-editor/protocol  — binary wire codec + message types,
-                                                 shared by client and server.
+                                                 shared by client and server. Phase 7 built
+                                                 the whole thing, corrected against the real
+                                                 API/Protocol/Data Spec v1.0 text after an
+                                                 initial pass built without it (see the Phase
+                                                 7 completed-phase entry for the full list of
+                                                 what changed): LEB128 varint;
+                                                 stamp/optional-stamp/string/uuid/scalar
+                                                 primitives (src/primitives.ts); the exact
+                                                 3-byte envelope (protocolVersion, channel
+                                                 0x01/0x02/0x03, messageType — NO frame-level
+                                                 flags byte) plus per-message seq/flags
+                                                 (src/codec.ts, src/messages.ts); all seven
+                                                 OPS message types with spec-exact numeric
+                                                 values — OP_INSERT (0x01), OP_INSERT_RUN
+                                                 (0x02), OP_DELETE (0x03), OP_DELETE_BATCH
+                                                 (0x04), OP_UNDELETE (0x05), OP_ACK (0x10,
+                                                 a batch of acks, S→C only), OP_REJECT (0x11,
+                                                 a batch of rejects + shared detail string,
+                                                 S→C only) — with OP_INSERT_RUN/
+                                                 OP_DELETE_BATCH expansion into real engine
+                                                 Operations (src/expand.ts); debugProject() →
+                                                 JSON (src/codec.ts); and the 7-code
+                                                 RejectReason enum with spec-exact
+                                                 values/names (src/messages.ts). A single
+                                                 insert at counters near 50,000 measures
+                                                 exactly 18 bytes, matching API Spec §1.3.
+                                                 CONTROL/PRESENCE message types and the actual
+                                                 socket are still not built (Phases 9, 31, 8).
+                                                 Depends on engine (for Identifier/Operation
+                                                 types and, in tests only, Engine itself).
 packages/server      @collab-editor/server    — Express + WebSocket gateway,
                                                  Document Coordinator, persistence.
                                                  Depends on engine + protocol.
@@ -513,17 +542,193 @@ test:properties` (60,000 generated cases), `pnpm test:adversarial` (22
   edits to the (now much longer) canary explanation without needing
   another patch update.
 
+- **Phase 7** — Binary wire codec (API/Protocol/Data Spec v1.0 §1.3–§1.4,
+  §3.1, §3.2, §3.5; Test Plan §11.2). Built in two passes, and — like
+  Phase 5 — that matters for how much to trust it.
+
+  **Pass 1** was built without the literal spec text in context, only the
+  section citations and requirements listed in the phase brief. **Pass 2**
+  followed immediately after the user supplied the real §1.3/§1.4/§3.1/
+  §3.2/§3.5 text verbatim and asked for a field-by-field comparison. That
+  comparison found the self-derived layout WRONG in several load-bearing
+  ways, corrected below — the same "green on the first run is not
+  evidence it matches an unseen spec" lesson Phase 5 already taught this
+  project, now repeated one layer down (wire bytes, not test scenarios):
+
+  - **An invented frame-level reserved-flags byte, right after the 3-byte
+    envelope, does not exist in the spec.** §3.2 is explicit: the
+    envelope is exactly 3 bytes (protocolVersion, channel, messageType)
+    and the payload starts immediately at offset 3 — "no frame-level
+    length prefix... no correlation id" and (per this correction) no
+    frame-level flags byte either. This was the direct cause of the
+    single-insert size landing at 19 bytes instead of spec's 18 —
+    removing the invented byte closes the gap exactly, now verified with
+    `expect(bytes.length).toBe(18)`, not an approximate range.
+  - **`channel` and `messageType` numeric values were wrong.** Pass 1
+    used small sequential integers starting at 0. The real values are
+    `channel`: OPS=`0x01`, PRESENCE=`0x02`, CONTROL=`0x03`; `messageType`
+    (namespaced within OPS): OP_INSERT=`0x01`, OP_INSERT_RUN=`0x02`,
+    OP_DELETE=`0x03`, OP_DELETE_BATCH=`0x04`, OP_UNDELETE=`0x05`,
+    OP_ACK=`0x10`, OP_REJECT=`0x11` — note the jump to `0x10`/`0x11` for
+    the two server-only types, not `0x06`/`0x07`.
+  - **OP_DELETE/OP_UNDELETE's field layout and field ORDER were wrong.**
+    Pass 1 wrote `id` (as a stamp) then `target`. The real layout is
+    `target` (a stamp) FIRST, then the deleting operation's own identity
+    as two separate varints, `at` (the counter) and `by` (the replica) —
+    same two numbers as a stamp, same order (counter then replica), but a
+    different field NAME and a different POSITION relative to `target`.
+    `OpDeleteMessage`/`OpUndeleteMessage`'s TypeScript shape is unchanged
+    (`{ id, target }`) — only `codec.ts`'s wire order changed, writing
+    `target`, then `id.c`, then `id.r`.
+  - **OP_INSERT_RUN was substantively wrong**, not just reordered: `bind`
+    is ONE flag for the WHOLE run (§3.5.2: "bind applies to the WHOLE
+    run"), not a per-character bitmap — Pass 1 invented a bitmap that
+    doesn't exist on the wire. And the run's characters are NOT encoded
+    as a list of individual varint scalars; §3.5.2 encodes them as
+    `varint count` + `varint byteLength` + `bytes utf8` — the run's
+    scalars re-encoded as a UTF-8 string. Fixed by reconstructing the
+    string with `String.fromCodePoint(...values)` on encode and
+    `Array.from(text, ch => ch.codePointAt(0))` on decode (which
+    correctly handles astral code points via JS's per-code-point string
+    iteration), plus a new check that the decoded scalar count matches
+    the declared `count` (`RUN_LENGTH_MISMATCH` if not). Also: the spec
+    requires `n >= 2` for a run (single characters go through OP_INSERT
+    instead) — Pass 1 allowed `n >= 1`; now enforced both at encode
+    (`RangeError`) and decode (`ProtocolDecodeError` reason
+    `RUN_TOO_SHORT`). `OpInsertRunMessage.replicaId`/`startCounter` were
+    renamed to a single `firstId: Identifier`, matching the spec's own
+    field name. The originLeft-chains/originRight-shared expansion logic
+    itself (§3.5.2's expansion table) was correct in Pass 1 and is
+    unchanged — see the dedicated paragraph below.
+  - **OP_DELETE_BATCH's minimum count was wrong** (allowed `n >= 1`, spec
+    requires `n >= 2`, same reasoning as the run) — now enforced
+    identically. Field layout/order (`seq`, `by`, `atFirst`, `count`,
+    `target[]`) was already correct in Pass 1; fields were renamed from
+    `replicaId`/`startCounter` to `by`/`atFirst` to match the spec text.
+  - **OP_ACK and OP_REJECT were modeled as single-operation messages with
+    their own `seq`; both are actually BATCH messages with no `seq` field
+    at all.** §3.5.7: `varint count` followed by `count` pairs of
+    `(ackSeq, ackStamp)`. §3.5.8: `varint count` followed by `count`
+    pairs of `(stamp, reason)`, THEN a single shared `varint detailLength`
+    + optional UTF-8 `detail` bytes for the whole frame. Both message
+    types were restructured accordingly (`OpAckMessage.acks:
+readonly AckEntry[]`, `OpRejectMessage.rejects: readonly RejectEntry[]`
+    + `detail: string`, empty string meaning absent/`detailLength: 0`) —
+    a shape change, not a byte-order fix, since the TypeScript types
+    themselves were wrong, not just their wire encoding. Because these
+    two types carry no `seq`, `decodeFrame()` no longer applies the
+    client-seq check to them; instead it now rejects a client-origin
+    OP_ACK/OP_REJECT outright (`MESSAGE_NOT_VALID_FROM_CLIENT`), since
+    §3.5.7/§3.5.8 mark both "S→C" only — a real directionality
+    constraint Pass 1 had no way to encode at all under the old
+    single-op-with-seq shape.
+  - **The 7 `RejectReason` codes were entirely invented names/values in
+    Pass 1**, not derived from anything in the brief beyond "exactly 7
+    codes, no conflict code." The real 7, values and names both taken
+    verbatim from §3.5.8: `PERMISSION_DENIED=0x01`, `SESSION_EXPIRED=
+0x02`, `IDENTITY_MISMATCH=0x03`, `MALFORMED=0x04`, `RATE_LIMITED=0x05`,
+    `OFFLINE_WINDOW_EXCEEDED=0x06`, `DOCUMENT_LOCKED=0x07`. The "no
+    conflict code, and there never will be" comment (PRD FR-CE-7) is
+    unchanged in spirit — §3.5.8 states the identical rule verbatim.
+  - **What Pass 1 got RIGHT and needed no change**: the varint (LEB128,
+    division/modulo not bitwise ops), stamp (`varint c, varint r`,
+    counter first), optional-stamp (presence-bit-gated, ⊥ never a
+    sentinel), string (`varint byteLength` + UTF-8), uuid (16 raw bytes)
+    and scalar (`varint codePoint`) primitives; the identity decision
+    (origin stamp IS the operation identity, no separate UUID, API Spec
+    §1.4); OP_INSERT's field layout and flags-byte bit assignment
+    (bit0/bit1/bit2 = originLeft/originRight/bind present, bits 3-7
+    reserved); and — most importantly — OP_INSERT_RUN's origin-expansion
+    RULE itself (`originLeft` chains to the previous node, `originRight`
+    is the SAME shared value for every node in the run, never chained) —
+    confirmed correct by comparing directly against the spec's own
+    expansion pseudocode, unchanged from Pass 1.
+
+  **Everything else in the file layout is unchanged from Pass 1**:
+  `bytes.ts` (`ByteWriter`/`ByteReader`, bounds-checked, throw not crash);
+  `varint.ts`; `primitives.ts`; `messages.ts` (now holding the corrected
+  enums/types above, plus new `AckEntry`/`RejectEntry` interfaces for the
+  batch entries); `codec.ts` (`encodeFrame`/`decodeFrame` — 3-byte
+  envelope with NO extra frame-level byte, `direction: "clientOrigin" |
+"serverOrigin"`-checked `seq` per bidirectional message type, the
+  OP_ACK/OP_REJECT client-origin rejection, plus `debugProject(bytes) →
+unknown`); `expand.ts` (`expandInsertRun`/`expandDeleteBatch` plus the
+  1:1 `opInsertToOperation`/`operationToOpInsert` family). `package.json`
+  depends on `@collab-editor/engine` (types, and `Engine` itself in
+  tests) and `fast-check` (mirroring `testkit`'s Phase 4 setup).
+
+  **OP_INSERT_RUN expansion (§3.5.2)**, in `expandInsertRun`: for a run
+  of `N` characters starting at `firstId`, node `j`'s id is
+  `(firstId.c + j, firstId.r)`. `originLeft` CHAINS forward (node `j`'s
+  `originLeft` is node `j-1`'s id, for `j > 0`; only node 0 uses the
+  run's own `originLeft`), but `originRight` does NOT chain — every
+  expanded node gets the SAME `originRight`, the run's own shared right
+  boundary, exactly as the spec's own expansion table states ("SAME
+  right origin for EVERY node in the run, not the predecessor"). `bind`
+  applies uniformly to every expanded node (single flag, not per-char).
+  Verified directly, not just by construction: a dedicated test builds a
+  2,000-character run the normal way (2,000 sequential `localInsert()`
+  calls on a real `Engine`, which is what actually produces the
+  chained-`originLeft`/shared-`originRight` shape), round-trips it
+  through `encodeFrame`/`decodeFrame`, expands it, feeds the result into
+  one engine, separately encodes/decodes/applies the same 2,000
+  characters as 2,000 individual OP_INSERT frames into a second engine,
+  and asserts both produce identical text AND identical node-id
+  sequences.
+
+  **Malformed-frame rejection**, centralized in `decodeFrame()`: a
+  reserved bit set in a message-specific flags byte (OP_INSERT/
+  OP_INSERT_RUN's origin-presence-and-bind bits, bits 3-7 reserved), an
+  unsupported protocol version, an unsupported channel, a client-origin
+  bidirectional-type frame with `seq !== 0`, a client-origin OP_ACK/
+  OP_REJECT (server-only), a run/batch declaring fewer than 2 members, a
+  run whose declared `count` doesn't match its decoded UTF-8 text length,
+  an unrecognized message type, an unrecognized `RejectReason` code, a
+  frame that runs out of bytes mid-field, and trailing bytes after a
+  valid payload — all throw `ProtocolDecodeError` (a stable `reason`
+  string plus a message), never a raw RangeError/TypeError from an
+  out-of-bounds read. Verified with dedicated tests constructing each
+  malformed case by hand via `ByteWriter`.
+
+  **`debugProject(bytes)` is deliberately tolerant of malformed input**:
+  it tries `decodeFrame` as a client-origin frame, retries as
+  server-origin (since OP_ACK/OP_REJECT are only ever legally
+  server-origin), and if both fail returns a `{ malformed: true, reason,
+message }` object rather than throwing.
+
+  **Measured frame size**: a single OP_INSERT at counters near 50,000
+  (id + originLeft + originRight all in the ~50,000 range, replica ids
+  1–8, an ASCII value) encodes to exactly **18 bytes** — envelope 3 + seq
+  1 + flags 1 + id stamp 4 + originLeft stamp 4 + originRight stamp 4 +
+  value 1 — matching API/Protocol/Data Spec §1.3's "One insert = 18 B"
+  exactly, now that the invented frame-level byte from Pass 1 is gone.
+
+  **DoD verification, re-run after the correction**: 10,000-case
+  round-trip property test across all 7 message types (now split by
+  direction — bidirectional types decoded `clientOrigin`, OP_ACK/
+  OP_REJECT decoded `serverOrigin`, since a real client-origin decode of
+  the latter two is now a rejection, not a round-trip case); the
+  2,000-char OP_INSERT_RUN-vs-2,000-individual-frames equivalence check;
+  varint round-trips for 0, 127, 128, 16383, 16384, and 2^31; the exact
+  18-byte measurement (`toBe(18)`, not a tolerance range); and the full
+  malformed-frame suite above. `pnpm test` passes 105 tests across 13
+  files (up from 96 before this correction — the new envelope/
+  directionality/count-minimum checks added test cases, not just fixed
+  existing ones).
+
 ## Current phase in progress
 
-None — Phase 6 complete, awaiting Phase 7.
+None — Phase 7 complete, awaiting Phase 8.
 
 ## What is explicitly NOT yet built
 
 Undo/redo's real resurrection semantics beyond Undelete's structural
 inverse (Phase 36); the indexed position structure (Phase 19) — integrate()
 currently locates origins via a linear `indexOf` scan, not an index; garbage
-collection (Phase 21); block run-length encoding (later, alongside GC). No
-wire protocol; no server (no Express app, no WebSocket gateway, no
+collection (Phase 21); block run-length encoding (later, alongside GC). The
+OPS channel's binary codec exists (Phase 7), but CONTROL/PRESENCE message
+types (Phases 9, 31) and the actual socket (Phase 8) do not — nothing yet
+sends a frame anywhere. No server (no Express app, no WebSocket gateway, no
 database schema, no auth); no client (no React app, no editor binding, no
 DOM rendering); no persistence; no permissions; no offline/reconciliation
 logic; no presence; no version history; no Docker setup; no deployed
@@ -826,16 +1031,25 @@ pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constru
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
-`pnpm test` currently passes: 54 tests across 10 files, including
+`pnpm test` currently passes: 105 tests across 13 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
 insert/delete round-trip), `packages/testkit/src/adversarial/
-adversarial.test.ts` (22 tests — see the Phase 5 entry above), and
+adversarial.test.ts` (22 tests — see the Phase 5 entry above),
 `packages/testkit/src/fuzz/harness.selftest.test.ts`, which proves the
 fuzz harness itself works (detects a deliberately broken toy engine as
 divergent, and completes 10,000 toy-engine seeds in ~2s, well under the
-30s bar).
+30s bar), and Phase 7's `packages/protocol/src/*.test.ts` (52 tests, after
+the Pass-2 spec correction: 17 varint round-trip/boundary/malformed-input
+cases, 7 primitive round-trip cases, and 27 codec tests — a 10,000-case
+round-trip property test across all 7 OPS message types split by
+direction, 4 envelope/enum-value checks including the exact-18-byte
+OP_INSERT measurement, the 2,000-character OP_INSERT_RUN-vs-2,000-
+individual-frames equivalence check, 10 malformed-frame rejection cases
+including OP_ACK/OP_REJECT client-origin rejection and run/batch
+minimum-count enforcement, and debugProject coverage for every message
+type).
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),
