@@ -2,12 +2,20 @@ import type { Server as HttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
+  Channel,
   ProtocolDecodeError,
+  SessionRole,
+  decodeControlFrame,
   decodeFrame,
+  encodeControlFrame,
   encodeFrame,
+  peekChannel,
+  type ControlMessage,
   type OpsMessage,
 } from "@collab-editor/protocol";
-import { DocumentCoordinator } from "./documentCoordinator.js";
+import { DocumentCoordinator, type CoordinatorSession } from "./documentCoordinator.js";
+import { armPresenceStaleTimer, disarmPresenceStaleTimer, onPingReceived } from "./heartbeat.js";
+import { buildSnapshotMessage, buildWelcomeMessage } from "./handshake.js";
 import { toOperations } from "./ingest.js";
 import { logger } from "./logger.js";
 import { ConnectionSendQueues } from "./sendQueues.js";
@@ -34,24 +42,6 @@ function toUint8Array(data: RawData): Uint8Array {
     return new Uint8Array(Buffer.concat(data));
   }
   return new Uint8Array(data);
-}
-
-/**
- * `documentId` binding (API Spec §1.2: "A WebSocket connection is bound to
- * exactly one document at handshake time and never rebinds"). This phase
- * has no real handshake message yet (Phase 9) and no auth yet (Phases
- * 26-29), so the interim binding mechanism is a `documentId` query
- * parameter on the upgrade URL, read once at connect time and never
- * consulted again for that socket — satisfying "bound at handshake time,
- * never rebinds" without inventing any CONTROL-channel frame content.
- * Phase 9 replaces this with the real handshake.
- */
-function readDocumentId(requestUrl: string | undefined): string | null {
-  if (!requestUrl) {
-    return null;
-  }
-  const url = new URL(requestUrl, "http://internal");
-  return url.searchParams.get("documentId");
 }
 
 function getOrCreateCoordinator(
@@ -114,16 +104,14 @@ export function createGateway(httpServer: HttpServer): Gateway {
     handleProtocols: (protocols) => (protocols.has(WS_SUBPROTOCOL) ? WS_SUBPROTOCOL : false),
   });
 
-  wss.on("connection", (ws: WebSocket, request) => {
-    const documentId = readDocumentId(request.url);
-    if (!documentId) {
-      ws.close(1008, "documentId query parameter is required");
-      return;
-    }
-
+  wss.on("connection", (ws: WebSocket) => {
     const sessionId = randomUUID();
-    const coordinator = getOrCreateCoordinator(coordinators, documentId);
-    const replicaId = coordinator.allocateReplicaId();
+    // `bound` is set the moment HELLO completes the handshake (API Spec §1.2: "bound to
+    // exactly one document at handshake time and never rebinds" — this is that binding).
+    // Before that, the socket exists but belongs to no document and no coordinator.
+    let bound:
+      | { readonly coordinator: DocumentCoordinator; readonly session: CoordinatorSession }
+      | undefined;
 
     const queues = new ConnectionSendQueues(
       (frame) =>
@@ -133,41 +121,173 @@ export function createGateway(httpServer: HttpServer): Gateway {
       () => ws.bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES,
     );
 
-    coordinator.join({ sessionId, replicaId, queues });
-    logger.info("ws.connect", { documentId, sessionId, replicaId });
+    logger.info("ws.open", { sessionId });
+
+    function closeMalformed(reason: string): void {
+      logger.warn("ws.malformedFrame", {
+        sessionId,
+        documentId: bound?.coordinator.documentId,
+        reason,
+      });
+      ws.close(1008, "malformed frame");
+    }
+
+    /**
+     * The first frame after the upgrade MUST be HELLO on CONTROL (API Spec
+     * §3.6.1). Everything else (wrong channel, wrong CONTROL type, a decode
+     * failure) closes the socket — there is no partially-joined state to
+     * clean up, since nothing was registered with a coordinator yet.
+     */
+    function handleHandshake(bytes: Uint8Array): void {
+      if (peekChannel(bytes) !== Channel.CONTROL) {
+        closeMalformed("first frame must be HELLO on the CONTROL channel");
+        return;
+      }
+      let ctrlMsg: ControlMessage;
+      try {
+        ctrlMsg = decodeControlFrame(bytes, { direction: "clientOrigin" });
+      } catch (err) {
+        closeMalformed(err instanceof ProtocolDecodeError ? err.reason : "DECODE_ERROR");
+        return;
+      }
+      if (ctrlMsg.kind !== "hello") {
+        closeMalformed(`first frame must be HELLO, got ${ctrlMsg.kind}`);
+        return;
+      }
+
+      const coordinator = getOrCreateCoordinator(coordinators, ctrlMsg.documentId);
+      const replicaId = coordinator.allocateReplicaId();
+      const session: CoordinatorSession = {
+        sessionId,
+        replicaId,
+        queues,
+        // Hardcoded EDITOR for every session this phase — matches buildWelcomeMessage's role (real roles/auth are Phase 26-29).
+        role: SessionRole.EDITOR,
+        // Placeholder identity — real users don't exist until Phase 26.
+        userId: randomUUID(),
+        displayName: `Guest ${replicaId}`,
+        lastPingAt: Date.now(),
+        presenceStale: false,
+        staleTimer: undefined,
+      };
+      coordinator.join(session);
+      bound = { coordinator, session };
+      armPresenceStaleTimer(session);
+      logger.info("ws.connect", { documentId: ctrlMsg.documentId, sessionId, replicaId });
+
+      // WELCOME, then SNAPSHOT (API Spec §3.6.1-§3.6.3) — both on CONTROL, in this order,
+      // so the client always sees its own admission before the state it's being admitted to.
+      queues.enqueue(
+        "control",
+        encodeControlFrame(buildWelcomeMessage(coordinator, sessionId, replicaId)),
+      );
+      queues.enqueue("control", encodeControlFrame(buildSnapshotMessage(coordinator)));
+    }
+
+    /** PING/SYNC_COMPLETE/LEAVE — the only CONTROL types a client may legally send after handshake (§3.6). */
+    function handleControlMessage(ctrlMsg: ControlMessage): void {
+      if (!bound) {
+        return;
+      }
+      const { coordinator, session } = bound;
+      switch (ctrlMsg.kind) {
+        case "ping": {
+          onPingReceived(session);
+          coordinator.watermarks.set(session.replicaId, BigInt(ctrlMsg.lastAppliedSeq));
+          queues.enqueue(
+            "control",
+            encodeControlFrame({
+              kind: "pong",
+              clientTimeMs: ctrlMsg.clientTimeMs,
+              serverSeq: Number(coordinator.currentSeq),
+            }),
+          );
+          break;
+        }
+        case "syncComplete":
+          logger.info("ws.syncComplete", {
+            documentId: coordinator.documentId,
+            sessionId,
+            lastServerSeq: ctrlMsg.lastServerSeq,
+            resentCount: ctrlMsg.resentCount,
+          });
+          break;
+        case "leave":
+          logger.info("ws.leave", {
+            documentId: coordinator.documentId,
+            sessionId,
+            lastAppliedSeq: ctrlMsg.lastAppliedSeq,
+          });
+          break;
+        default:
+          // HELLO again, or a server-only type somehow past decodeControlFrame's direction
+          // check (shouldn't happen) — ignore rather than tear down an otherwise-healthy session.
+          break;
+      }
+    }
 
     ws.on("message", (data, isBinary) => {
       if (!isBinary) {
-        // Binary frames only (Scope-IN, this phase). A text frame is malformed input at the transport level.
+        // Binary frames only (Scope-IN, Phase 8). A text frame is malformed input at the transport level.
         ws.close(1003, "binary frames only");
         return;
       }
       const bytes = toUint8Array(data);
 
-      let msg: OpsMessage;
-      try {
-        msg = decodeFrame(bytes, { direction: "clientOrigin" });
-      } catch (err) {
-        const reason = err instanceof ProtocolDecodeError ? err.reason : "DECODE_ERROR";
-        logger.warn("ws.malformedFrame", { documentId, sessionId, reason });
-        ws.close(1008, "malformed frame");
+      if (!bound) {
+        handleHandshake(bytes);
         return;
       }
 
-      ingestOperation(coordinator, msg, sessionId);
+      const channel = peekChannel(bytes);
+      if (channel === Channel.OPS) {
+        let msg: OpsMessage;
+        try {
+          msg = decodeFrame(bytes, { direction: "clientOrigin" });
+        } catch (err) {
+          closeMalformed(err instanceof ProtocolDecodeError ? err.reason : "DECODE_ERROR");
+          return;
+        }
+        ingestOperation(bound.coordinator, msg, sessionId);
+      } else if (channel === Channel.CONTROL) {
+        let ctrlMsg: ControlMessage;
+        try {
+          ctrlMsg = decodeControlFrame(bytes, { direction: "clientOrigin" });
+        } catch (err) {
+          closeMalformed(err instanceof ProtocolDecodeError ? err.reason : "DECODE_ERROR");
+          return;
+        }
+        handleControlMessage(ctrlMsg);
+      } else {
+        // PRESENCE (0x02) isn't built yet (Phase 31); anything else is not a valid channel.
+        closeMalformed(`unsupported channel ${channel}`);
+      }
     });
 
     ws.on("close", (code) => {
       queues.close();
-      coordinator.leave(sessionId);
-      logger.info("ws.disconnect", { documentId, sessionId, code });
-      if (coordinator.sessionCount === 0) {
-        coordinators.delete(documentId);
+      if (bound) {
+        disarmPresenceStaleTimer(bound.session);
+        bound.coordinator.leave(sessionId);
+        logger.info("ws.disconnect", { documentId: bound.coordinator.documentId, sessionId, code });
+        // Deliberately NOT deleting the coordinator when it empties out (Phase 8 did this; Phase
+        // 9 removes it): API Spec §3.6.2 requires replica ids to be "NEVER reused, NEVER
+        // reclaimed" for a document's whole lifetime. With no persistence yet (Phase 15), the
+        // only way to honor that once every session has left and a new one later joins the same
+        // document is to keep the coordinator (and its replica-id counter) alive in memory for
+        // the life of the process — recreating it on the next join would silently reset the
+        // counter back to 1 and hand out an already-used id.
+      } else {
+        logger.info("ws.disconnect", { sessionId, code });
       }
     });
 
     ws.on("error", (err) => {
-      logger.error("ws.error", { documentId, sessionId, message: err.message });
+      logger.error("ws.error", {
+        sessionId,
+        documentId: bound?.coordinator.documentId,
+        message: err.message,
+      });
     });
   });
 
@@ -175,6 +295,12 @@ export function createGateway(httpServer: HttpServer): Gateway {
     wss,
     coordinators,
     close: () => {
+      // `wss.close()` alone only stops accepting NEW connections — it does not touch already-open
+      // sockets, so `httpServer.close(cb)` (server.ts) would hang forever waiting for them to end
+      // on their own. Terminate every still-open connection first so shutdown always completes.
+      for (const ws of wss.clients) {
+        ws.terminate();
+      }
       wss.close();
     },
   };

@@ -17,6 +17,19 @@ export { toOperations } from "./ingest.js";
 export { createHttpApp } from "./httpApp.js";
 export { createGateway, WS_PATH, WS_SUBPROTOCOL, type Gateway } from "./gateway.js";
 export { createCollabServer, type CollabServer } from "./server.js";
+export {
+  armPresenceStaleTimer,
+  disarmPresenceStaleTimer,
+  onPingReceived,
+  PING_INTERVAL_MS,
+  PRESENCE_STALE_MS,
+  SESSION_INACTIVE_MS,
+} from "./heartbeat.js";
+export {
+  assertSnapshotFormAllowed,
+  buildSnapshotMessage,
+  buildWelcomeMessage,
+} from "./handshake.js";
 
 import { loadConfig } from "./config.js";
 import { createCollabServer } from "./server.js";

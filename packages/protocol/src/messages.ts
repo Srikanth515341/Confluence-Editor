@@ -18,6 +18,19 @@ export enum Channel {
   CONTROL = 0x03,
 }
 
+/**
+ * Reads offset 1 (the `channel` byte) directly, without decoding the rest
+ * of the frame — lets a caller with frames from more than one channel
+ * (Phase 9's gateway: OPS and CONTROL interleaved on one socket) pick which
+ * decoder to invoke before committing to either one's message-type
+ * dispatch. Returns `null` for a frame too short to even have a channel
+ * byte, so the caller can reject it the same way a truncated frame decode
+ * would, without throwing from a peek.
+ */
+export function peekChannel(bytes: Uint8Array): number | null {
+  return bytes.length > 1 ? bytes[1]! : null;
+}
+
 /** OPS channel message types, namespaced within the channel (§3.5). */
 export enum OpsMessageType {
   OP_INSERT = 0x01,
