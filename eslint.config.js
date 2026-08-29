@@ -39,6 +39,11 @@ const engineSyntaxBan = [
     message:
       "Engine purity (Engine Spec I0): no wall-clock reads. Ordering derives from Lamport counters only.",
   },
+  {
+    selector: "CallExpression[callee.property.name='getTime']",
+    message:
+      "Engine purity (Engine Spec §10.8 C9): no wall-clock reads. Ordering derives from Lamport counters only.",
+  },
 ];
 
 export default tseslint.config(

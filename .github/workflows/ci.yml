@@ -67,3 +67,28 @@ jobs:
 
       - name: Convergence suite
         run: pnpm test:convergence
+
+  # Separate job for the same reason as `convergence` above: its own named
+  # check, and its own runtime budget (5 properties at 10^4 generated
+  # cases each, Test Plan §2.5) that the fast inner-loop `ci` job above
+  # should not have to pay on every push.
+  properties:
+    name: Property-based suite (PROP-1..5, 10^4 cases/property)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Property-based suite
+        run: pnpm test:properties
