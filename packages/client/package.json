@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "description": "React app and editor binding (DomWriter, input pipeline, cursor/presence rendering). See API/Protocol/Data Spec §7-9.",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.json"

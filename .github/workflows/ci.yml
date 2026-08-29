@@ -37,3 +37,33 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+  # Separate job (not a step in `ci` above) so GitHub reports it as its own
+  # named check — that's what a branch-protection "required status check"
+  # picker selects from. This suite is EXPECTED to fail until Phase 3
+  # implements integrate() (Engine Spec §4.3); see
+  # packages/testkit/src/fuzz/convergence.test.ts. Marking this check as
+  # actually REQUIRED in GitHub's branch-protection settings is a manual,
+  # one-time repo-settings action — not something a file in this repo can
+  # do — and makes most sense to flip on once Phase 3 lands (Test Plan
+  # §2.2/§2.3/§12.6, PRD M1(a)/C-7).
+  convergence:
+    name: Convergence suite (C1-C6, 10^4 seeds/config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Convergence suite
+        run: pnpm test:convergence
