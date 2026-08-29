@@ -90,7 +90,15 @@ packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  into the default `pnpm test`, since
                                                  unlike convergence/properties these are
                                                  fast and deterministic — no isolation
-                                                 needed). Depends on engine.
+                                                 needed). Phase 6 added a test-build-only
+                                                 canary assertion at the end of Case C in
+                                                 integrate() (throws if a Case C node would
+                                                 have outranked the candidate — see the
+                                                 Phase 6 entry below) and src/mutation/ —
+                                                 the ten-mutant matrix harness (string-
+                                                 patches a temp copy of this very
+                                                 directory, never the real files), run via
+                                                 `pnpm test:mutation`. Depends on engine.
 ```
 
 `protocol`, `server`, and `client` still each export one placeholder
@@ -387,9 +395,127 @@ test:convergence` passed with all ten invariants active across all
   a separate job — no isolated runtime budget to justify one) right
   after the general `pnpm test` step.
 
+- **Phase 6** — Mutation testing and the full CI gate (Test Plan §2.8,
+  §14.2, §12.6). `packages/testkit/src/mutation/`: `mutants.ts` (the ten
+  mutant patches, supplied verbatim by the user from Test Plan §2.8 —
+  not derived); `loadMutantEngine.ts` (string-patches ONE mutant into a
+  freshly-copied, freshly-transpiled `packages/engine/src` in a scratch
+  temp directory — never the real source on disk — using `typescript`'s
+  `ts.transpileModule` per file, then dynamically `import()`s the result;
+  throws if a mutant's `find` text doesn't match exactly once, so a
+  mutant can never silently become a no-op); `mutantAdapter.ts` (wraps
+  the loaded engine as a `ReplicaAdapter`, reusing `runTrial.ts` — the
+  SAME harness the real convergence suite uses — with an
+  `withInvariants` toggle, because several mutants, e.g. M5, are
+  completely invisible to pure convergence checking but caught
+  immediately once `assertInvariants` is wired in); `fuzzUntilKilled.ts`
+  (seed-by-seed early exit at first non-converged outcome — a real
+  Phase-2/4 harness quirk surfaced here: `pendingCounts` is read AFTER
+  `runTrial`'s own try/catch, so an invariant violation thrown from
+  `pendingCount()` — which never happens on the real engine, hence never
+  a problem before — propagated uncaught and crashed the whole matrix
+  run the first time; fixed by wrapping the `runTrial` call itself,
+  scoped to the mutation harness only, not the shared production code);
+  `targetedChecks.ts` / `targetedProperties.ts` (a hand-picked subset of
+  Phase 4/5's suites, re-implemented against the dynamically-loaded
+  engine type rather than the static `@collab-editor/engine` import
+  those suites use, chosen specifically so every one of the ten mutants
+  has at least one direct catcher); `runMatrix.ts` / `generateReport.ts`
+  (orchestration and the `docs/mutation-matrix.md` writer); `mutKill01.ts`
+  (MUT-KILL-01, Test Plan §14.2 — a small/fast/high-volume trial config
+  biased toward many concurrent, variously-anchored inserts per round,
+  aimed at maximizing how often `integrate()`'s scan actually reaches a
+  genuine Case C node). New command `pnpm test:mutation`
+  (`packages/testkit/vitest.mutation.config.ts`), excluded from the
+  default `pnpm test` (like convergence/properties — even at reduced
+  budgets, transpiling and fuzzing ten engine variants isn't inner-loop
+  material). New nightly workflow (`.github/workflows/nightly.yml`,
+  `schedule` + `workflow_dispatch`) running the full matrix with
+  `MUT_KILL_01_BUDGET=1000000`.
+
+  **Two of the four hand-picked targeted checks were wrong on the first
+  attempt and had to be re-derived** — a smaller-scale repeat of the
+  Phase 5 lesson: a check passing against the real engine is not enough
+  evidence it actually discriminates the mutant it's aimed at. The
+  original M2 check (Engine Spec §10.3's HELLO/ELL/x/HxO trace) turned
+  out to be structurally immune to `M2_no_right_bound` — nothing in that
+  scenario ever "wins" a comparison it shouldn't, so the unbounded scan
+  window never changes the outcome. The original M9 check (delete →
+  undelete → later delete) turned out to be immune to
+  `M9_delete_first_wins` too — an undelete arriving right after a delete
+  resets the "already deleted" snapshot either way, so both correct and
+  buggy attribution reach the same answer in that specific sequence.
+  Both were re-derived by hand-tracing the actual mutated algorithm step
+  by step (not by trial and error against the running code) until a
+  genuinely discriminating scenario was found: for M2, base content with
+  a SMALLER replica id than the two concurrently-competing inserters, so
+  the (incorrectly) unbounded scan lets the base nodes "win" and cascade
+  `destIndex` to the very end of the document (verified: baseline
+  produces `"ApqBCD"`, M2 produces `"ABCDpq"`); for M9, two deletes with
+  NO undelete between them (so the first delete's attribution is never
+  overwritten under the bug), followed by an undelete whose id sits
+  between the two deletes' — correct attribution makes it a no-op,
+  "first wins" attribution makes it wrongly succeed (verified: baseline
+  produces `"AC"`, M9 produces `"ABC"`).
+
+  **Matrix result reproduces Test Plan §2.8's shape exactly**: M1, M6,
+  M7, M8, M10 killed by the pure-convergence fuzzer at seed 0 or 1; M2,
+  M4, M9 survive both fuzzer passes and are killed only by their
+  targeted adversarial check; M5 survives the pure-convergence fuzzer
+  but is killed the moment invariant assertions are added (both via the
+  invariant-enabled fuzzer pass AND the targeted I0 check) — matching
+  "M2, M4, M5, M9 survive the fuzzer" if "the fuzzer" means pure
+  convergence specifically, which is exactly the distinction
+  `mutantAdapter.ts`'s two-column design exists to preserve.
+  `M3_no_case_c` survives every suite in the matrix (fuzzer with and
+  without invariants, targeted adversarial, targeted properties).
+
+  **MUT-KILL-01 ran to the full 10^6-trial budget and did NOT kill
+  M3_no_case_c** (`{killed:false, trials:1000000}`, ~975s wall time at
+  ~0.92ms/trial). This is an accepted, documented outcome, not a Phase 6
+  failure — the Test Plan and Implementation Plan built the Case C
+  canary specifically as the fallback for exactly this result. Timed a
+  50,000-trial sample first (~46s) to extrapolate the full-budget
+  runtime before committing to it.
+
+  **The Case C test-build canary** (added to `integrate()` per the
+  Definition of Done's "if M3 survived" branch — M3 did): restates
+  Engine Spec §6.2 sub-case iii-d's claim as a live assertion — if a
+  Case C node would have outranked the candidate in a same-window
+  comparison, that's a witness that NOT breaking there (M3's mutation)
+  could have moved `destIndex`, which would disprove sub-case iii-d.
+  Verified it never fires across `pnpm test` (54 tests), `pnpm
+test:properties` (60,000 generated cases), `pnpm test:adversarial` (22
+  cases), and the real 10^6-trial MUT-KILL-01 run above (which loaded
+  the UN-mutated `compareRank`, since M3's own patch only removes the
+  trailing `break` — the canary and its comparison logic stay intact
+  under M3's specific mutation). It fired exactly once anywhere in this
+  phase's work — not on M3, but incidentally on `M1_rank_by_counter`
+  during the mutation matrix's own targeted-properties check: M1
+  redefines module-level `rank()`/`compareRank()` to compare by Lamport
+  counter instead of replica id, and since the canary reuses that SAME
+  (now-mutated) `compareRank`, two same-replica nodes reaching Case C in
+  counter order tripped its "other outranks node" condition. This is a
+  real, if incidental, second detection path for M1 (already killed at
+  seed 0 by the fuzzer regardless) — not a false positive on the
+  UN-mutated engine, since the canary's own logic and the function it
+  calls only diverge from correct behavior when M1's specific patch is
+  loaded. It DID surface a real harness bug, though:
+  `targetedProperties.ts`'s PROP-1/PROP-2 loops had no try/catch around
+  each trial (unlike `fuzzUntilKilled.ts`, already hardened for exactly
+  this in Phase 6's first crash) — the canary's exception propagated
+  uncaught and crashed the whole matrix run instead of being recorded as
+  a kill. Fixed by wrapping each trial body in try/catch, treating a
+  thrown exception as a detected mutant (consistent with how the rest of
+  the harness already treats an uncaught throw). M3's mutant patch in
+  `mutants.ts` was updated to anchor on the Case C block's closing lines
+  rather than the whole comment, specifically so it survives future
+  edits to the (now much longer) canary explanation without needing
+  another patch update.
+
 ## Current phase in progress
 
-None — Phase 5 complete, awaiting Phase 6.
+None — Phase 6 complete, awaiting Phase 7.
 
 ## What is explicitly NOT yet built
 
@@ -400,11 +526,51 @@ collection (Phase 21); block run-length encoding (later, alongside GC). No
 wire protocol; no server (no Express app, no WebSocket gateway, no
 database schema, no auth); no client (no React app, no editor binding, no
 DOM rendering); no persistence; no permissions; no offline/reconciliation
-logic; no presence; no version history; no mutation testing (Phase 6), no
-10⁶ nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
+logic; no presence; no version history; no Docker setup; no deployed
+environment. GitHub branch-protection required-status-check wiring for
+`convergence`/`properties`/`nightly-mutation-matrix` remains a manual,
+one-time repo-settings action, as does the nightly workflow's first
+manual `workflow_dispatch` trigger (Claude cannot push branches or
+trigger GitHub Actions runs).
 
 ## Key technical decisions with source citations
 
+- **A mutation-testing check passing is not evidence it can catch its
+  target mutant — only a hand-trace of the MUTATED algorithm against
+  that exact input is.** Phase 6's first M2 and M9 targeted checks both
+  passed against the correct engine and were written specifically "for"
+  those mutants, yet both turned out to be structurally immune to the
+  bug they were meant to catch (see the Phase 6 completed-phase entry
+  for the full trace of each). The failure mode was identical both
+  times: picking an input because it touches the right code region, not
+  because tracing the MUTATED code line by line against that exact input
+  proves it produces a different final state than the correct code. This
+  is the same shape of mistake Phase 5 made with self-invented adversarial
+  cases (below), one level more subtle — here the check even NAMED the
+  right mutant and still didn't discriminate it. The fix both times: hand
+  simulate the mutated algorithm specifically (not re-verify the correct
+  one) to find the precise structural precondition the bug needs to
+  become externally visible, derive the expected literal from that
+  simulation BEFORE running anything, then confirm the run matches the
+  prediction rather than accepting whatever it happened to produce.
+- **The mutation harness had two "propagates uncaught and crashes the
+  whole matrix" bugs, both surfaced by mutants actually misbehaving in
+  ways the harness's happy-path code never anticipated.** `fuzzUntilKilled.ts`
+  originally called `runTrial()` unwrapped; `runTrial.ts`'s own
+  try/catch covers generation/delivery but its `pendingCounts` read
+  happens AFTER that block (never a problem for the real engine, hence
+  never noticed before), so an `assertInvariants` violation thrown from
+  `pendingCount()` crashed the run instead of counting as a kill.
+  `targetedProperties.ts` had the same shape of gap: no try/catch around
+  each PROP-1/PROP-2 trial, so the Case C canary firing (incidentally,
+  under `M1_rank_by_counter` — see the Phase 6 entry) crashed the whole
+  matrix instead of being recorded. Both fixed the same way: wrap the
+  call, treat any thrown exception as a detection. The lesson: a harness
+  built and tested only against a CORRECT engine will have exactly this
+  class of latent gap, because "the code we're testing might throw from
+  a place we assumed was safe" is precisely what mutation testing is
+  for — the bugs it found in its own scaffolding are as real a signal as
+  the mutants it killed.
 - **Phase 5's adversarial suite was corrected against the real Test Plan
   §2.4 table after an initial pass built without it.** The first pass
   (no §2.4 text available that session) guessed 15 of 22 scenarios from
@@ -657,6 +823,7 @@ pnpm test:watch        # Vitest, watch mode
 pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each, invariants active
 pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
+pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
 `pnpm test` currently passes: 54 tests across 10 files, including
@@ -695,3 +862,15 @@ a second, so — unlike convergence/properties — it is NOT excluded from
 the default `pnpm test`; it has its own command purely for an isolated,
 unambiguous signal, and is wired into CI as an explicit named step inside
 the main `ci` job (not a separate job).
+
+`pnpm test:mutation` currently PASSES: 9 of the 10 Test Plan §2.8
+mutants killed by at least one of four suites (pure-convergence fuzzer,
+invariant-checked fuzzer, targeted adversarial checks, targeted property
+checks); `M3_no_case_c` survives every suite here, which is expected —
+it's exactly why MUT-KILL-01 exists. Writes `docs/mutation-matrix.md` on
+every run. Excluded from the default `pnpm test` (transpiling and
+fuzzing ten engine variants isn't inner-loop material, even at the
+reduced sanity budget this command uses); the authoritative full
+10^6-trial MUT-KILL-01 run is separate (`MUT_KILL_01_BUDGET=1000000`,
+what the nightly workflow sets) — see the Phase 6 completed-phase entry
+above for its result.

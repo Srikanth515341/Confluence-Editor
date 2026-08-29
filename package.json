@@ -18,6 +18,7 @@
     "test:convergence": "pnpm --filter @collab-editor/testkit run test:convergence",
     "test:properties": "pnpm --filter @collab-editor/testkit run test:properties",
     "test:adversarial": "pnpm --filter @collab-editor/testkit run test:adversarial",
+    "test:mutation": "pnpm --filter @collab-editor/testkit run test:mutation",
     "check:purity": "node scripts/check-engine-purity.mjs",
     "build": "pnpm -r --if-present run build",
     "format": "prettier --write .",

@@ -270,6 +270,25 @@ export class Engine {
           // current conflict group — stays undecided, keep scanning.
         } else {
           // Case C: `other`'s origin lies outside this conflict group entirely.
+          //
+          // Test-build canary (Phase 6, Test Plan §14.2 MUT-KILL-01 / Engine Spec §6.2
+          // sub-case iii-d): sub-case iii-d claims a Case C node can NEVER affect where
+          // `node` lands. MUT-KILL-01's directed 10^6-trial search (partially overlapping
+          // origin intervals) was built specifically to try to disprove that claim and did
+          // not find a counterexample. This restates the same claim as a live assertion
+          // rather than relying solely on that one search: if `other` would have outranked
+          // `node` in a same-window comparison, that is direct evidence that NOT breaking
+          // here (M3_no_case_c's mutation) could have moved `destIndex` for this exact
+          // input — i.e. this input would be a genuine witness disproving sub-case iii-d,
+          // not just a mutation-testing curiosity. Must never fire on any correct input;
+          // firing it is a hard failure.
+          if (compareRank(other, node) < 0) {
+            throw new Error(
+              `integrate(): Case C reached with candidate ${serializeId(node.id)} whose destination ` +
+                `would have moved past ${serializeId(other.id)} — this disproves Engine Spec §6.2 ` +
+                "sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+            );
+          }
           break;
         }
       }

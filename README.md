@@ -12,14 +12,13 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 5 — the adversarial suite.** All 22 hand-constructed cases
-from Test Plan §2.4 (ADV-01…ADV-22) now pass, each with a literal
-expected output derived by hand rather than computed: concurrent inserts
-at k=2/3/8, tombstone-anchored inserts, split/overlapping deletes,
-reverse-causal delivery, empty-document and boundary edge cases,
-backward-typing runs, combining marks and zero-width joiners (each
-checked in every replica-id ordering, per Test Plan §2.4.1), and
-block-compressible identifier runs.
+🚧 **Phase 6 — mutation testing and the full CI gate.** Ten mutants
+(Test Plan §2.8) are string-patched into isolated copies of the engine
+source and run against every suite: 9 of 10 are killed, several only by
+a hand-picked targeted check after surviving pure convergence fuzzing —
+proof the test suites would actually catch a broken engine, not just
+that they pass against a correct one. The tenth, `M3_no_case_c`, is the
+target of a dedicated directed search (MUT-KILL-01) run to 10^6 trials.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -94,10 +93,27 @@ pnpm test:adversarial
 
 22 hand-constructed cases (Test Plan §2.4) that randomized fuzzing isn't
 aimed at finding on its own — three-way backward-typing runs, a
-combining mark racing an ordinary character for the same anchor,
-tangled nested concurrent inserts, and more. Fast and deterministic, so
-unlike the two suites above it also runs as part of the default
-`pnpm test`.
+combining mark racing an ordinary character for the same anchor, an
+insert whose originRight arrives before its originLeft, and more. Fast
+and deterministic, so unlike the two suites above it also runs as part
+of the default `pnpm test`.
+
+### The mutation matrix
+
+```bash
+pnpm test:mutation
+```
+
+Ten mutants (Test Plan §2.8), each string-patched into an isolated,
+freshly-transpiled copy of the engine source — never the real files —
+then run against every suite. Proof the suites would actually catch a
+broken engine: 9 of 10 mutants are killed, several only after surviving
+pure convergence fuzzing and being caught by a hand-picked targeted
+check instead. The tenth, `M3_no_case_c`, is the subject of a dedicated
+directed search (MUT-KILL-01) run to 10^6 trials — see
+[`docs/mutation-matrix.md`](./docs/mutation-matrix.md) for the current
+results. Excluded from the default `pnpm test`; the nightly workflow
+runs this at full scale on a schedule.
 
 ## Feature status
 
@@ -108,6 +124,7 @@ unlike the two suites above it also runs as part of the default
 | OBSEQ convergence engine                | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet) |
 | Invariant assertions + property tests   | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)            |
 | Adversarial suite                       | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)           |
+| Mutation testing + nightly CI gate      | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th) |
 | Wire protocol                           | ⏳ not started                                                             |
 | Server (coordinator, persistence, auth) | ⏳ not started                                                             |
 | Client (editor binding, presence)       | ⏳ not started                                                             |

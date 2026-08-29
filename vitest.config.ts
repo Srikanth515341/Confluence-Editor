@@ -18,6 +18,12 @@ export default defineConfig({
       // generated cases each and belongs in its own gate, run via
       // `pnpm test:properties` (packages/testkit/vitest.properties.config.ts).
       "**/property/**/*.test.ts",
+      // Same reasoning again: the mutation-testing suite (Test Plan §2.8)
+      // string-patches and dynamically transpiles ten engine variants and
+      // fuzzes each one — run via `pnpm test:mutation`
+      // (packages/testkit/vitest.mutation.config.ts), never swept into
+      // the default run.
+      "**/mutation/**/*.test.ts",
     ],
     environment: "node",
     globals: false,

@@ -11,12 +11,14 @@
     "build": "tsc -p tsconfig.json",
     "test:convergence": "vitest run --config vitest.convergence.config.ts",
     "test:properties": "vitest run --config vitest.properties.config.ts",
-    "test:adversarial": "vitest run --config vitest.adversarial.config.ts"
+    "test:adversarial": "vitest run --config vitest.adversarial.config.ts",
+    "test:mutation": "vitest run --config vitest.mutation.config.ts"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*"
   },
   "devDependencies": {
-    "fast-check": "^4.9.0"
+    "fast-check": "^4.9.0",
+    "typescript": "^5.6.3"
   }
 }
