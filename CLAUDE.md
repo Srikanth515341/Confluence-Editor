@@ -46,12 +46,18 @@ packages/engine      @collab-editor/engine    — OBSEQ. Phase 1 built the data 
                                                  fixpoint), integrate() (the
                                                  origin-bounded placement algorithm,
                                                  Engine Spec §4.3, Cases A/B/C), and
-                                                 localInsert()/localDelete(). No index
-                                                 (§8.5) yet — position lookup during
-                                                 integrate() is a linear scan. Pure: no
-                                                 DOM, no network, no storage, no clock.
-                                                 Only package whose tsconfig excludes
-                                                 "DOM" from lib.
+                                                 localInsert()/localDelete(). Phase 4
+                                                 added invariants.ts (assertInvariants(),
+                                                 all ten I0–I9 runtime assertions) and a
+                                                 ClockEvent log on Engine (mint()/
+                                                 observe() each push one event) that
+                                                 exists solely so I0's assertion can
+                                                 independently replay the clock. No
+                                                 index (§8.5) yet — position lookup
+                                                 during integrate() is a linear scan.
+                                                 Pure: no DOM, no network, no storage,
+                                                 no clock. Only package whose tsconfig
+                                                 excludes "DOM" from lib.
 packages/protocol    @collab-editor/protocol  — binary wire codec + message types,
                                                  shared by client and server.
 packages/server      @collab-editor/server    — Express + WebSocket gateway,
@@ -69,8 +75,15 @@ packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  engineAdapter.ts to the real Engine
                                                  (no more NotImplementedError) — the
                                                  convergence suite now runs against a
-                                                 real, not throwaway, oracle. Depends
-                                                 on engine.
+                                                 real, not throwaway, oracle. Phase 4
+                                                 wired assertInvariants() into
+                                                 engineAdapter.ts (checked after every
+                                                 mutating call, all 10^4 convergence
+                                                 seeds) and added src/property/ — the
+                                                 five PROP-1..5 fast-check suites, run
+                                                 via `pnpm test:properties`, plus a
+                                                 dependency on fast-check. Depends on
+                                                 engine.
 ```
 
 `protocol`, `server`, and `client` still each export one placeholder
@@ -156,7 +169,7 @@ is not implemented yet`). `tests/regression/README.md` documents the
   return order). `rank(n) = [n.bind ? 0 : 1, n.id.r]` per Definition 4.2.
   `packages/engine/src/identifier.ts` gained `serializeId()`, the map-key
   function `byKey`/`applied` are keyed on. `packages/testkit/src/fuzz/
-  engineAdapter.ts` now wires `localInsert`/`localDelete`/`applyRemote`
+engineAdapter.ts` now wires `localInsert`/`localDelete`/`applyRemote`
   straight through to the real `Engine` — `NotImplementedError` is gone
   from the codebase entirely (deleted from `engineAdapter.ts` and its
   re-export in `fuzz/index.ts`), because there is no longer anything for
@@ -196,9 +209,66 @@ is not implemented yet`). `tests/regression/README.md` documents the
     entirely — neither Case A nor Case B applies): the scan has walked
     past this conflict group's boundary; stop and insert here.
 
+- **Phase 4** — Invariant assertions and property-based tests (Engine
+  Spec §5 I0–I9, §6; Test Plan §2.5/§2.6). `packages/engine/src/
+invariants.ts`: `assertInvariants(engine, { quiescent? })`, checking all
+  ten invariants every time it's called — see the ten dedicated bullets
+  below for how each is actually checked (several needed a proxy or a
+  history, not a literal restatement of the spec sentence). Engine.ts
+  gained a `ClockEvent` log (`{kind:"mint"}` / `{kind:"observe",
+remoteCounter}`, pushed inside `mint()`/`observe()` — test/diagnostic
+  only, never read by ordering logic) purely so I0's check can
+  independently replay the correct clock value and compare it against
+  the real one. `packages/testkit/src/fuzz/engineAdapter.ts` now calls
+  `assertInvariants(engine)` after every `localInsert`/`localDelete`/
+  `applyRemote`, and `assertInvariants(engine, { quiescent: true })`
+  inside `pendingCount()` — the one point `runTrial.ts` calls it, exactly
+  once, right after all of a trial's deliveries complete. `pnpm
+test:convergence` passed with all ten invariants active across all
+  60,000 seeds (6 configs × 10,000). Manually verified the check is
+  live, not decorative: temporarily changed `observe()` to
+  `this.clock += 1` (ignoring the remote counter entirely), confirmed
+  `assertInvariants` threw `InvariantViolation: I0 violated: ...`
+  immediately, then reverted — see the I0 bullet below for exactly why a
+  literal-history-replay design was necessary to make this catchable at
+  all from outside `mint()`/`observe()`.
+  `packages/testkit/src/property/` (new): `support.ts` (shared
+  generation/linearization/subsequence helpers, deliberately
+  reimplementing readiness independently of `engine.ts`'s own `ready()`
+  rather than importing it, so the test can't silently share a bug with
+  the code it's checking) and five fast-check suites, each ≥10,000
+  generated cases: `commutativity.property.test.ts` (PROP-1, all four
+  operation-type pairings, `insIns` biased ~86% toward identical
+  positions), `idempotence.property.test.ts` (PROP-2, full-state
+  comparison — text, structure length, AND every node's `deleted` flag),
+  `orderIndependence.property.test.ts` (PROP-3, two independent
+  causality-respecting linearizations of one operation set, built from
+  two mutually-unaware replicas' local histories so the dependency graph
+  has genuine concurrency to linearize differently),
+  `partialKnowledge.property.test.ts` (PROP-4, a prefix of any valid
+  linearization is causally closed by construction, checked as an
+  order-preserving subsequence against the FULL replica's `nodes`
+  including tombstones — not `visible()` — see the dedicated bullet
+  below for why that distinction matters), `clockSkew.property.test.ts`
+  (PROP-5, compares a randomly-clock-skewed merge against the same
+  scenario unskewed rather than only checking the skewed run merges with
+  itself, plus a second, independently-written source grep for
+  Date.now/new Date/performance.now/getTime in `packages/engine/src`).
+  `fast-check@^4.9.0` added as a devDependency of `@collab-editor/testkit`.
+  New root/testkit command `pnpm test:properties`
+  (`packages/testkit/vitest.properties.config.ts`), excluded from the
+  default `pnpm test` the same way `convergence.test.ts` is, and wired
+  into CI as its own job (`.github/workflows/ci.yml`, job `properties`).
+  Also closed a real, pre-existing gap while implementing PROP-5's grep:
+  `scripts/check-engine-purity.mjs`'s FORBIDDEN list and
+  `eslint.config.js`'s engine-purity syntax ban were both missing
+  `getTime` — Engine Spec §10.8 C9 names it explicitly alongside
+  `Date.now`/`new Date`/`performance.now`, but neither existing
+  mechanism had ever checked for it. Both now do.
+
 ## Current phase in progress
 
-None — Phase 3 complete, awaiting Phase 4.
+None — Phase 4 complete, awaiting Phase 5.
 
 ## What is explicitly NOT yet built
 
@@ -209,12 +279,101 @@ collection (Phase 21); block run-length encoding (later, alongside GC). No
 wire protocol; no server (no Express app, no WebSocket gateway, no
 database schema, no auth); no client (no React app, no editor binding, no
 DOM rendering); no persistence; no permissions; no offline/reconciliation
-logic; no presence; no version history; no property-based tests (Phase
-4), no adversarial suite (Phase 5), no mutation testing (Phase 6), no 10⁶
-nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
+logic; no presence; no version history; no adversarial suite (Phase 5),
+no mutation testing (Phase 6), no 10⁶ nightly fuzz run (Phase 6); no
+Docker setup; no deployed environment.
 
 ## Key technical decisions with source citations
 
+- **How each of the ten invariants is actually checked by `assertInvariants()`** — several are NOT a literal restatement of their Engine Spec §5 sentence, because that sentence describes something only checkable with history, or only checkable at prohibitive cost every call:
+  - **I0** (clock advances exactly once per mint) is checked by REPLAYING a
+    dedicated `ClockEvent` log with hard-coded correct max/increment
+    semantics and comparing the replayed value to the actual clock — not
+    by inspecting `nodes`/`pending` at all. Reconstructing "what did this
+    replica mint" from final state is fundamentally unreliable: a delete
+    op that lost the causally-latest race for its target leaves NO trace
+    anywhere in state, so a snapshot-based reconstruction produces false
+    "gaps" for perfectly correct behavior under `C3_DELETE_HEAVY`. The
+    event log sidesteps this by recording facts (a mint happened; observe
+    was called with X) rather than trying to infer them after the fact.
+  - **I1** (identifier uniqueness) is a direct count check: number of
+    nodes vs. number of distinct `(counter, replica)` pairs among them,
+    using a nested `Map<number, Map<number, Node>>` keyed by the raw
+    numbers rather than a `serializeId()` string — see the performance
+    bullet below for why.
+  - **I2** (identifier immutability) needs a per-node snapshot from a
+    PRIOR call to compare against; a single end-of-trial call would make
+    it vacuously true. Tracked in a `WeakMap<Node, NodeSnapshot>` at
+    module scope (safe across engines/trials because Node object
+    identity itself is globally unique — no two trials ever share a Node
+    object, unlike identifiers, which restart at (1, replicaId) every
+    trial).
+  - **I3** (order stability) is checked as a running-maximum scan, not an
+    O(n²) all-pairs recheck or an O(n) array-copy-and-rescan every call:
+    walking the current array left to right, each previously-seen node's
+    OLD index must not dip below the highest OLD index seen so far in the
+    walk. A dip means two already-ordered nodes flipped. This is
+    mathematically equivalent to "the old sequence is a subsequence of
+    the new one" but computable in one pass with no allocation, which
+    mattered once measurement showed the naive version added ~3x runtime
+    to the convergence suite (see below).
+  - **I4** (origin presence at integration time) and **I5** (tombstone
+    retention) sound almost identical from outside `integrate()`, but are
+    checked as two DIFFERENT things: I4 checks that every node's CURRENT
+    origins resolve (a node pointing at a vanished origin), while I5
+    checks that the STRUCTURE never SHRINKS between calls (a node that
+    existed a moment ago is now gone). Right now, with no GC, I5 can only
+    ever fire on a genuine regression (e.g., a future GC bug) — it exists
+    for that future, not because it's expected to catch anything today.
+  - **I6** (scan-window determinism) is checked via its lasting structural
+    consequence, not by re-running `integrate()`: every node must sit
+    strictly between the CURRENT positions of its own `originLeft` and
+    `originRight`. This is necessary-but-not-fully-equivalent to "the
+    algorithm is deterministic," but re-executing integration itself
+    inside an assertion would be circular — the convergence suite's
+    cross-replica text/structure equality is the stronger, independent
+    proof of determinism; this is a cheap, always-on sanity check for the
+    same property.
+  - **I7** (deletion attribution monotonicity) needs the PRIOR
+    `deletedBy` to compare against — same shape as I2, another
+    `WeakMap<Node, Identifier>` populated across calls.
+  - **I8** (grapheme cluster contiguity) is checked directly and
+    literally: for every `bind: true` node, scan the array positions
+    between its `originLeft` and itself for any `bind: false` node
+    sharing that same `originLeft`. Costs nothing on the actual fuzz
+    suite because none of its generated characters are combining marks
+    (`0x61`–`0x7a` only) — this check has never actually executed its
+    inner loop body against real fuzz data, only against hand-constructed
+    scenarios, which is worth remembering if it's ever suspected of
+    hiding a bug.
+  - **I9** (pending buffer drains at quiescence) is the one invariant
+    NOT checked on every call — a nonempty `pending` mid-trial is normal
+    (Engine Spec §4.2), so `assertInvariants` only evaluates it when
+    called with `{ quiescent: true }`. `engineAdapter.ts` passes that
+    flag from exactly one call site: inside `pendingCount()`, which
+    `runTrial.ts` calls exactly once, immediately after all of a trial's
+    deliveries are done — piggybacking on an existing, already-correct
+    "this is the quiescence point" signal rather than inventing a new one.
+    — Engine Spec §5 (I0–I9), Test Plan §2.6.
+- **`assertInvariants()` measurably costs ~3x the convergence suite's
+  runtime, and that cost was cut in half twice before being accepted.**
+  A first working version (string-keyed `Map<string,Node>` via
+  `serializeId()`, an I3 check that copied and rescanned the whole node
+  array every call, redundant origin lookups repeated across I4/I6/I8)
+  measured ~162ms/seed on `C5_WIDE` (8 replicas) — 10,000 seeds of just
+  that one config would have taken ~27 minutes. Resolving each origin
+  ONCE per node and sharing the result across I4/I6/I8, switching to a
+  nested numeric-keyed map to avoid `serializeId()` string allocation on
+  the hot path (kept only for violation MESSAGES, which are cold), and
+  folding I3's check into the same pass instead of a separate
+  array-copy-and-rescan brought this to ~86ms/seed — the full 60,000-seed
+  suite completed in the same run that also passed all 6 configs. The
+  general lesson worth keeping: `serializeId()`-based lookups and
+  WeakMap-based history are both fine in isolation, but this function
+  runs after EVERY mutation across every fuzz seed, so a per-call cost
+  that looks trivial in isolation is not trivial at this call volume —
+  measure before accepting a design, not after a CI timeout.
+  — Test Plan §2.6.
 - **Case A's tie-break requires BOTH `originLeft` equality (to enter the
   branch) AND `originRight` equality (to actually stop scanning) — checking
   only `originLeft` is the exact historical bug.** A node reached mid-scan
@@ -244,7 +403,7 @@ nightly fuzz run (Phase 6); no Docker setup; no deployed environment.
   recomputing `visible()` after each tombstone.** `deleted` mutation
   removes a node from `vis(S)` immediately, which would shift every
   subsequent index if recomputed mid-loop — the caller's `(visibleIndex,
-  count)` describes a contiguous range in the sequence AS IT STOOD when the
+count)` describes a contiguous range in the sequence AS IT STOOD when the
   call began, not a moving target. API Spec §1.4.
 - **`integrate()` throws if an origin isn't present in `byKey`, rather than
   silently treating it as document-start/end.** This can only happen if a
@@ -359,9 +518,10 @@ There is no `pnpm dev` yet — no server or client app exists to run.
 ## How to run the test suite
 
 ```bash
-pnpm test              # Vitest, all packages EXCEPT the convergence suite, single run
+pnpm test              # Vitest, all packages EXCEPT the convergence + property suites, single run
 pnpm test:watch        # Vitest, watch mode
-pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each
+pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each, invariants active
+pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
 ```
 
 `pnpm test` currently passes: 32 tests across 9 files, including
@@ -376,11 +536,19 @@ divergent, and completes 10,000 toy-engine seeds in ~2s, well under the
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),
-zero divergences, zero stuck-pending, zero errors. Total wall time on the
-reference machine was ~510s (C5-wide, at 8 replicas, is the slowest single
-config at ~280s — this is a fuzz-suite runtime, not a hot-path
-correctness concern). It is wired into CI as its own job
+zero divergences, zero stuck-pending, zero errors, with all ten Engine
+Spec §5 invariants (I0–I9) actively checked via `assertInvariants()`
+after every mutating call across every one of those 60,000 seeds (Test
+Plan §2.6) — not merely a passing convergence check running alongside an
+inert invariant module. It is wired into CI as its own job
 (`.github/workflows/ci.yml`, job `convergence`), separate from the main
 `ci` job, so GitHub reports it as its own named check — but actually
 marking that check as a branch-protection-required status is still a
 manual, one-time GitHub Settings action that hasn't been done yet.
+
+`pnpm test:properties` currently PASSES: 5 properties (PROP-1…5, Test
+Plan §2.5) at 10,000 fast-check-generated cases each, plus a sixth,
+independent source-grep test confirming `packages/engine/src` contains
+no `Date.now`/`new Date`/`performance.now`/`getTime` (Engine Spec §10.8
+C9). Wired into CI as its own job (`properties`), for the same reasons as
+`convergence` — its own runtime budget, its own named check.

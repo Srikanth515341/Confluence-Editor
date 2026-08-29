@@ -23,6 +23,10 @@ const FORBIDDEN = [
     pattern: /\bperformance\.now\s*\(/,
     reason: "wall-clock read (performance.now) — Engine Spec I0",
   },
+  {
+    pattern: /\.getTime\s*\(/,
+    reason: "wall-clock read (getTime) — Engine Spec §10.8 C9",
+  },
   { pattern: /\bdocument\s*\./, reason: "DOM access (document) — PRD NG-3 / FR-CE-14" },
   { pattern: /\bwindow\s*\./, reason: "DOM/browser global access (window) — PRD NG-3" },
   { pattern: /\bfetch\s*\(/, reason: "network access (fetch) — Engine Spec §5 purity" },

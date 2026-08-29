@@ -7,9 +7,16 @@
 // (I0, C9).
 
 export type { Identifier } from "./identifier.js";
-export { compareIds } from "./identifier.js";
+export { compareIds, serializeId } from "./identifier.js";
 export type { Node } from "./node.js";
-export type { DeleteOperation, InsertOperation, Operation, UndeleteOperation } from "./operation.js";
+export type {
+  DeleteOperation,
+  InsertOperation,
+  Operation,
+  UndeleteOperation,
+} from "./operation.js";
 export { isClusterContinuing } from "./grapheme.js";
 export { Engine } from "./engine.js";
-export type { EngineStats } from "./engine.js";
+export type { ClockEvent, EngineStats } from "./engine.js";
+export { assertInvariants, InvariantViolation } from "./invariants.js";
+export type { AssertInvariantsOptions } from "./invariants.js";

@@ -1,7 +1,12 @@
 import type { Identifier } from "./identifier.js";
 import { compareIds, serializeId } from "./identifier.js";
 import type { Node } from "./node.js";
-import type { DeleteOperation, InsertOperation, Operation, UndeleteOperation } from "./operation.js";
+import type {
+  DeleteOperation,
+  InsertOperation,
+  Operation,
+  UndeleteOperation,
+} from "./operation.js";
 import { isClusterContinuing } from "./grapheme.js";
 
 /** Structural metrics feeding PRD M8 / RFC §7.8's tombstone-ratio observability. */
@@ -10,6 +15,22 @@ export interface EngineStats {
   readonly tombstones: number;
   readonly visibleLength: number;
 }
+
+/**
+ * Test/diagnostic-only record of every clock-affecting call, consumed
+ * exclusively by Invariant I0's runtime assertion (invariants.ts, Test
+ * Plan §2.6) to independently REPLAY what the clock should be — using
+ * only the correct max/increment semantics restated from scratch — and
+ * compare that against the engine's actual clock. This is what lets the
+ * assertion catch a defect where OBSERVE's body was changed from merging
+ * via `Math.max` to an unconditional increment: the replay wouldn't
+ * reflect that change (it hard-codes the correct semantics), so it would
+ * disagree with the now-wrong actual clock. Mirrors this project's
+ * existing "two independent mechanisms" pattern (engine-purity's ESLint
+ * rule + grep script) — never read by mint()/observe()/integrate().
+ */
+export type ClockEvent =
+  { readonly kind: "mint" } | { readonly kind: "observe"; readonly remoteCounter: number };
 
 /**
  * Disambiguator rank (Engine Spec Definition 4.2). Binding rank precedes
@@ -75,8 +96,16 @@ export class Engine {
   /** Operations buffered because their causal dependencies are unmet (Engine Spec §4.2). */
   readonly pending: Operation[] = [];
 
+  /** See {@link ClockEvent}. Test/diagnostic-only — never consulted by ordering logic. */
+  private readonly clockEvents: ClockEvent[] = [];
+
   constructor(replicaId: number) {
     this.replicaId = replicaId;
+  }
+
+  /** See {@link ClockEvent}. Exposed only for Invariant I0's runtime assertion. */
+  get clockEventLog(): readonly ClockEvent[] {
+    return this.clockEvents;
   }
 
   /**
@@ -100,6 +129,7 @@ export class Engine {
    */
   mint(): Identifier {
     this.clock += 1;
+    this.clockEvents.push({ kind: "mint" });
     return { c: this.clock, r: this.replicaId };
   }
 
@@ -113,6 +143,7 @@ export class Engine {
    */
   observe(remoteCounter: number): void {
     this.clock = Math.max(this.clock, remoteCounter);
+    this.clockEvents.push({ kind: "observe", remoteCounter });
   }
 
   /** Current clock value. Exposed for tests and diagnostics only — never for ordering decisions. */
@@ -192,7 +223,8 @@ export class Engine {
    */
   private integrate(node: Node): void {
     const leftIndex = node.originLeft === null ? -1 : this.indexOfOrigin(node.originLeft);
-    const rightIndex = node.originRight === null ? this.nodes.length : this.indexOfOrigin(node.originRight);
+    const rightIndex =
+      node.originRight === null ? this.nodes.length : this.indexOfOrigin(node.originRight);
 
     if (leftIndex + 1 === rightIndex) {
       // Nothing currently sits between our origins — no conflict to resolve.
@@ -360,7 +392,11 @@ export class Engine {
   }
 
   /** Mints and applies a local insert, returning the operation to broadcast (API Spec §1.4). */
-  localInsert(visibleIndex: number, value: number, bind: boolean = isClusterContinuing(value)): InsertOperation {
+  localInsert(
+    visibleIndex: number,
+    value: number,
+    bind: boolean = isClusterContinuing(value),
+  ): InsertOperation {
     const vis = this.visible();
     const leftNode = visibleIndex > 0 ? vis[visibleIndex - 1] : undefined;
     const rightNode = visibleIndex < vis.length ? vis[visibleIndex] : undefined;
