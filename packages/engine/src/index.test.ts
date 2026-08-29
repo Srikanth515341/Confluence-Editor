@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { ENGINE_PACKAGE_NAME } from "./index.js";
+import { Engine, compareIds, isClusterContinuing } from "./index.js";
 
-describe("engine package scaffolding", () => {
-  it("exists and is importable", () => {
-    expect(ENGINE_PACKAGE_NAME).toBe("@collab-editor/engine");
+describe("engine package public surface", () => {
+  it("exports the Phase 1 primitives", () => {
+    expect(typeof Engine).toBe("function");
+    expect(typeof compareIds).toBe("function");
+    expect(typeof isClusterContinuing).toBe("function");
   });
 });
