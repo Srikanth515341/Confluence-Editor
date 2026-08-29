@@ -12,13 +12,26 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 6 — mutation testing and the full CI gate.** Ten mutants
-(Test Plan §2.8) are string-patched into isolated copies of the engine
-source and run against every suite: 9 of 10 are killed, several only by
-a hand-picked targeted check after surviving pure convergence fuzzing —
-proof the test suites would actually catch a broken engine, not just
-that they pass against a correct one. The tenth, `M3_no_case_c`, is the
-target of a dedicated directed search (MUT-KILL-01) run to 10^6 trials.
+🚧 **Phase 7 — binary wire codec.** `packages/protocol` implements the
+full OPS-channel binary format, verified field-by-field against the real
+API/Protocol/Data Spec v1.0 text after an initial pass built without it
+(§1.3–§1.4, §3.1, §3.2, §3.5) — several mismatches were found and fixed,
+including an invented frame-level flags byte that isn't in the spec.
+LEB128 varints, the stamp/string/uuid/scalar primitives, the exact
+3-byte envelope (protocolVersion, channel, messageType — payload starts
+immediately at offset 3, no extra byte), and all seven OPS message types
+with spec-exact numeric values, including OP_INSERT_RUN/OP_DELETE_BATCH
+expansion into real engine operations and OP_ACK/OP_REJECT as
+server-only batch messages. There is no separate operation UUID anywhere
+on the wire — the OBSEQ identifier itself (`counter`, `replica`) is the
+operation's identity. Malformed frames (reserved flag bits, a nonzero
+client `seq`, a client-origin OP_ACK/OP_REJECT, a run/batch below its
+minimum count, an unknown message type or reject reason,
+truncated/trailing bytes) are rejected with a specific, typed error,
+never a crash. A single insert at counters near 50,000 measures exactly
+18 bytes, matching spec §1.3. CONTROL/PRESENCE message types and the
+socket itself are still not built (Phases 9, 31, 8) — nothing yet sends
+a frame anywhere.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -125,7 +138,8 @@ runs this at full scale on a schedule.
 | Invariant assertions + property tests   | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)            |
 | Adversarial suite                       | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)           |
 | Mutation testing + nightly CI gate      | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th) |
-| Wire protocol                           | ⏳ not started                                                             |
+| Binary wire codec (OPS channel)         | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)       |
+| Socket / CONTROL / PRESENCE channels    | ⏳ not started (Phases 8, 9, 31)                                          |
 | Server (coordinator, persistence, auth) | ⏳ not started                                                             |
 | Client (editor binding, presence)       | ⏳ not started                                                             |
 | Offline & reconciliation                | ⏳ not started                                                             |

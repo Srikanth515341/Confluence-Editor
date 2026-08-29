@@ -9,5 +9,12 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@collab-editor/engine": "workspace:*"
+  },
+  "devDependencies": {
+    "fast-check": "^4.9.0",
+    "typescript": "^5.6.3"
   }
 }
