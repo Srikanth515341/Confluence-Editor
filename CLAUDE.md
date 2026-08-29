@@ -85,40 +85,59 @@ packages/protocol    @collab-editor/protocol  — binary wire codec + message ty
                                                  values/names (src/messages.ts). A single
                                                  insert at counters near 50,000 measures
                                                  exactly 18 bytes, matching API Spec §1.3.
-                                                 CONTROL/PRESENCE message types are still not
-                                                 built (Phases 9, 31) — the socket itself now
-                                                 exists (Phase 8, packages/server).
-                                                 Depends on engine (for Identifier/Operation
+                                                 Phase 9 added the CONTROL channel: src/
+                                                 controlMessages.ts (ControlMessageType enum,
+                                                 spec-exact 0x01-0x0E values; the 9 message
+                                                 types this phase implements — HELLO, WELCOME,
+                                                 SNAPSHOT, SYNC_COMPLETE, PING, PONG, LEAVE,
+                                                 GOODBYE, ERROR — plus CATCHUP_*/ALREADY_HAVE/
+                                                 PERMISSION_CHANGED reserved-but-unimplemented);
+                                                 src/controlCodec.ts (encode/decodeControlFrame,
+                                                 same envelope shape as OPS, C→S/S→C direction
+                                                 enforcement); src/snapshotBody.ts (the
+                                                 structure-form SNAPSHOT body codec — a Phase-9
+                                                 placeholder serialization, EXPECTED to be
+                                                 reworked once Phase 20's block run-length
+                                                 encoding lands, not merely unverified). PRESENCE
+                                                 message types are still not built (Phase 31).
+                                                 Depends on engine (for Identifier/Operation/Node
                                                  types and, in tests only, Engine itself).
 packages/server      @collab-editor/server    — Express + WebSocket gateway, Document
-                                                 Coordinator. Phase 8 built the whole
-                                                 in-memory path: config.ts (PORT from env);
-                                                 logger.ts (structured JSON logging, used for
-                                                 connect/disconnect); sendQueues.ts
-                                                 (ConnectionSendQueues — three separate
-                                                 physical per-connection queues for OPS/
-                                                 CONTROL/PRESENCE, drained strictly in
-                                                 priority order, PRESENCE's backpressure-shed
-                                                 policy); documentCoordinator.ts
-                                                 (DocumentCoordinator — one per open document,
-                                                 holding createEngine(0) per API Spec §6.1,
-                                                 replica id 0 reserved for the server;
-                                                 watermarks/opsSinceSnap/lastSnapAt exist as
-                                                 unused scaffolding fields for Phases 16-17);
-                                                 ingest.ts (toOperations() — expands any
-                                                 inbound OpsMessage into engine Operations);
-                                                 httpApp.ts (Express, GET /healthz); gateway.ts
-                                                 (the WebSocketServer at /v1/rt, subprotocol
-                                                 obseq.v1, binary-frames-only enforcement,
-                                                 the interim documentId query-param room
-                                                 binding, and the ingress/broadcast pipeline);
-                                                 server.ts (ties httpApp + gateway onto one
-                                                 shared http.Server). Persistence, acks,
-                                                 auth, presence, and the real CONTROL-channel
-                                                 handshake are NOT built yet (Phases 9, 15-17,
-                                                 26-29, 31) — state is in-memory only and lost
-                                                 on restart, which is correct for this phase.
-                                                 Depends on engine + protocol.
+                                                 Coordinator. Phase 8 built the in-memory OPS
+                                                 path (config.ts, logger.ts, sendQueues.ts's
+                                                 three-priority-queue ConnectionSendQueues,
+                                                 httpApp.ts, server.ts). Phase 9 built the real
+                                                 sync handshake, replacing Phase 8's interim
+                                                 documentId-query-param binding entirely:
+                                                 handshake.ts (buildWelcomeMessage/
+                                                 buildSnapshotMessage, and the live
+                                                 assertSnapshotFormAllowed guard — API Spec
+                                                 §3.6.3 forbids form:0 to an editor/owner, and
+                                                 every session is hardcoded EDITOR this phase,
+                                                 so SNAPSHOT is unconditionally form:1);
+                                                 heartbeat.ts (the three DISTINCT §3.6.11
+                                                 liveness constants — 3s ping / 8s presence-
+                                                 stale / 10min session-inactive — with only the
+                                                 first two wired; session-inactive eviction is
+                                                 scaffolding only, per §11.4);
+                                                 documentCoordinator.ts (CoordinatorSession now
+                                                 carries role/userId/displayName/lastPingAt/
+                                                 presenceStale/staleTimer; watermarks is now
+                                                 live, updated from PING's lastAppliedSeq;
+                                                 replica-id allocation persists for a
+                                                 document's whole in-memory lifetime — a
+                                                 coordinator is no longer deleted when its last
+                                                 session leaves, specifically so replica ids are
+                                                 never reused, API Spec §3.6.2); gateway.ts
+                                                 (connections now start unbound and complete a
+                                                 real HELLO→WELCOME→SNAPSHOT handshake before
+                                                 any OPS/PING/SYNC_COMPLETE/LEAVE frame is
+                                                 accepted; `Gateway.close()` now terminates every
+                                                 open socket so shutdown can't hang). Persistence,
+                                                 acks, auth, and presence are NOT built yet
+                                                 (Phases 15-17, 26-29, 31) — state is in-memory
+                                                 only and lost on restart, which is correct for
+                                                 this phase. Depends on engine + protocol.
 packages/client       @collab-editor/client   — React app + editor binding
                                                  (DomWriter, input pipeline, presence).
                                                  The only package with DOM lib types.
@@ -870,31 +889,187 @@ engine.text() === "a"`), a text frame closing with 1003, a missing-
   same 2-character text on both sides via the real OBSEQ algorithm, not
   a mock.
 
+- **Phase 9** — Sync handshake, fresh connection (API/Protocol/Data Spec
+  §3.6.1–§3.6.3, §3.6.8, §3.6.11, §3.7.1; Test Plan §11.2). Built against
+  the real spec text pasted in up front — like Phase 8, no self-derive-
+  then-correct pass needed. New `packages/protocol/src/`:
+  `controlMessages.ts` (`ControlMessageType` — HELLO=0x01 through
+  GOODBYE=0x0E, spec-exact; the 9-member `ControlMessage` union this
+  phase implements — `HelloMessage`, `WelcomeMessage`, `SnapshotMessage`,
+  `SyncCompleteMessage`, `PingMessage`, `PongMessage`, `LeaveMessage`,
+  `GoodbyeMessage`, `ErrorMessage`; `GoodbyeReason` with spec-exact 0-3
+  values; `SessionRole`/`SyncMode`/`SnapshotForm` enums); `controlCodec.ts`
+  (`encodeControlFrame`/`decodeControlFrame` — same 3-byte-envelope shape
+  as OPS, `channel = CONTROL (0x03)`, C→S/S→C direction enforcement
+  mirroring Phase 7's OP_ACK/OP_REJECT pattern); `snapshotBody.ts` (see
+  its own paragraph below). `messages.ts` gained `peekChannel()` — reads
+  offset 1 directly, letting `gateway.ts` pick OPS vs. CONTROL decoding
+  without committing to either first, now that one socket carries both.
+  New `packages/server/src/`: `handshake.ts`, `heartbeat.ts`; `gateway.ts`
+  rewritten around a real handshake instead of Phase 8's `documentId`
+  query param; `documentCoordinator.ts`'s `CoordinatorSession` extended
+  with session state.
+
+  **The SNAPSHOT structure-form body (`snapshotBody.ts`) is a genuinely
+  different kind of placeholder than Phase 5/7's unverified-guess
+  caveats, and is documented as such rather than flagged identically.**
+  The API Spec explicitly leaves this byte layout undefined for this
+  phase — not "not yet pasted," but structurally deferred, because the
+  real serialization depends on block run-length encoding (Engine Spec
+  §7.5), which isn't built until Phase 20. So this phase's design (one
+  record per node — `flags` byte with bit0/1/2/3/4 =
+  hasOriginLeft/hasOriginRight/bind/deleted/hasDeletedBy, then `stamp id`,
+  optional origin stamps, `scalar value`, optional `stamp deletedBy`,
+  reusing Phase 7's stamp/optional-stamp/scalar primitives directly) is
+  EXPECTED to be replaced/reworked in Phase 20, not merely "possibly
+  wrong until cross-checked." The resolution path is "rebuild it in
+  Phase 20," not "paste the real spec text and diff." Confirmed to
+  actually round-trip and correctly seed a fresh client's view: an engine
+  with inserts, a concurrent delete, and tombstones present round-trips
+  through `encodeStructureSnapshotBody`/`decodeStructureSnapshotBody`
+  with every field intact (`snapshotBody.test.ts`), and separately, two
+  and three real WebSocket clients joining a document with existing
+  content each decode a SNAPSHOT whose visible text matches exactly
+  (`gateway.test.ts`).
+
+  **Two real bugs surfaced integrating Phase 8's code with Phase 9's
+  requirements — both fixed, not worked around**:
+  1. Phase 8's "delete the coordinator when its last session leaves"
+     hygiene (invented in Phase 8, not spec-mandated) directly violated
+     API Spec §3.6.2's "replica ids NEVER reused, NEVER reclaimed":
+     deleting the coordinator resets its replica-id counter, so a
+     document that empties out and is rejoined would silently hand out
+     an already-used id. Caught by this phase's own DoD test (50
+     sequential connect/disconnect cycles all landed on replica id 1
+     instead of 1..50). Fixed by simply not deleting the coordinator on
+     empty — with no persistence yet, keeping it alive in memory for the
+     process's lifetime is the only way to honor "never reused," and is
+     no different in kind from Phase 8's own "state is in-memory only"
+     stance.
+  2. `Gateway.close()` only called `wss.close()`, which stops accepting
+     new connections but does nothing to already-open sockets — a test
+     leaving any WebSocket connection open past the end of a test hung
+     `httpServer.close()` (and the test's `afterEach` hook) for the full
+     10-second hook timeout. Fixed by having `close()` iterate `wss.clients`
+     and `terminate()` every open socket first. This is a real production
+     robustness fix, not just a test convenience — the old code would have
+     hung an actual graceful shutdown attempt the same way with any client
+     still connected.
+
+  **WELCOME's participant list membership** (does it include the session
+  currently being welcomed, or just "everyone else"?) isn't specified
+  either way by the spec text — an application-level scoping choice, not
+  a byte-layout invention, so decided here rather than asked about (the
+  same category of call Phase 8 made for its `documentId` interim
+  binding and replica-id allocation scheme): `listParticipants()` returns
+  the full roster INCLUDING the new session, treating WELCOME as a
+  complete point-in-time snapshot rather than special-casing "everyone
+  but me."
+
+  **`ErrorMessage`'s wire format is fully implemented and round-trip
+  tested, but nothing constructs one this phase.** The spec text
+  available doesn't enumerate `code`'s semantic values (unlike
+  `RejectReason`, which Phase 7 got verbatim), and no DoD scenario
+  requires sending one — protocol violations during handshake instead
+  reuse Phase 8's existing pattern of closing with a specific WebSocket
+  close code (1008 for a decode failure or "first frame wasn't HELLO",
+  1003 for a text frame). Documented in `controlMessages.ts` so a later
+  phase that needs real error codes defines them against real spec text
+  rather than inventing them here under schedule pressure.
+  `GoodbyeMessage`/`LeaveMessage` are similarly fully implemented and
+  round-trip tested; `LEAVE` is handled (logged) when received, but
+  session-eviction paths that would legitimately SEND a `GOODBYE` are
+  Phase 21 scaffolding, per the phase brief, so nothing constructs one
+  yet either.
+
+  **Heartbeat (§3.6.11)**: `heartbeat.ts` keeps `PING_INTERVAL_MS` (3s),
+  `PRESENCE_STALE_MS` (8s), and `SESSION_INACTIVE_MS` (10min) as three
+  separate constants per the phase brief's explicit "do not merge them"
+  instruction, even though the first two are numerically close and easy
+  to conflate. Only the first two are live: `onPingReceived()` updates
+  `lastPingAt`, clears `presenceStale` (logging a fresh transition if it
+  was set), and re-arms an 8-second timer (`armPresenceStaleTimer`) that
+  marks the session stale and logs a warning if it fires — no presence
+  system exists to actually remove anything yet (Phase 31), so "removed"
+  per the spec text becomes "logged/marked" per the phase brief's own
+  scoping. `SESSION_INACTIVE_MS` is defined and cited (API Spec §11.4 in
+  a comment) but read by no code — intentionally scaffolding only.
+  Tested with Vitest's fake timers (`vi.useFakeTimers()`/
+  `advanceTimersByTime()`), not real waits: a 9-second advance with no
+  intervening ping marks a session stale exactly at the 8,000ms boundary
+  (not before), a ping received at 7s resets the window, and a simulated
+  5 minutes of on-schedule 3-second pings never marks the session stale
+  — proving the DoD's "keeps a connection alive for 5 minutes idle"
+  claim without a literally-5-minute-long test. Also verified over a
+  REAL WebSocket connection in `gateway.test.ts`: a real PING gets a real
+  PONG on the CONTROL channel (not OPS), echoing `clientTimeMs` and
+  reporting `serverSeq`, and `coordinator.watermarks` — Phase 8
+  scaffolding, unused until now — is live as of this phase, updated from
+  each PING's `lastAppliedSeq`.
+
+  **A subtle test-harness race, not a product bug, that's worth
+  remembering**: the first version of `gateway.test.ts`'s handshake
+  helper called `ws.once("message", ...)` separately for WELCOME and then
+  again for SNAPSHOT. Because the server enqueues both back-to-back, the
+  SNAPSHOT frame could arrive and fire with NO listener attached in the
+  gap between awaiting WELCOME and registering the next `once` — a
+  classic missed-event race, not a server defect. Every affected test
+  hung until diagnosed. Fixed with an `IncomingFrames` buffering reader
+  registered once, immediately after the socket opens, that queues
+  frames arriving with no active waiter and hands them out FIFO — the
+  same shape of fix a real client SDK would need for the same reason.
+
+  **DoD verification**: `pnpm test` passes 147 tests across 19 files (up
+  from 117) — `controlCodec.test.ts` (11 tests, including a 5,000-case
+  round-trip property test for each direction), `snapshotBody.test.ts`
+  (5 tests, including a 2,000-case round-trip property test and a real
+  `Engine`'s node list), `handshake.test.ts` (5 tests — the DoD's
+  "SNAPSHOT form:0 to an editor is rejected in code" requirement, plus
+  `assertSnapshotFormAllowed`'s VIEWER/STRUCTURE-always-allowed cases),
+  `heartbeat.test.ts` (6 tests, fake-timer-based, described above), and
+  `gateway.test.ts` (9 tests, rewritten around the real handshake): a
+  fresh client completing HELLO→WELCOME→SNAPSHOT→SYNC_COMPLETE against a
+  real server; two AND three real clients joining a document with
+  existing content each receiving it correctly via SNAPSHOT; 50
+  sequential connect/disconnect cycles all landing on 50 distinct
+  replica ids in order; a non-HELLO first frame closing with 1008; a
+  text frame closing with 1003 even mid-handshake; cross-client
+  convergence still working end-to-end through the new handshake; and
+  the two real-connection heartbeat checks described above.
+
 ## Current phase in progress
 
-None — Phase 8 complete, awaiting Phase 9.
+None — Phase 9 complete, awaiting Phase 10.
 
 ## What is explicitly NOT yet built
 
 Undo/redo's real resurrection semantics beyond Undelete's structural
 inverse (Phase 36); the indexed position structure (Phase 19) — integrate()
 currently locates origins via a linear `indexOf` scan, not an index; garbage
-collection (Phase 21); block run-length encoding (later, alongside GC). The
-OPS channel's binary codec exists (Phase 7) and the WebSocket gateway now
-carries it end to end (Phase 8), but CONTROL/PRESENCE message types (Phases
-9, 31) do not exist, so the real connection handshake, presence broadcast,
-and any CONTROL-channel behavior are all unbuilt — Phase 8's `documentId`
-query-param room binding is an explicitly-temporary stand-in for the real
-handshake. No persistence (no database schema, no snapshotting, no acks —
-`DocumentCoordinator`'s `watermarks`/`opsSinceSnap`/`lastSnapAt` fields
-exist but are unused no-ops, Phases 15-17); no auth (Phases 26-29) — any
-WebSocket client can join any document by guessing its id, which is correct
-for this phase and not yet a security concern since nothing is exposed
-publicly; no client (no React app, no editor binding, no DOM rendering);
-no permissions; no offline/reconciliation logic; no version history; no
-Docker setup; no deployed environment. Server state is in-memory only and
-lost on restart — correct for Phase 8, not yet for anything after Phase
-15. GitHub branch-protection required-status-check wiring for
+collection (Phase 21); block run-length encoding (later, alongside GC) — and
+because of that, SNAPSHOT's structure-form body serialization
+(`packages/protocol/src/snapshotBody.ts`) is a deliberate Phase 9 placeholder
+EXPECTED to be reworked in Phase 20, not a finished format. The OPS and
+CONTROL channels both now flow end to end (Phases 7-9); PRESENCE message
+types and any presence broadcast do not exist yet (Phase 31) — a stale
+session is only logged/marked, never actually removed from anything.
+Reconnection (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.7) is not built —
+only fresh connections work; a client that disconnects and reconnects
+completes a brand-new fresh handshake (with a brand-new replica id) rather
+than resuming. Session-inactivity eviction (10 minutes with no PING) is
+scaffolded (constant defined, cited to §11.4) but not wired to anything —
+Phase 21's concern. No persistence (no database schema, no snapshotting,
+no acks — `DocumentCoordinator`'s `opsSinceSnap`/`lastSnapAt` fields exist
+but are unused no-ops, Phases 15-17; `watermarks` is live as of Phase 9 but
+only in memory, nothing durable); no auth (Phases 26-29) — any WebSocket
+client can join any document by guessing its id and is unconditionally
+granted the EDITOR role, which is correct for this phase and not yet a
+security concern since nothing is exposed publicly; no client (no React
+app, no editor binding, no DOM rendering); no permissions; no offline/
+reconciliation logic; no version history; no Docker setup; no deployed
+environment. Server state is in-memory only and lost on restart — correct
+through Phase 9, not yet for anything after Phase 15. GitHub branch-
+protection required-status-check wiring for
 `convergence`/`properties`/`nightly-mutation-matrix` remains a manual,
 one-time repo-settings action, as does the nightly workflow's first
 manual `workflow_dispatch` trigger (Claude cannot push branches or
@@ -1209,7 +1384,7 @@ pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constru
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
-`pnpm test` currently passes: 117 tests across 15 files, including
+`pnpm test` currently passes: 147 tests across 19 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
@@ -1236,7 +1411,17 @@ all with no network involved; `gateway.test.ts`'s 6 tests against a REAL
 connections — the health endpoint, binary frame exchange, a text frame
 closing with 1003, a missing-`documentId` connection closing with 1008,
 and two real WebSocket clients each driving their own local `Engine`
-converging, both sequentially and under genuine concurrency).
+converging, both sequentially and under genuine concurrency), and Phase
+9's additions: `packages/protocol/src/controlCodec.test.ts` (11 tests,
+including a 5,000-case round-trip property test per direction) and
+`snapshotBody.test.ts` (5 tests, including a 2,000-case round-trip
+property test), plus `packages/server/src/handshake.test.ts` (5 tests),
+`heartbeat.test.ts` (6 tests, fake-timer-based), and a rewritten
+`gateway.test.ts` (9 tests, now built around the real HELLO/WELCOME/
+SNAPSHOT handshake rather than Phase 8's `documentId` query param — see
+the Phase 9 completed-phase entry above for what each test covers,
+including the 50-cycle distinct-replica-id check and the two real-bug
+fixes that check surfaced).
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),

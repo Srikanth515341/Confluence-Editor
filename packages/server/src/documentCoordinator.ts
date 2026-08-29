@@ -1,4 +1,5 @@
 import { Engine } from "@collab-editor/engine";
+import { SessionRole, type ParticipantInfo } from "@collab-editor/protocol";
 import type { ConnectionSendQueues } from "./sendQueues.js";
 
 /**
@@ -9,19 +10,36 @@ import type { ConnectionSendQueues } from "./sendQueues.js";
  */
 export const SERVER_REPLICA_ID = 0;
 
+/**
+ * Per-connection state, populated once a HELLO/WELCOME handshake completes
+ * (Phase 9, API Spec §3.6.1-3.6.2). `lastPingAt`/`presenceStale`/
+ * `staleTimer` are heartbeat.ts's liveness bookkeeping (§3.6.11) — mutated
+ * there, not read for any other purpose.
+ */
 export interface CoordinatorSession {
   readonly sessionId: string;
   readonly replicaId: number;
   readonly queues: ConnectionSendQueues;
+  /** Hardcoded EDITOR for every session this phase — real roles/auth are Phase 26-29 (API Spec §3.6.2). */
+  readonly role: SessionRole;
+  /** Placeholder UUID this phase — real users don't exist until Phase 26. */
+  readonly userId: string;
+  readonly displayName: string;
+  /** Epoch ms of the last PING received. Updated by heartbeat.ts's `onPingReceived`. */
+  lastPingAt: number;
+  /** True once 8s have passed with no PING (§3.6.11) — logged/marked only, since no presence system exists yet. */
+  presenceStale: boolean;
+  /** The pending presence-stale timeout, so a new PING can cancel and restart it. `undefined` before the first PING/join. */
+  staleTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 /**
  * One Document Coordinator per open document (RFC §5), holding the
  * server-side engine instance every connected session's operations flow
- * through. Fields exactly match API Spec §6.1's list; `watermarks`,
- * `opsSinceSnap`, and `lastSnapAt` are scaffolding for persistence/snapshot
- * phases (15-17) and are unused no-ops here — this phase only reads/writes
- * `engine` and `currentSeq`.
+ * through. Fields exactly match API Spec §6.1's list; `watermarks` is now
+ * live (updated from each session's PING, §3.6.11 — mirrors
+ * `sessions.last_ack_seq`); `opsSinceSnap`/`lastSnapAt` remain unused
+ * scaffolding for Phase 17.
  */
 export class DocumentCoordinator {
   readonly documentId: string;
@@ -30,7 +48,7 @@ export class DocumentCoordinator {
   /** API Spec §6.1: `currentSeq: bigint`. Assigned once per ingested OPS frame — see gateway.ts's ingest path for why frame-granularity, not per-underlying-operation. */
   currentSeq = 0n;
 
-  /** Scaffolding for Phase 16 (persistence acks) — mirrors `sessions.last_ack_seq`. Unused this phase. */
+  /** Per-replica last-acknowledged seq, updated on every PING's `lastAppliedSeq` (§3.6.11: "server updates the session's ... last-acked-seq on receipt"). Mirrors `sessions.last_ack_seq` — real persistence is Phase 16. */
   readonly watermarks = new Map<number, bigint>();
   /** Scaffolding for Phase 17 (snapshotting). Unused this phase. */
   opsSinceSnap = 0;
@@ -49,10 +67,16 @@ export class DocumentCoordinator {
   }
 
   /**
-   * Allocates a replica id for a newly-joining session. Interim scheme for
-   * this phase — a monotonic counter per document, starting at 1 (0 stays
-   * reserved for the server) — since real session/identity assignment is
-   * Phases 26-29's auth work, not yet built.
+   * Allocates a replica id for a newly-joining session — an in-memory
+   * monotonic counter per document, starting at 1 (0 stays reserved for the
+   * server), backed by `documents.next_replica_id` once persistence exists
+   * (Phase 15).
+   *
+   * A reconnecting client is given a NEW replica id, never its previous one.
+   * Reusing it could let the client mint an identifier with a counter it already
+   * used before the disconnect, producing two distinct nodes with the same id and
+   * violating Engine Spec I1 — silently, and only under specific timing.
+   * API Spec §3.6.2.
    */
   allocateReplicaId(): number {
     const id = this.nextReplicaId;
@@ -68,6 +92,10 @@ export class DocumentCoordinator {
     this.sessions.delete(sessionId);
   }
 
+  getSession(sessionId: string): CoordinatorSession | undefined {
+    return this.sessions.get(sessionId);
+  }
+
   /** Every session in this room except `exceptSessionId` — the ingress path's broadcast target set. */
   otherSessions(exceptSessionId: string): CoordinatorSession[] {
     const others: CoordinatorSession[] = [];
@@ -77,5 +105,21 @@ export class DocumentCoordinator {
       }
     }
     return others;
+  }
+
+  /**
+   * WELCOME's participant list (API Spec §3.6.2). Includes the session
+   * currently being welcomed itself — the spec text doesn't say either way,
+   * so this treats WELCOME as a full roster snapshot at time of join
+   * (simpler and more consistent than special-casing "everyone but me"),
+   * matching the analogous application-level calls made in Phase 8 (e.g.
+   * the `documentId` interim binding mechanism) without needing to ask.
+   */
+  listParticipants(): ParticipantInfo[] {
+    return Array.from(this.sessions.values(), (s) => ({
+      replicaId: s.replicaId,
+      userId: s.userId,
+      displayName: s.displayName,
+    }));
   }
 }

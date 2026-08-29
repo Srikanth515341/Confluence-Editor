@@ -32,6 +32,7 @@ export {
   type OpsMessage,
   OpsMessageType,
   type OpUndeleteMessage,
+  peekChannel,
   PROTOCOL_VERSION,
   type RejectEntry,
   RejectReason,
@@ -47,3 +48,35 @@ export {
   operationToOpInsert,
   operationToOpUndelete,
 } from "./expand.js";
+export {
+  CLIENT_CAP_ACCEPTS_OP_INSERT_RUN,
+  CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT,
+  ControlMessageType,
+  type ControlMessage,
+  type ErrorMessage,
+  type GoodbyeMessage,
+  GoodbyeReason,
+  type HelloMessage,
+  isImplementedControlType,
+  type LeaveMessage,
+  type ParticipantInfo,
+  type PingMessage,
+  type PongMessage,
+  SessionRole,
+  type SnapshotMessage,
+  SnapshotForm,
+  SyncMode,
+  type SyncCompleteMessage,
+  type WelcomeMessage,
+} from "./controlMessages.js";
+export {
+  type DecodeControlFrameOptions,
+  decodeControlFrame,
+  encodeControlFrame,
+} from "./controlCodec.js";
+export {
+  decodeStructureSnapshotBody,
+  decodeTextSnapshotBody,
+  encodeStructureSnapshotBody,
+  encodeTextSnapshotBody,
+} from "./snapshotBody.js";
