@@ -85,12 +85,39 @@ packages/protocol    @collab-editor/protocol  — binary wire codec + message ty
                                                  values/names (src/messages.ts). A single
                                                  insert at counters near 50,000 measures
                                                  exactly 18 bytes, matching API Spec §1.3.
-                                                 CONTROL/PRESENCE message types and the actual
-                                                 socket are still not built (Phases 9, 31, 8).
+                                                 CONTROL/PRESENCE message types are still not
+                                                 built (Phases 9, 31) — the socket itself now
+                                                 exists (Phase 8, packages/server).
                                                  Depends on engine (for Identifier/Operation
                                                  types and, in tests only, Engine itself).
-packages/server      @collab-editor/server    — Express + WebSocket gateway,
-                                                 Document Coordinator, persistence.
+packages/server      @collab-editor/server    — Express + WebSocket gateway, Document
+                                                 Coordinator. Phase 8 built the whole
+                                                 in-memory path: config.ts (PORT from env);
+                                                 logger.ts (structured JSON logging, used for
+                                                 connect/disconnect); sendQueues.ts
+                                                 (ConnectionSendQueues — three separate
+                                                 physical per-connection queues for OPS/
+                                                 CONTROL/PRESENCE, drained strictly in
+                                                 priority order, PRESENCE's backpressure-shed
+                                                 policy); documentCoordinator.ts
+                                                 (DocumentCoordinator — one per open document,
+                                                 holding createEngine(0) per API Spec §6.1,
+                                                 replica id 0 reserved for the server;
+                                                 watermarks/opsSinceSnap/lastSnapAt exist as
+                                                 unused scaffolding fields for Phases 16-17);
+                                                 ingest.ts (toOperations() — expands any
+                                                 inbound OpsMessage into engine Operations);
+                                                 httpApp.ts (Express, GET /healthz); gateway.ts
+                                                 (the WebSocketServer at /v1/rt, subprotocol
+                                                 obseq.v1, binary-frames-only enforcement,
+                                                 the interim documentId query-param room
+                                                 binding, and the ingress/broadcast pipeline);
+                                                 server.ts (ties httpApp + gateway onto one
+                                                 shared http.Server). Persistence, acks,
+                                                 auth, presence, and the real CONTROL-channel
+                                                 handshake are NOT built yet (Phases 9, 15-17,
+                                                 26-29, 31) — state is in-memory only and lost
+                                                 on restart, which is correct for this phase.
                                                  Depends on engine + protocol.
 packages/client       @collab-editor/client   — React app + editor binding
                                                  (DomWriter, input pipeline, presence).
@@ -716,9 +743,136 @@ message }` object rather than throwing.
   directionality/count-minimum checks added test cases, not just fixed
   existing ones).
 
+- **Phase 8** — WebSocket gateway and Document Coordinator, in-memory (RFC
+  §5, §4.4; API Spec §1.2, §3.3, §6.1; PRD FR-CE-7). Built against the
+  real spec text pasted in up front — no self-derive-then-correct pass
+  needed this time, unlike Phases 5 and 7. New `packages/server/src/`:
+  `config.ts` (`loadConfig()` — reads `PORT` from `.env.example`, the
+  first code in the repo to actually consume that file); `logger.ts`
+  (one JSON line per event to stdout); `sendQueues.ts`
+  (`ConnectionSendQueues` — see the dedicated paragraph below);
+  `documentCoordinator.ts` (`DocumentCoordinator`, `SERVER_REPLICA_ID =
+0`); `ingest.ts` (`toOperations()`, expanding any inbound `OpsMessage`
+  into the engine `Operation[]` it represents, reusing Phase 7's
+  `expand.ts` functions); `httpApp.ts` (Express, `GET /healthz`);
+  `gateway.ts` (`createGateway()` — the `WebSocketServer`, connection
+  lifecycle, and the ingest/broadcast pipeline); `server.ts`
+  (`createCollabServer()` — one shared `http.Server` carrying both
+  Express and the WS upgrade). `package.json` gained `express`/`ws`
+  runtime dependencies and `@types/express`/`@types/node`/`@types/ws`
+  dev dependencies.
+
+  **`DocumentCoordinator` fields match API Spec §6.1 exactly**: `engine =
+new Engine(SERVER_REPLICA_ID)` with `SERVER_REPLICA_ID = 0` (reserved,
+  never allocated to a session — enforced by construction, since session
+  replica ids are allocated starting at 1 by a per-coordinator counter,
+  `allocateReplicaId()`, itself an explicitly-temporary Phase 8 stand-in
+  for real session/identity assignment, Phases 26-29); `currentSeq:
+bigint`, assigned once per ingested OPS FRAME rather than once per
+  underlying engine operation — an OP_INSERT_RUN/OP_DELETE_BATCH frame
+  carries exactly one `seq` field on the wire (Phase 7's corrected
+  layout), so a single frame can only be stamped once; Phase 16's real
+  ack design may need to revisit this granularity once OP_ACK's
+  per-operation `(ackSeq, ackStamp)` pairs are actually implemented.
+  `watermarks`/`opsSinceSnap`/`lastSnapAt` exist as fields, typed exactly
+  as the spec names them, and are genuinely unused — no code reads or
+  writes them meaningfully this phase, per the phase brief's explicit
+  instruction that they're Phase 16-17 scaffolding only.
+
+  **The three-queue design (API Spec §3.3)**: `ConnectionSendQueues`
+  holds three literally separate arrays (`opsQueue`/`controlQueue`/
+  `presenceQueue`), not one array with a priority field — the spec's own
+  worked justification ("a presence burst already enqueued would sit
+  ahead of a later operation" in a single prioritized FIFO) is exactly
+  what three independent arrays avoid. Draining re-checks priority order
+  (`nextFrame()`: ops, then control, then presence) after EVERY single
+  frame sent, not just once per drain pass, so a higher-priority frame
+  enqueued while a lower-priority backlog is draining always preempts it
+  — proved directly in `sendQueues.test.ts`'s "a higher-priority frame
+  enqueued mid-drain preempts a lower-priority backlog" test. One
+  genuine implementation subtlety, documented at both the code and the
+  test level: `pump()` dequeues and starts sending the very FIRST frame
+  the instant a queue transitions from idle to non-idle, synchronously,
+  before any `await` — this is unavoidable (a network write already
+  started can't be un-sent) and correct, but it means a test that
+  enqueues a whole burst in one synchronous loop will see whatever
+  landed in the previously-idle queue first "jump the line" as the
+  in-flight frame. Every ordering test in `sendQueues.test.ts` primes the
+  queue with a permanently-blocked send first, so the burst it then
+  enqueues is genuinely all still queued (not draining) before the
+  priority assertions run — this is a correct way to TEST the guarantee
+  against an eagerly-draining implementation, not a workaround for a bug.
+  PRESENCE's backpressure policy ("Shed newest-but-one", §3.3) is
+  interpreted as: while backpressured, enqueuing a new presence frame
+  first pops whatever is currently the newest frame in the presence
+  queue, then pushes the new one — so the frame about to become
+  "newest-but-one" relative to the new arrival is the one shed. OPS and
+  CONTROL never shed under backpressure ("Queue and block" / "Queue") —
+  those two arrays are left unbounded, relying on the caller to apply
+  real backpressure upstream if they grow unreasonably (not built this
+  phase — no scope bullet asked for it, and there's no persistence yet
+  to make an unbounded OPS backlog meaningfully dangerous beyond memory).
+
+  **The ingress pipeline** (`gateway.ts`'s `ingestOperation`, matching
+  the phase brief's own "decode → engine.applyRemote → assign seq →
+  broadcast to peers" verbatim): `decodeFrame(bytes, { direction:
+"clientOrigin" })` (already rejects OP_ACK/OP_REJECT as
+  `MESSAGE_NOT_VALID_FROM_CLIENT`, Phase 7); `toOperations(msg)` expands
+  the message to one or more engine `Operation`s, each applied via
+  `coordinator.engine.applyRemote()`; `coordinator.currentSeq += 1n`;
+  the SAME message shape is re-encoded with `seq: Number(currentSeq)` and
+  broadcast to every OTHER session in the room via `queues.enqueue("ops",
+...)` — relaying the original run/batch representation rather than
+  expanding it into individual OP_INSERT frames on the wire, preserving
+  Phase 7's compact encoding for peers too. The sender is never echoed
+  its own operation back (verified by `gateway.test.ts`). No OP_ACK is
+  sent to the sender — acks require durable storage that doesn't exist
+  until Phase 16, exactly as the phase brief's Scope-IN bullet states.
+
+  **Room membership / `documentId` binding (API Spec §1.2)**: "bound to
+  exactly one document at handshake time and never rebinds" is
+  satisfied literally — `documentId` is read ONCE from the WebSocket
+  upgrade URL's query string at connect time and never consulted again
+  for that socket — but the MECHANISM (a query parameter) is an
+  explicitly-temporary Phase 8 stand-in, called out in both the code
+  comment and here: the real handshake (Phase 9) will replace it with
+  whatever CONTROL-channel message that phase actually specifies. This
+  was a deliberate choice to satisfy "one socket, one document, bound at
+  connect" without inventing any CONTROL-channel byte layout — the phase
+  brief's explicit stop-and-ask condition was about message FRAMING
+  (byte layouts/field names), which a URL query parameter never touches.
+  A `DocumentCoordinator` is created lazily on first connection to a
+  `documentId` and removed once its last session disconnects (Phase
+  8-only resource hygiene, not a spec requirement — with no persistence
+  yet, an empty in-memory room serves no purpose).
+
+  **Binary-frames-only enforcement**: `ws`'s `message` event's
+  `isBinary` flag is checked on every message; a text frame closes the
+  socket with code 1003 immediately, before any decode is attempted.
+  Malformed BINARY frames (a `ProtocolDecodeError` from `decodeFrame`)
+  close with code 1008 rather than crashing the connection or being
+  silently ignored — logged first via `logger.warn` with the specific
+  `reason` code, then closed.
+
+  **DoD verification**: `pnpm test` passes 117 tests across 15 files
+  (up from 105) — `sendQueues.test.ts` (6 tests, priority draining +
+  backpressure shedding + separate-queue-objects proof, no network) and
+  `gateway.test.ts` (6 tests, all against a REAL `createCollabServer()`
+  bound to an ephemeral port and REAL `ws` client connections, no
+  browser): the health endpoint, a raw client exchanging a binary
+  OP_INSERT frame and the server engine reflecting it (`coordinator.
+engine.text() === "a"`), a text frame closing with 1003, a missing-
+  `documentId` connection closing with 1008, two real WebSocket clients
+  each driving their own local `Engine` — one inserts, the relayed frame
+  reaches the other re-stamped with a nonzero server-assigned `seq`, and
+  both engines' `text()` converge — and a concurrent-insert variant
+  (both clients insert at position 0 in the same tick) converging to the
+  same 2-character text on both sides via the real OBSEQ algorithm, not
+  a mock.
+
 ## Current phase in progress
 
-None — Phase 7 complete, awaiting Phase 8.
+None — Phase 8 complete, awaiting Phase 9.
 
 ## What is explicitly NOT yet built
 
@@ -726,13 +880,21 @@ Undo/redo's real resurrection semantics beyond Undelete's structural
 inverse (Phase 36); the indexed position structure (Phase 19) — integrate()
 currently locates origins via a linear `indexOf` scan, not an index; garbage
 collection (Phase 21); block run-length encoding (later, alongside GC). The
-OPS channel's binary codec exists (Phase 7), but CONTROL/PRESENCE message
-types (Phases 9, 31) and the actual socket (Phase 8) do not — nothing yet
-sends a frame anywhere. No server (no Express app, no WebSocket gateway, no
-database schema, no auth); no client (no React app, no editor binding, no
-DOM rendering); no persistence; no permissions; no offline/reconciliation
-logic; no presence; no version history; no Docker setup; no deployed
-environment. GitHub branch-protection required-status-check wiring for
+OPS channel's binary codec exists (Phase 7) and the WebSocket gateway now
+carries it end to end (Phase 8), but CONTROL/PRESENCE message types (Phases
+9, 31) do not exist, so the real connection handshake, presence broadcast,
+and any CONTROL-channel behavior are all unbuilt — Phase 8's `documentId`
+query-param room binding is an explicitly-temporary stand-in for the real
+handshake. No persistence (no database schema, no snapshotting, no acks —
+`DocumentCoordinator`'s `watermarks`/`opsSinceSnap`/`lastSnapAt` fields
+exist but are unused no-ops, Phases 15-17); no auth (Phases 26-29) — any
+WebSocket client can join any document by guessing its id, which is correct
+for this phase and not yet a security concern since nothing is exposed
+publicly; no client (no React app, no editor binding, no DOM rendering);
+no permissions; no offline/reconciliation logic; no version history; no
+Docker setup; no deployed environment. Server state is in-memory only and
+lost on restart — correct for Phase 8, not yet for anything after Phase
+15. GitHub branch-protection required-status-check wiring for
 `convergence`/`properties`/`nightly-mutation-matrix` remains a manual,
 one-time repo-settings action, as does the nightly workflow's first
 manual `workflow_dispatch` trigger (Claude cannot push branches or
@@ -1010,7 +1172,7 @@ test:convergence`), excluded from root `vitest.config.ts`'s default
 
 ```bash
 pnpm install
-cp .env.example .env   # not yet consumed by any code — no server exists yet
+cp .env.example .env   # PORT is now read by packages/server/src/config.ts (Phase 8)
 pnpm lint
 pnpm format:check
 pnpm typecheck
@@ -1018,7 +1180,23 @@ pnpm check:purity
 pnpm test
 ```
 
-There is no `pnpm dev` yet — no server or client app exists to run.
+There is still no `pnpm dev`/`start` script wired up to actually run the
+server standalone. `packages/server` builds (`tsc`) and typechecks cleanly,
+but running the compiled output directly (`node dist/index.js`) currently
+fails at import time — verified, not assumed: `@collab-editor/engine` and
+`@collab-editor/protocol`'s `package.json` still point `main`/`types` at
+`./src/index.ts` (a pre-existing decision from Phase 0, "no project-level
+TypeScript references between packages"), which plain Node cannot import as
+a module once server's OWN code has been compiled to `dist/`. This has no
+effect on `pnpm test` (Vitest transpiles on the fly, so `gateway.test.ts`
+starts a real server via `createCollabServer()` + `listen()` and it works
+fine there) — it only affects a hypothetical standalone `node
+dist/index.js` invocation outside the test runner, which nothing in this
+project has needed until Phase 8. Fixing it (project references, a
+bundler, or switching every package's `main` to point at compiled output)
+is not itself part of any phase's stated scope yet and wasn't attempted
+here to avoid scope creep — flagging it now so it isn't mistaken for an
+untested claim later.
 
 ## How to run the test suite
 
@@ -1031,7 +1209,7 @@ pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constru
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
-`pnpm test` currently passes: 105 tests across 13 files, including
+`pnpm test` currently passes: 117 tests across 15 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
@@ -1040,7 +1218,7 @@ adversarial.test.ts` (22 tests — see the Phase 5 entry above),
 `packages/testkit/src/fuzz/harness.selftest.test.ts`, which proves the
 fuzz harness itself works (detects a deliberately broken toy engine as
 divergent, and completes 10,000 toy-engine seeds in ~2s, well under the
-30s bar), and Phase 7's `packages/protocol/src/*.test.ts` (52 tests, after
+30s bar), Phase 7's `packages/protocol/src/*.test.ts` (52 tests, after
 the Pass-2 spec correction: 17 varint round-trip/boundary/malformed-input
 cases, 7 primitive round-trip cases, and 27 codec tests — a 10,000-case
 round-trip property test across all 7 OPS message types split by
@@ -1049,7 +1227,16 @@ OP_INSERT measurement, the 2,000-character OP_INSERT_RUN-vs-2,000-
 individual-frames equivalence check, 10 malformed-frame rejection cases
 including OP_ACK/OP_REJECT client-origin rejection and run/batch
 minimum-count enforcement, and debugProject coverage for every message
-type).
+type), and Phase 8's `packages/server/src/*.test.ts` (12 tests:
+`sendQueues.test.ts`'s 6 tests proving the three physical queues are
+separate objects, strict priority draining re-evaluated after every
+frame, mid-drain preemption, and PRESENCE's backpressure-shed policy,
+all with no network involved; `gateway.test.ts`'s 6 tests against a REAL
+`createCollabServer()` on an ephemeral port with REAL `ws` client
+connections — the health endpoint, binary frame exchange, a text frame
+closing with 1003, a missing-`documentId` connection closing with 1008,
+and two real WebSocket clients each driving their own local `Engine`
+converging, both sequentially and under genuine concurrency).
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),
