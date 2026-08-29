@@ -1,0 +1,13 @@
+{
+  "name": "@collab-editor/engine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OBSEQ convergence engine. Pure: no DOM, no network, no storage, no clock. See Engine Spec v1.0.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.json"
+  }
+}

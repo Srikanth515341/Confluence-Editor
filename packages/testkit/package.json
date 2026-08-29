@@ -1,0 +1,16 @@
+{
+  "name": "@collab-editor/testkit",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fuzz harness, mutation-testing harness, network-fault proxy, and load harness. See Test Plan v1.0.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@collab-editor/engine": "workspace:*"
+  }
+}

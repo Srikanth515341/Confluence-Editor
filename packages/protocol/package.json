@@ -1,0 +1,13 @@
+{
+  "name": "@collab-editor/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Binary wire codec and message types shared between client and server. See API/Protocol/Data Spec v1.0.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.json"
+  }
+}

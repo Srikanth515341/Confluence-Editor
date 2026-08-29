@@ -1,0 +1,25 @@
+node_modules/
+dist/
+build/
+coverage/
+.turbo/
+
+# env
+.env
+.env.local
+.env.*.local
+
+# editors / os
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# test artifacts
+tests/regression/.tmp/
+*.tsbuildinfo

@@ -1,0 +1,17 @@
+{
+  "name": "@collab-editor/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "React app and editor binding (DomWriter, input pipeline, cursor/presence rendering). See API/Protocol/Data Spec §7-9.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@collab-editor/engine": "workspace:*",
+    "@collab-editor/protocol": "workspace:*"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@collab-editor/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Express + WebSocket gateway, document coordinator, and persistence layer. See API/Protocol/Data Spec v1.0.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@collab-editor/engine": "workspace:*",
+    "@collab-editor/protocol": "workspace:*"
+  }
+}
