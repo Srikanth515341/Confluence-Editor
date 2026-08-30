@@ -173,7 +173,36 @@ packages/client       @collab-editor/client   — React app + editor binding
                                                  @collab-editor/server is a devDependency
                                                  (test-only, for spinning up a real server in
                                                  integration tests — never imported by
-                                                 production sync/ code).
+                                                 production sync/ code). Phase 11 built
+                                                 src/binding/ (the DOM render model and
+                                                 position mapping) plus Playwright
+                                                 infrastructure (packages/client/e2e/) — no
+                                                 input handling, sentinel, or React component
+                                                 exists yet: unicodeOffsets.ts (scalarToUtf16/
+                                                 utf16ToScalar — the scalar-vs-UTF-16 unit
+                                                 mismatch API Spec §7.2.2/§11.10 exists to
+                                                 name, plus isInsideSurrogatePair, computed
+                                                 independently for a real cross-check);
+                                                 renderIndex.ts (RenderRun, RUN_MAX_SCALARS=
+                                                 512, findRunForVis — binary search);
+                                                 positionMapping.ts (visToDom, domToVis,
+                                                 normalizeElementPosition for API Spec
+                                                 §7.2.3's element-node selection quirks);
+                                                 domWriter.ts (DomWriter — the only module
+                                                 permitted to mutate the editor subtree;
+                                                 mount/insertText/deleteRange with incremental
+                                                 renderIndex maintenance and run-splitting at
+                                                 the 512-scalar cap; assertConsistent(), the
+                                                 dev-build assertion). e2e/ (Playwright, first
+                                                 use in this project): playwright.config.ts
+                                                 (real chromium + webkit projects);
+                                                 build-bundle.mjs (esbuild — bundles src/
+                                                 binding into one dependency-free browser
+                                                 script, window.Binding); domPositionMapping.
+                                                 spec.ts (DOM-01) and
+                                                 elementSelectionNormalization.spec.ts
+                                                 (DOM-03), both against real browsers, not
+                                                 jsdom.
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -1180,9 +1209,104 @@ engine.text() === "a"`), a text frame closing with 1003, a missing-
   `syncClient.test.ts` (13, fake-socket/fake-timer-driven), and
   `headlessHarness.test.ts` (3, real server + real WebSocket, no mocks).
 
+- **Phase 11** — Render model and position mapping (API Spec §7.1
+  architecture, §7.2 position mapping, §11.10; Test Plan §7.1; PRD
+  FR-CE-9). Built against the real Test Plan §7.1 text pasted in up
+  front — no self-derive-then-correct pass needed, like Phases 8-10. New
+  `packages/client/src/binding/` — see the package-table entry above for
+  the file-by-file breakdown. This phase also stood up Playwright
+  (`packages/client/e2e/`), the first use of real-browser testing
+  anywhere in this project, per the phase brief's explicit instruction —
+  jsdom cannot exercise real Selection/Range quirks, which is exactly
+  what DOM-03 tests.
+
+  **A real infinite-loop bug, caught immediately by actually running the
+  test rather than reasoning about the code**: `DomWriter.deleteRange()`'s
+  first version renumbered every run's `startVis` only ONCE, after its
+  whole while-loop finished. For a deletion spanning two runs, this meant
+  the second run's `startVis` stayed stale (its OLD, pre-deletion value)
+  for the rest of the loop — so `findRunForVis(visOffset)` kept
+  re-resolving the same fixed `visOffset` back to the FIRST run (now
+  exhausted at that exact position, contributing 0 further scalars to
+  delete) forever, never advancing to the second run at all. Manifested
+  as `vitest` hanging with zero output and the worker process eventually
+  dying (`Error: Worker exited unexpectedly`) — not a thrown exception,
+  since nothing ever threw; the loop just never terminated. Fixed by
+  renumbering after EVERY run touched, not once at the end — the O(runs)
+  cost per touched run is irrelevant at this phase's scale, and
+  correctness matters more than the saved passes. Caught by
+  `domWriter.test.ts`'s own "deletes across a run boundary, spanning two
+  runs" case, which is exactly why that case exists rather than only
+  testing single-run deletes.
+
+  **A second, more mundane bug fixed the same way**: the very first
+  attempt to run ANY jsdom-environment test hung identically (`Worker
+  exited unexpectedly`, no output) for an unrelated reason — `jsdom` was
+  a devDependency of `packages/client` only, but this project runs one
+  shared root-level `vitest run` via a single root `vitest.config.ts`,
+  and Vitest resolves an `environment: "jsdom"` (or the
+  `// @vitest-environment jsdom` file pragma) package relative to the
+  process's own root, not the individual test file's package. Fixed by
+  also adding `jsdom` to the ROOT `package.json`'s devDependencies —
+  the first time any package in this workspace has needed a
+  browser-DOM-emulation test environment at all.
+
+  **Test strategy split three ways, each for a specific, named reason,
+  not by default**:
+  - `unicodeOffsets.test.ts`, `renderIndex.test.ts`,
+    `domEngineConsistency.test.ts` — plain Node, no DOM at all needed
+    (the last of these is DOM-01's "insert at v lands at exactly v"
+    assertion, which the phase brief explicitly calls out as needing "a
+    real Engine instance... not just testing the mapping functions in
+    isolation" — it uses a real `Engine` from Phase 3, seeded with each
+    fixture, and checks scalar-indexed consistency between
+    `localInsert(v, ...)` and the DOM mapping functions' own notion of
+    `v`, with zero DOM involved).
+  - `domWriter.test.ts` — Vitest with `// @vitest-environment jsdom`:
+    ordinary DOM tree manipulation (Text nodes, `childNodes`,
+    `parentNode`) that jsdom implements reliably, used for
+    mount/insert/delete mechanics and the dev-build assertion
+    (including deliberately corrupting `renderIndex` and confirming it
+    fires — this phase's own DoD item).
+  - `e2e/*.spec.ts` — real Playwright, real Chromium AND real WebKit:
+    reserved specifically for Selection/Range behavior a synthetic DOM
+    can't be trusted to reproduce (DOM-01's round-trip-via-a-real-caret
+    check, and all of DOM-03). `e2e/build-bundle.mjs` (esbuild) bundles
+    `src/binding` into one dependency-free browser script exposed as
+    `window.Binding` — this project has no dev server yet, so each spec
+    injects it directly via `page.addScriptTag` rather than navigating
+    to a running app.
+
+  **`normalizeElementPosition`'s assumption, stated plainly rather than
+  hidden**: it treats `node`'s children as exactly this editor's
+  rendered runs in document order, true only because DomWriter never
+  nests a run's Text node inside anything but the root and nothing else
+  exists yet to violate that — an assumption a later phase (input
+  handling, nested formatting, etc.) will need to revisit explicitly
+  rather than silently inherit.
+
+  **DoD verification**: `pnpm test` passes 230 tests across 28 files (up
+  from 180/24) — `packages/client/src/binding/*.test.ts` contributes 50:
+  `unicodeOffsets.test.ts` (10, including a 5,000-case round-trip
+  property test and a dedicated "diverges from naive String.length past
+  the astral character" regression case), `renderIndex.test.ts` (7),
+  `domEngineConsistency.test.ts` (7, one per DOM-01 fixture, every
+  interior position), and `domWriter.test.ts` (22, including all 4
+  corruption-fires-the-assertion cases and one confirming
+  `assertionsEnabled = false` genuinely suppresses it). Separately,
+  `pnpm --filter @collab-editor/client run test:e2e` passes 22 tests across real
+  Chromium AND real WebKit (44 browser-runs total): all 7 DOM-01
+  fixtures' full round-trip-and-surrogate-pair-check, the real-Selection
+  cross-check, and all 3 in-scope DOM-03 cases (empty editor via an
+  actual `page.click`, after a `<br>`, and at a >512-scalar run
+  boundary) — the empty-editor case runs on both engines specifically
+  because Chromium and WebKit are known to disagree on what that DOM
+  shape looks like, which is the entire reason API Spec §7.2.3 and this
+  phase's DoD call it out by name.
+
 ## Current phase in progress
 
-None — Phase 10 complete, awaiting Phase 11.
+None — Phase 11 complete, awaiting Phase 12.
 
 ## What is explicitly NOT yet built
 
@@ -1212,12 +1336,17 @@ restart loses ALL document content, not just the connection, which Phase
 away. No auth (Phases 26-29) — any WebSocket client can join any document
 by guessing its id and is unconditionally granted the EDITOR role, which is
 correct for this phase and not yet a security concern since nothing is
-exposed publicly. No React app, no editor binding, no DOM rendering, no
-DomWriter (`packages/client` has a real connection layer now but nothing
-that touches the DOM yet); no permissions; no version history; no Docker
-setup; no deployed environment. Server state is in-memory only and lost on
-restart — correct through Phase 10, not yet for anything after Phase 15.
-GitHub branch-
+exposed publicly. No React app, no real editor DOM mounted anywhere, no
+input handling (Phase 12) — DomWriter exists and is fully tested
+(`packages/client/src/binding/`), but nothing calls it from a live,
+user-editable page yet, and nothing connects it to `SyncClient` (Phase
+10) or to keystrokes. No sentinel (Phase 13), no cursor transformation
+under remote edits (Phase 32) — the render index only knows how to
+apply patches DomWriter itself is told about, not how to keep a real
+user's caret stable while a remote edit lands. No permissions; no
+version history; no Docker setup; no deployed environment. Server state
+is in-memory only and lost on restart — correct through Phase 11, not
+yet for anything after Phase 15. GitHub branch-
 protection required-status-check wiring for
 `convergence`/`properties`/`nightly-mutation-matrix` remains a manual,
 one-time repo-settings action, as does the nightly workflow's first
@@ -1533,7 +1662,30 @@ pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constru
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
-`pnpm test` currently passes: 180 tests across 24 files, including
+### The Playwright suite (real browsers, Phase 11)
+
+```bash
+cd packages/client
+pnpm run test:e2e:install  # one-time: downloads real Chromium + WebKit binaries
+pnpm run test:e2e          # rebuilds the binding bundle, then runs every e2e/*.spec.ts against both
+```
+
+Separate from `pnpm test` and from Vitest entirely — Playwright is its own
+test runner, configured in `packages/client/playwright.config.ts`, with
+its own two browser projects (`chromium`, `webkit`). Test Plan §7.1
+requires real browsers specifically because jsdom does not implement real
+Selection/Range quirks, and DOM-03's whole point is that Chromium and
+WebKit disagree on what an empty, focused contenteditable's DOM looks
+like. `e2e/build-bundle.mjs` (esbuild) bundles `packages/client/src/
+binding` into one dependency-free browser script exposed as
+`window.Binding` — there is no dev server in this project yet, so each
+spec injects that bundle directly via `page.addScriptTag` rather than
+navigating to a running app. Currently PASSES: 22 tests × 2 browsers = 44
+browser-runs, covering DOM-01 (all 7 fixtures' round trip plus a
+real-`Selection` cross-check) and DOM-03 (empty editor, after a `<br>`, at
+a run boundary).
+
+`pnpm test` currently passes: 230 tests across 28 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
@@ -1581,7 +1733,14 @@ the "dies immediately after WELCOME" case from §3.10's own text), and
 `headlessHarness.test.ts` (3, real server + real global `WebSocket`, no
 mocks: 1,000-operation convergence, and the kill-the-server/restart-on-
 the-same-port/reconnect/re-converge scenario with connection-state
-sequence assertions).
+sequence assertions), and Phase 11's `packages/client/src/binding/
+*.test.ts` (50 tests: `unicodeOffsets.test.ts`, `renderIndex.test.ts`,
+`domEngineConsistency.test.ts` — the last using a real Phase-3 `Engine`,
+no DOM — and `domWriter.test.ts`, run under jsdom via a per-file
+`// @vitest-environment jsdom` pragma). Real-browser coverage (DOM-01's
+round trip and DOM-03's element-selection normalization, against real
+Chromium AND real WebKit via Playwright) is separate from `pnpm test`
+— see "How to run the Playwright suite" below.
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),

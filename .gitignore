@@ -23,3 +23,9 @@ pnpm-debug.log*
 # test artifacts
 tests/regression/.tmp/
 *.tsbuildinfo
+
+# Playwright (Phase 11)
+packages/client/e2e/.bundle/
+playwright-report/
+test-results/
+blob-report/
