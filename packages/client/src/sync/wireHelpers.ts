@@ -1,4 +1,4 @@
-import type { Operation } from "@collab-editor/engine";
+import type { InsertOperation, Operation } from "@collab-editor/engine";
 import {
   expandDeleteBatch,
   expandInsertRun,
@@ -8,6 +8,7 @@ import {
   operationToOpDelete,
   operationToOpInsert,
   operationToOpUndelete,
+  type OpInsertRunMessage,
   type OpsMessage,
 } from "@collab-editor/protocol";
 
@@ -48,4 +49,47 @@ export function operationToOpsMessage(op: Operation): OpsMessage {
     case "undelete":
       return operationToOpUndelete(op, 0);
   }
+}
+
+/**
+ * Coalesces a sequence of locally-minted `InsertOperation`s (as produced by
+ * calling `Engine.localInsert()` once per character, in ascending-position
+ * order — Phase 12's `SyncClient.localInsertText`) into as few OPS
+ * messages as possible, per API Spec §3.5.2: consecutive characters from
+ * one run mint CONSECUTIVE counters by construction (Engine Spec §3.4), so
+ * any maximal run of two or more with the SAME `bind` flag (§3.5.2 models a
+ * run as one grapheme-cluster-uniform burst — there is no per-character
+ * bind bit on the wire) becomes one OP_INSERT_RUN; everything else
+ * (singletons, or a bind-flag change) falls back to individual OP_INSERT
+ * messages. This is what turns a 2,000-character paste into ONE wire frame
+ * instead of 2,000 (Test Plan MUT-01), while still coalescing correctly
+ * around any embedded combining marks in less common inputs.
+ */
+export function operationsToRunMessages(ops: readonly InsertOperation[]): OpsMessage[] {
+  const messages: OpsMessage[] = [];
+  let i = 0;
+  while (i < ops.length) {
+    let j = i + 1;
+    while (j < ops.length && ops[j]!.bind === ops[i]!.bind) {
+      j += 1;
+    }
+    const group = ops.slice(i, j);
+    const first = group[0]!;
+    if (group.length >= 2) {
+      const runMsg: OpInsertRunMessage = {
+        kind: "opInsertRun",
+        seq: 0,
+        firstId: first.id,
+        originLeft: first.originLeft,
+        originRight: first.originRight,
+        bind: first.bind,
+        values: group.map((op) => op.value),
+      };
+      messages.push(runMsg);
+    } else {
+      messages.push(operationToOpInsert(first, 0));
+    }
+    i = j;
+  }
+  return messages;
 }

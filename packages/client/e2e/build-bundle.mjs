@@ -24,3 +24,21 @@ await build({
   platform: "browser",
   logLevel: "info",
 });
+
+// Phase 12: a second bundle exposing `window.InputHarness` for
+// e2e/inputPipeline.spec.ts — DomWriter + SyncClient + Engine +
+// attachInputPipeline, so those specs can drive the real beforeinput
+// dispatch pipeline against a real browser's real Selection/InputEvent
+// behavior (Test Plan MUT-01/GRA-02) without needing a live server (see
+// e2e/support/inputHarness.ts's own comment for why Engine is re-exported
+// here rather than from the production package index).
+await build({
+  entryPoints: [path.join(here, "support", "inputHarness.ts")],
+  bundle: true,
+  format: "iife",
+  globalName: "InputHarness",
+  outfile: path.join(here, ".bundle", "inputHarness.js"),
+  target: "es2022",
+  platform: "browser",
+  logLevel: "info",
+});

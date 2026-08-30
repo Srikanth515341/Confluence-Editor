@@ -194,6 +194,29 @@ describe("SyncClient — handshake and messaging, against a fake socket", () => 
     client.connect();
     expect(() => client.localInsert(0, 0x61)).toThrow();
   });
+
+  it("localInsertText of 2,000 characters sends exactly ONE frame on the socket (Phase 12 DoD, Test Plan MUT-01: paste)", () => {
+    client.connect();
+    const ws = sockets[0]!;
+    ws.triggerOpen();
+    ws.triggerMessage(welcomeFrame(1));
+    ws.triggerMessage(snapshotFrame(0));
+
+    ws.sent.length = 0; // clear SYNC_COMPLETE
+    const text = "a".repeat(2000);
+    const ops = client.localInsertText(0, text);
+
+    expect(ops).toHaveLength(2000);
+    expect(client.engine?.text()).toBe(text);
+    expect(ws.sent).toHaveLength(1); // the actual frame count on the socket, not just the coalescing helper in isolation
+    expect(client.unackedCount).toBe(2000); // every underlying character is still tracked individually for acking
+
+    const sentMsg = decodeFrame(ws.sent[0]!, { direction: "clientOrigin" });
+    expect(sentMsg.kind).toBe("opInsertRun");
+    if (sentMsg.kind === "opInsertRun") {
+      expect(sentMsg.values).toHaveLength(2000);
+    }
+  });
 });
 
 describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {

@@ -28,4 +28,4 @@ export {
   type WebSocketLike,
 } from "./syncClient.js";
 export { UnackedQueue } from "./unackedQueue.js";
-export { operationToOpsMessage, toOperations } from "./wireHelpers.js";
+export { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
