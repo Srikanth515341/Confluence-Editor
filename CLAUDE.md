@@ -202,7 +202,65 @@ packages/client       @collab-editor/client   — React app + editor binding
                                                  spec.ts (DOM-01) and
                                                  elementSelectionNormalization.spec.ts
                                                  (DOM-03), both against real browsers, not
-                                                 jsdom.
+                                                 jsdom. Phase 12 built src/input/ (the
+                                                 beforeinput dispatch pipeline) and src/editor/
+                                                 (the first React component) — no sentinel
+                                                 (Phase 13) or cursor transformation under
+                                                 remote edits (Phase 32) exists yet:
+                                                 graphemeSegmentation.ts (clusterBefore/
+                                                 clusterAfter/wordBefore/wordAfter/
+                                                 lineStartBefore, all Intl.Segmenter-based —
+                                                 API Spec §7.4.2's explicit "use
+                                                 Intl.Segmenter('word'), not a regex"
+                                                 obligation, generalized to grapheme
+                                                 boundaries too, operating on UTF-16 offsets
+                                                 into the whole materialized document text,
+                                                 independent of renderIndex/DomWriter);
+                                                 inputPipeline.ts (handleBeforeInput/
+                                                 attachInputPipeline — the full API Spec
+                                                 §7.4.2 inputType dispatch table,
+                                                 unconditional preventDefault first, always;
+                                                 placeCaretAt(), which repositions the LIVE
+                                                 browser Selection after every mutation —
+                                                 see the Phase 12 completed-phase entry below
+                                                 for the real bug this fixes). React (added
+                                                 as a real dependency this phase, previously
+                                                 absent from the whole repo) is used by
+                                                 src/editor/EditorView.tsx, a contenteditable
+                                                 root component that mounts DomWriter from a
+                                                 caller-supplied, caller-connected SyncClient
+                                                 and wires attachInputPipeline — the
+                                                 component owns no connection-lifecycle
+                                                 policy itself. `packages/client/package.json`
+                                                 gained real `react`/`react-dom` dependencies
+                                                 (`@types/react`/`@types/react-dom` dev). e2e/
+                                                 gained a firefox project (playwright.config.ts
+                                                 — Phase 12 Scope-IN: "Runs in Chromium,
+                                                 Firefox and WebKit") and
+                                                 inputPipeline.spec.ts, built against a SECOND
+                                                 esbuild bundle (e2e/support/inputHarness.ts →
+                                                 window.InputHarness, kept OUT of the
+                                                 production package's own public index since
+                                                 it exists purely to expose `Engine` to
+                                                 browser-side e2e tests for the same
+                                                 no-network SyncClient-with-a-directly-set-
+                                                 `.engine` trick the Vitest unit tests use).
+                                                 src/sync/ also gained two Phase 12 additions:
+                                                 wireHelpers.ts's `operationsToRunMessages()`
+                                                 (coalesces a sequence of locally-minted
+                                                 InsertOperations into the fewest possible OPS
+                                                 messages — a maximal same-bind run of ≥2
+                                                 becomes one OP_INSERT_RUN, per API Spec
+                                                 §3.5.2) and syncClient.ts's
+                                                 `localInsertText()` (mints one
+                                                 `Engine.localInsert()` per character, then
+                                                 sends the result through
+                                                 `operationsToRunMessages` — this is what
+                                                 turns a 2,000-character paste into ONE wire
+                                                 frame, verified in syncClient.test.ts by
+                                                 literally counting frames on a fake socket,
+                                                 not just checking the coalescing helper in
+                                                 isolation).
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -1304,9 +1362,159 @@ engine.text() === "a"`), a text frame closing with 1003, a missing-
   shape looks like, which is the entire reason API Spec §7.2.3 and this
   phase's DoD call it out by name.
 
+- **Phase 12** — Input pipeline (API Spec §7.4 inputType dispatch table,
+  §7.4.3 grapheme boundaries, §7.4.4 bind flag; Test Plan MUT-01, GRA-02;
+  PRD FR-CE-13/FR-CE-14). Built against the real §7.4.2 inputType table and
+  the real MUT-01/GRA-02 test-plan text pasted in up front — no self-derive-
+  then-correct pass needed, like Phases 8-10. New `packages/client/src/
+input/` (`graphemeSegmentation.ts`, `inputPipeline.ts`) and
+  `packages/client/src/editor/` (`EditorView.tsx`, the project's first React
+  component) — see the package-table entry above for the file-by-file
+  breakdown. `react`/`react-dom` became real dependencies of
+  `@collab-editor/client` for the first time this phase.
+
+  **Every `beforeinput` is prevented unconditionally, before any dispatch
+  logic runs** (Scope-IN's own wording, "without exception") — `DomWriter`
+  (Phase 11) remains the sole mutator of the editor subtree; the browser's
+  own native edit never happens, verified directly (20 distinct inputTypes,
+  `event.defaultPrevented` checked for each, including two NOT in the
+  dispatch table) in both `inputPipeline.test.ts` (jsdom) and
+  `e2e/inputPipeline.spec.ts` (real Chromium/Firefox/WebKit).
+
+  **A real, load-bearing bug was caught only by actually running the e2e
+  suite in a real browser, not by unit tests alone**: the first version of
+  `inputPipeline.ts` mutated `DomWriter`/`Engine` correctly on every
+  `beforeinput` but never touched the browser's own `Selection` afterward.
+  Because `preventDefault()` is called unconditionally, the browser never
+  advances its caret the way it would after a native edit — every
+  SUBSEQUENT keystroke kept reporting the exact same (stale) caret
+  position. Typing "hello" via real `page.keyboard.type()` landed as
+  "olleh": each character was re-inserted at position 0, since the caret
+  never moved off the start. jsdom's own `inputPipeline.test.ts` suite
+  (which manually places the Selection before EVERY dispatched event,
+  never relying on the pipeline to have moved it from a prior call) could
+  not have caught this — it only surfaced once a real browser was left to
+  drive its OWN native key-repeat loop against the pipeline's actual
+  after-effects. Fixed by `placeCaretAt()`, called at the end of every
+  insert/delete: after an insert of `n` scalars at position `v`, the caret
+  moves to `v + n`; after a delete, it moves to the deletion's start.
+
+  **A second, more subtle bug was caught the same way, specific to one
+  browser**: real Firefox, given a genuine family-ZWJ-emoji (7 scalars)
+  followed by one real `Backspace` keystroke, removed only the trailing
+  ZWJ+code-point pair (2 scalars) instead of the whole cluster — GRA-02's
+  literal counterexample. The cause: `deleteContentCluster` originally
+  preferred `event.getTargetRanges()` (Input Events Level 2) when
+  available, falling back to `Intl.Segmenter`-based resolution only when
+  it wasn't — and real Firefox DOES implement `getTargetRanges()`, but ITS
+  own notion of "one grapheme cluster" for that event, in this headless/
+  color-emoji-font-less test environment, disagreed with Unicode's actual
+  grapheme-cluster-boundary rules. Scope-IN obligation 1 ("grapheme-cluster
+  boundary resolution using Intl.Segmenter before every localInsert/
+  localDelete") is not a suggestion Chromium happens to satisfy — it is
+  the reason this project cannot trust a browser's own targetRange for
+  cluster boundaries at all. Fixed by having `deleteContentCluster`
+  (unlike every other dispatch-table handler) read ONLY the live
+  `Selection` — never `getTargetRanges()` — for the collapsed-caret case,
+  so `Intl.Segmenter` always has the final word on where a cluster begins
+  and ends, regardless of what any given browser's own text-shaping stack
+  would have reported. `deleteWordBackward`/`deleteWordForward`/
+  `deleteSoftLineBackward`/`deleteHardLineBackward`/`deleteByDrag`/
+  `deleteByCut` are NOT required by Scope-IN to bypass `getTargetRanges()`
+  this same way (only the grapheme-cluster obligation is spec-explicit)
+  and were left using `resolvedRange()` (targetRange, falling back to live
+  selection).
+
+  **Real-browser-only test-methodology decision, documented rather than
+  silently made**: MUT-01's own text asks for "real browser interaction
+  rather than synthetic events," but this project has no OS-level input
+  automation and no dev server (nothing to navigate a real user flow
+  against). Real key presses via Playwright's `page.keyboard` genuinely
+  produce browser-generated `beforeinput` events for typing and
+  Backspace/Ctrl+Backspace — used wherever possible. For
+  autocorrect/spellcheck-replacement/paste/drag/cut, no headless-
+  automatable OS/clipboard trigger exists, so each is exercised by
+  directly dispatching a real `InputEvent` via `element.dispatchEvent`
+  carrying the `inputType` a genuine trigger would have produced — a real
+  event object handled by real browser event-dispatch machinery and this
+  project's real listener, only its ORIGIN is synthetic. This is this
+  phase's own documented, defensible call (same latitude as Phase 8's
+  `documentId` interim binding or Phase 9's WELCOME participant-list
+  scoping), not a byte-layout invention.
+
+  **A genuine, documented WebKit-only limitation, not a pipeline defect**:
+  real WebKit runs a `DataTransfer` constructed via `new DataTransfer()`
+  (never produced by an actual native paste/drop) in "protected mode" —
+  `getData()` returns `""` for a synthetically-dispatched `beforeinput`,
+  even though `setData()` on the same object succeeds. Chromium and
+  Firefox are both lenient enough to allow this for testing; WebKit is
+  not. `e2e/inputPipeline.spec.ts`'s two `dataTransfer`-dependent tests
+  (paste, drag/drop) are `test.skip()`-ed specifically on
+  `browserName === "webkit"`, with the reasoning inline — a REAL user
+  paste/drop in real WebKit populates `dataTransfer` correctly; only a
+  synthetic dispatch cannot reach it there. The "2,000 chars → ONE wire
+  frame" half of this DoD item is verified independently and browser-
+  independently in `syncClient.test.ts` (a fake socket, counting actual
+  sent frames), not in the browser suite at all.
+
+  **OP_INSERT_RUN coalescing (`operationsToRunMessages`, `wireHelpers.ts`)
+  groups by BIND, not by input source**: pasting text containing an
+  embedded combining mark correctly splits into multiple messages at the
+  bind-flag boundary (verified in `wireHelpers.test.ts`, `"e" + U+0301 +
+"f"` → three separate `OP_INSERT` messages, none long enough to qualify
+  as a run) — exactly mirroring Phase 7's own `expandInsertRun`
+  requirement that `bind` apply uniformly to a WHOLE run, never per
+  character.
+
+  **`insertText`/`insertReplacementText`/`insertFromPaste`/
+  `insertFromDrop`/`insertLineBreak`/`insertParagraph` all reduce to one
+  shared code path** (`replaceRangeThenInsert`): resolve the range that
+  would be replaced (empty for a plain caret), delete it if non-empty,
+  insert the type's own text (from `event.data`, `event.dataTransfer`, or
+  the literal `"\n"`) at the range's start. This is not an
+  approximation — API Spec §7.4.2's own table describes autocorrect,
+  paste, and drop identically ("delete range, then insert"), and this
+  phase's own `insertReplacementText` test (`"teh" → "the"`) and paste
+  tests exercise the exact same function.
+
+  **`insertCompositionText`/`deleteCompositionText` never emit an
+  operation, exactly per the table** — IME composition is entirely a
+  Phase 13 (sentinel) concern; this phase only guarantees the browser's
+  own composition UI never mutates the DOM itself (still prevented
+  unconditionally), which will look broken mid-composition until Phase 13
+  lands, as documented.
+
+  **`historyUndo`/`historyRedo` are stubbed exactly as the table
+  specifies**: `preventDefault()` only (already unconditional), a
+  `TODO(Phase 36)` comment, no engine call — `Engine.undo()`/`redo()`
+  don't exist yet (Phase 36, Engine Spec §9).
+
+  **DoD verification**: `pnpm test` passes 278 tests across 32 files (up
+  from 230/28) — `packages/client/src/input/*.test.ts` contributes 38
+  (`graphemeSegmentation.test.ts`: 15, including the GRA-02 family-emoji
+  fixture; `inputPipeline.test.ts`: 23, jsdom, covering every dispatch-
+  table row reachable without real OS/clipboard triggers, plus the
+  20-inputType `defaultPrevented` sweep), `packages/client/src/editor/
+EditorView.test.tsx` contributes 4 (no React Testing Library dependency —
+  `react-dom/client` + `act` directly, consistent with this project's
+  "no external dependency unless necessary" convention), and
+  `packages/client/src/sync/wireHelpers.test.ts` (new this phase) plus a
+  new `syncClient.test.ts` case contribute 6 covering the run-coalescing
+  helper and the literal one-frame-on-a-fake-socket assertion. Separately,
+  `pnpm --filter @collab-editor/client run test:e2e` now passes 25 of 27
+  browser-test-cases across real Chromium, Firefox, AND WebKit (playwright.
+  config.ts gained a `firefox` project this phase, Scope-IN: "Runs in
+  Chromium, Firefox and WebKit") — 2 skipped, both on WebKit only, for the
+  documented `DataTransfer` protected-mode limitation above; every
+  Phase-11 DOM-01/DOM-03 case also re-verified green under the new
+  `firefox` project (33 tests × 3 browsers). A single Firefox "page setup"
+  timeout was observed once under 4-worker parallel load and confirmed to
+  be sandbox resource contention, not a real failure, by re-running that
+  exact test in isolation (`--workers=1`), where it passed in 4.8s.
+
 ## Current phase in progress
 
-None — Phase 11 complete, awaiting Phase 12.
+None — Phase 12 complete, awaiting Phase 13.
 
 ## What is explicitly NOT yet built
 
@@ -1336,15 +1544,22 @@ restart loses ALL document content, not just the connection, which Phase
 away. No auth (Phases 26-29) — any WebSocket client can join any document
 by guessing its id and is unconditionally granted the EDITOR role, which is
 correct for this phase and not yet a security concern since nothing is
-exposed publicly. No React app, no real editor DOM mounted anywhere, no
-input handling (Phase 12) — DomWriter exists and is fully tested
-(`packages/client/src/binding/`), but nothing calls it from a live,
-user-editable page yet, and nothing connects it to `SyncClient` (Phase
-10) or to keystrokes. No sentinel (Phase 13), no cursor transformation
-under remote edits (Phase 32) — the render index only knows how to
-apply patches DomWriter itself is told about, not how to keep a real
-user's caret stable while a remote edit lands. No permissions; no
-version history; no Docker setup; no deployed environment. Server state
+exposed publicly. A first React component (`EditorView`) and the full
+`beforeinput` dispatch pipeline now exist and are wired together (Phase
+12) — but no sentinel (Phase 13) and no cursor transformation under
+remote edits (Phase 32): `EditorView` re-mounts `DomWriter`'s entire
+content from `engine.text()` on every fresh SNAPSHOT and reflects only
+THIS session's own local edits; a remote peer's concurrent edit updates
+`sync.engine` correctly (Phase 3's engine, proven convergent) but is not
+yet reflected in this session's live DOM, and there is no reconciliation
+mechanism to detect or correct a DOM/engine disagreement if one ever
+occurred. IME composition (`insertCompositionText`/
+`deleteCompositionText`) never emits an operation and the browser's own
+composition UI will visibly misbehave mid-composition, exactly as
+documented — real IME support is Phase 13's sentinel. `historyUndo`/
+`historyRedo` are prevented but stubbed with no engine call (Phase 36).
+No permissions; no version history; no Docker setup; no deployed
+environment. Server state
 is in-memory only and lost on restart — correct through Phase 11, not
 yet for anything after Phase 15. GitHub branch-
 protection required-status-check wiring for
@@ -1662,30 +1877,35 @@ pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constru
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
-### The Playwright suite (real browsers, Phase 11)
+### The Playwright suite (real browsers, Phase 11-12)
 
 ```bash
 cd packages/client
-pnpm run test:e2e:install  # one-time: downloads real Chromium + WebKit binaries
-pnpm run test:e2e          # rebuilds the binding bundle, then runs every e2e/*.spec.ts against both
+pnpm run test:e2e:install  # one-time: downloads real Chromium + Firefox + WebKit binaries
+pnpm run test:e2e          # rebuilds both bundles, then runs every e2e/*.spec.ts against all three browsers
 ```
 
 Separate from `pnpm test` and from Vitest entirely — Playwright is its own
 test runner, configured in `packages/client/playwright.config.ts`, with
-its own two browser projects (`chromium`, `webkit`). Test Plan §7.1
-requires real browsers specifically because jsdom does not implement real
-Selection/Range quirks, and DOM-03's whole point is that Chromium and
-WebKit disagree on what an empty, focused contenteditable's DOM looks
-like. `e2e/build-bundle.mjs` (esbuild) bundles `packages/client/src/
-binding` into one dependency-free browser script exposed as
-`window.Binding` — there is no dev server in this project yet, so each
-spec injects that bundle directly via `page.addScriptTag` rather than
-navigating to a running app. Currently PASSES: 22 tests × 2 browsers = 44
-browser-runs, covering DOM-01 (all 7 fixtures' round trip plus a
-real-`Selection` cross-check) and DOM-03 (empty editor, after a `<br>`, at
-a run boundary).
+three browser projects (`chromium`, `firefox` as of Phase 12, `webkit`).
+Test Plan §7.1 requires real browsers specifically because jsdom does not
+implement real Selection/Range quirks, and DOM-03's whole point is that
+Chromium and WebKit disagree on what an empty, focused contenteditable's
+DOM looks like. `e2e/build-bundle.mjs` (esbuild) bundles TWO scripts: `
+packages/client/src/binding` into `window.Binding` (Phase 11) and, new
+this phase, `e2e/support/inputHarness.ts` into `window.InputHarness` —
+`DomWriter`/`SyncClient`/`Engine`/`attachInputPipeline` bundled together
+for `e2e/inputPipeline.spec.ts`, kept as a test-only e2e support file
+rather than a production package export (see the Phase 12 completed-phase
+entry above for why `Engine` specifically needed a bundle-only re-export).
+There is no dev server in this project yet, so every spec injects its
+bundle directly via `page.addScriptTag` rather than navigating to a
+running app. Currently PASSES: 55 DOM-01/DOM-03 test-runs (Phase 11, ×3
+browsers now instead of ×2) plus 25 of 27 `inputPipeline.spec.ts`
+test-runs (Phase 12; 2 skipped, both WebKit-only, for the documented
+`DataTransfer` protected-mode limitation — see the Phase 12 entry).
 
-`pnpm test` currently passes: 230 tests across 28 files, including
+`pnpm test` currently passes: 278 tests across 32 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
@@ -1737,10 +1957,20 @@ sequence assertions), and Phase 11's `packages/client/src/binding/
 *.test.ts` (50 tests: `unicodeOffsets.test.ts`, `renderIndex.test.ts`,
 `domEngineConsistency.test.ts` — the last using a real Phase-3 `Engine`,
 no DOM — and `domWriter.test.ts`, run under jsdom via a per-file
-`// @vitest-environment jsdom` pragma). Real-browser coverage (DOM-01's
-round trip and DOM-03's element-selection normalization, against real
-Chromium AND real WebKit via Playwright) is separate from `pnpm test`
-— see "How to run the Playwright suite" below.
+`// @vitest-environment jsdom` pragma), and Phase 12's
+`packages/client/src/input/*.test.ts` (38 tests: `graphemeSegmentation.
+test.ts`, 15, plain Node — including the GRA-02 family-ZWJ-emoji fixture
+— and `inputPipeline.test.ts`, 23, jsdom, covering every dispatch-table
+row reachable without a real OS/clipboard trigger plus the 20-inputType
+`defaultPrevented` sweep), `packages/client/src/editor/EditorView.test.
+tsx` (4 tests, jsdom, `react-dom/client` + `act` directly — no React
+Testing Library dependency), and `packages/client/src/sync/wireHelpers.
+test.ts` (5 tests, new this phase) plus one new `syncClient.test.ts` case
+covering the "2,000 chars → ONE frame on a fake socket" assertion.
+Real-browser coverage (DOM-01's round trip, DOM-03's element-selection
+normalization, and Phase 12's `inputPipeline.spec.ts`, against real
+Chromium, Firefox, AND WebKit via Playwright) is separate from `pnpm
+test` — see "How to run the Playwright suite" below.
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),

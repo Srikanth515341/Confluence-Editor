@@ -23,7 +23,7 @@ import { ObservableValue, type ConnectionState, type Observable } from "./connec
 import { GAP_RECONNECT_TIMEOUT_MS, SequenceGapTracker } from "./gapTracker.js";
 import { seedEngineFromSnapshot } from "./snapshotSeed.js";
 import { UnackedQueue } from "./unackedQueue.js";
-import { operationToOpsMessage, toOperations } from "./wireHelpers.js";
+import { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
 
 /** API Spec §1.2/§3: WebSocket path and subprotocol — restated here (not imported from `@collab-editor/server`, which a client must never depend on). */
 export const WS_PATH = "/v1/rt";
@@ -156,6 +156,38 @@ export class SyncClient {
     const ops = engine.localDelete(visibleIndex, count);
     for (const op of ops) {
       this.sendOperation(op);
+    }
+    return ops;
+  }
+
+  /**
+   * Mints one local insert per scalar in `text` (in ascending position
+   * order, starting at `visibleIndex`), then sends the RESULT as the
+   * fewest possible OPS frames rather than one frame per character (Phase
+   * 12, API Spec §3.5.2) — see {@link operationsToRunMessages} for the
+   * coalescing rule this relies on. Each underlying character is still a
+   * genuinely separate `Engine.localInsert()` call, producing exactly the
+   * chained-`originLeft`/shared-`originRight` node shape Phase 7's own
+   * 2,000-character equivalence test already verified `expandInsertRun`
+   * reconstructs correctly on the receiving side — only the WIRE
+   * representation is batched here, not the engine's own integration.
+   */
+  localInsertText(visibleIndex: number, text: string): readonly InsertOperation[] {
+    const engine = this.requireEngine();
+    const ops: InsertOperation[] = [];
+    let at = visibleIndex;
+    for (const ch of text) {
+      // `for...of` iterates a string by code point, not UTF-16 code unit — required for
+      // correct surrogate-pair handling (see unicodeOffsets.ts's own doc comment).
+      const codePoint = ch.codePointAt(0)!;
+      ops.push(engine.localInsert(at, codePoint));
+      at += 1;
+    }
+    for (const msg of operationsToRunMessages(ops)) {
+      this.sendFrame(encodeFrame(msg));
+    }
+    for (const op of ops) {
+      this.unacked.add(op);
     }
     return ops;
   }

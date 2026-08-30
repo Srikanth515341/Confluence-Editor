@@ -11,16 +11,20 @@
     "build": "tsc -p tsconfig.json",
     "test:e2e:build": "node e2e/build-bundle.mjs",
     "test:e2e": "pnpm run test:e2e:build && playwright test",
-    "test:e2e:install": "playwright install chromium webkit"
+    "test:e2e:install": "playwright install chromium firefox webkit"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*",
-    "@collab-editor/protocol": "workspace:*"
+    "@collab-editor/protocol": "workspace:*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@collab-editor/server": "workspace:*",
     "@playwright/test": "^1.48.0",
     "@types/node": "^20.16.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
     "esbuild": "^0.24.0",
     "fast-check": "^4.9.0",
     "jsdom": "^25.0.1",

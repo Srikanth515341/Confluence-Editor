@@ -12,28 +12,33 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 11 — render model and position mapping.**
-`packages/client/src/binding/` implements the bidirectional mapping
-between the engine's visible (Unicode scalar) indices and real DOM
-positions — the exact unit mismatch that breaks on the first emoji if
-you reach for `String.length`. `DomWriter` is the sole module allowed
-to touch the editor subtree, maintaining a render index of runs (each
-backed by one DOM Text node, capped at 512 scalars) with incremental
-maintenance on insert/delete and a dev-build assertion that fires if
-the index and the DOM ever disagree. Verified against 7 Unicode
-fixtures (ASCII, diacritics, an astral emoji, a ZWJ family sequence,
-regional-indicator flags, Devanagari matras, Hangul) — round-tripping
-every visible position, confirming the caret never lands inside a
-surrogate pair, and confirming a real Phase-3 `Engine` agrees on what
-"visible index" means. This phase also stood up **Playwright**, the
-first real-browser test infrastructure in this project: the same
-mapping is exercised against real Chromium AND real WebKit (not
-jsdom, which can't reproduce real Selection/Range quirks), including
-the well-known case where the two browsers disagree about what an
-empty, focused contenteditable's DOM looks like. Input handling, the
-sentinel, and cursor transformation under remote edits are still not
-built (Phases 12, 13, 32) — nothing connects a keystroke to `DomWriter`
-yet.
+🚧 **Phase 12 — input pipeline.**
+`packages/client/src/input/` captures every `beforeinput` event on a
+real contenteditable root and translates it into engine operations —
+the browser is never allowed to mutate the document itself
+(`event.preventDefault()` fires unconditionally, verified across 20
+distinct `inputType`s). The full API/Protocol/Data Spec §7.4.2
+dispatch table is implemented: typing, autocorrect/spellcheck
+replacement, paste and drag-and-drop (coalesced into a single
+`OP_INSERT_RUN` wire frame rather than one frame per character —
+verified by literally counting frames on a socket), cut, and deletion
+at grapheme-cluster/word/line granularity via `Intl.Segmenter` rather
+than a regex. `packages/client/src/editor/EditorView.tsx` is this
+project's first React component: a contenteditable root that mounts
+`DomWriter` from a caller-connected `SyncClient` and wires the input
+pipeline in. Two real bugs surfaced only by actually running the new
+input-pipeline suite in real browsers, not by unit tests alone: typing
+"hello" landing as "olleh" (the browser's own caret never advances once
+every native edit is prevented — fixed by manually repositioning the
+live `Selection` after each mutation), and real Firefox removing only
+part of a family-emoji grapheme cluster on Backspace (a browser's own
+`getTargetRanges()` cannot be trusted for cluster boundaries — only
+`Intl.Segmenter` can). Playwright now also runs against real Firefox,
+alongside Chromium and WebKit. No IME/composition handling and no
+cursor transformation under remote edits yet (Phases 13, 32) — typing,
+pasting, and deleting in a single browser session works end to end;
+a second replica's concurrent edits are not yet reflected live in this
+session's DOM.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -145,8 +150,9 @@ runs this at full scale on a schedule.
 | Sync handshake + heartbeat (fresh conn.)| ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)|
 | Client sync layer (SyncClient)          | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet) |
 | DOM render model + position mapping     | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)       |
+| Input pipeline (beforeinput → ops)      | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component) |
 | Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
-| Client (editor binding, presence)       | ⏳ not started                                                             |
+| Sentinel + cursor transform under remote edits | ⏳ not started (Phases 13, 32)                                      |
 | Offline & reconciliation                | ⏳ not started                                                             |
 | Permissions                             | ⏳ not started                                                             |
 | Version history                         | ⏳ not started                                                             |
