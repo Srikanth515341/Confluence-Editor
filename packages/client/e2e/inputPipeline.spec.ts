@@ -35,6 +35,7 @@ interface HarnessState {
   readonly editor: HTMLElement;
   readonly domWriter: import("./inputHarnessGlobal.js").HarnessDomWriter;
   readonly sync: import("./inputHarnessGlobal.js").HarnessSyncClient;
+  readonly sentinel: import("./inputHarnessGlobal.js").HarnessMutationSentinel;
 }
 
 declare global {
@@ -43,7 +44,7 @@ declare global {
   }
 }
 
-/** Builds the harness (DomWriter + a never-connected SyncClient with its engine seeded directly + the input pipeline attached) and stashes it on `window.__harness` for later `page.evaluate` calls in the same test. */
+/** Builds the harness (DomWriter + a never-connected SyncClient with its engine seeded directly + the Phase 13 MutationSentinel + the input pipeline attached) and stashes it on `window.__harness` for later `page.evaluate` calls in the same test. */
 async function setupHarness(
   page: import("@playwright/test").Page,
   initialText = "",
@@ -57,9 +58,15 @@ async function setupHarness(
     if (text.length > 0) {
       sync.localInsertText(0, text);
     }
-    domWriter.mount(editor, text);
-    window.InputHarness.attachInputPipeline(editor, { domWriter, sync });
-    window.__harness = { editor, domWriter, sync };
+    const sentinel = new window.InputHarness.MutationSentinel({
+      root: editor,
+      domWriter,
+      getEngineText: () => sync.engine?.text(),
+    });
+    sentinel.applyPatches(() => domWriter.mount(editor, text));
+    sentinel.start();
+    window.InputHarness.attachInputPipeline(editor, { domWriter, sync, sentinel });
+    window.__harness = { editor, domWriter, sync, sentinel };
   }, initialText);
 }
 

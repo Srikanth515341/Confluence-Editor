@@ -15,6 +15,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Engine } from "@collab-editor/engine";
 import { DomWriter, visToDom } from "../binding/index.js";
+import { MutationSentinel } from "../sentinel/index.js";
 import { SyncClient } from "../sync/syncClient.js";
 import { attachInputPipeline } from "./inputPipeline.js";
 
@@ -26,22 +27,29 @@ interface Harness {
   readonly root: HTMLDivElement;
   readonly domWriter: DomWriter;
   readonly sync: SyncClient;
+  readonly sentinel: MutationSentinel;
   readonly detach: () => void;
 }
 
-/** Builds a fully-wired pipeline against a real (never-connected) `SyncClient` whose `engine` is set directly — the same "no network required" trick `headlessHarness`-adjacent unit tests use, since `sendFrame` no-ops when `ws` is null (never connected here). */
+/** Builds a fully-wired pipeline against a real (never-connected) `SyncClient` whose `engine` is set directly — the same "no network required" trick `headlessHarness`-adjacent unit tests use, since `sendFrame` no-ops when `ws` is null (never connected here). The MutationSentinel (Phase 13) is real and started — every `DomWriter` write the pipeline makes runs through `sentinel.applyPatches()`, so these tests also implicitly prove the sentinel never mistakes a legitimate pipeline write for a foreign mutation (a regression here would show up as a reconciliation-metric bump most of these tests don't expect). */
 function makeHarness(initialText = ""): Harness {
   const root = document.createElement("div");
   document.body.appendChild(root); // jsdom's Selection API expects live-document nodes
   const domWriter = new DomWriter();
   const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
   sync.engine = new Engine(1);
+  const sentinel = new MutationSentinel({
+    root,
+    domWriter,
+    getEngineText: () => sync.engine?.text(),
+  });
+  sentinel.start();
   if (initialText.length > 0) {
     sync.localInsertText(0, initialText);
   }
-  domWriter.mount(root, initialText);
-  const detach = attachInputPipeline(root, { domWriter, sync });
-  return { root, domWriter, sync, detach };
+  sentinel.applyPatches(() => domWriter.mount(root, initialText));
+  const detach = attachInputPipeline(root, { domWriter, sync, sentinel });
+  return { root, domWriter, sync, sentinel, detach };
 }
 
 /** Places a collapsed caret at visible (scalar) index `v`. */
@@ -129,7 +137,12 @@ describe("inputPipeline — every beforeinput is preventDefaulted, without excep
     const domWriter = new DomWriter();
     domWriter.mount(root, "");
     const sync = new SyncClient({ url: "ws://unused", documentId: "doc" }); // engine still null
-    attachInputPipeline(root, { domWriter, sync });
+    const sentinel = new MutationSentinel({
+      root,
+      domWriter,
+      getEngineText: () => sync.engine?.text(),
+    });
+    attachInputPipeline(root, { domWriter, sync, sentinel });
     const event = new InputEvent("beforeinput", {
       inputType: "insertText",
       data: "x",

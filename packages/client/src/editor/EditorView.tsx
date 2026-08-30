@@ -6,18 +6,25 @@
 // the contenteditable root once synced, and wire `beforeinput` through the
 // input pipeline (Phase 12) so the browser never mutates the DOM itself.
 //
-// No sentinel (Phase 13) and no cursor transformation under remote edits
-// (Phase 32) exist yet: this component re-mounts DomWriter's ENTIRE content
-// from `engine.text()` on every fresh SNAPSHOT (a real (re)connect), and
-// otherwise reflects only this session's OWN local edits — a remote peer's
-// concurrent edit updates `sync.engine` correctly (Phase 3's engine, proven
-// convergent) but is not yet reflected in this session's live DOM, exactly
-// as the project's "what is NOT yet built" section documents.
+// Phase 13 added the MutationSentinel: every DomWriter write this component
+// performs (the initial mount, every SNAPSHOT re-mount) now runs through
+// `sentinel.applyPatches()`, and the sentinel watches the whole subtree for
+// any OTHER mutation — a browser extension, devtools, a future bug — and
+// reverts it, treating the engine as authoritative (API Spec §7.7, RFC R5).
+//
+// No cursor transformation under remote edits (Phase 32) exists yet: this
+// component re-mounts DomWriter's ENTIRE content from `engine.text()` on
+// every fresh SNAPSHOT (a real (re)connect), and otherwise reflects only
+// this session's OWN local edits — a remote peer's concurrent edit updates
+// `sync.engine` correctly (Phase 3's engine, proven convergent) but is not
+// yet reflected in this session's live DOM, exactly as the project's "what
+// is NOT yet built" section documents.
 
 import { useEffect, useRef } from "react";
 import type { Engine } from "@collab-editor/engine";
 import { DomWriter } from "../binding/index.js";
 import { attachInputPipeline } from "../input/index.js";
+import { MutationSentinel } from "../sentinel/index.js";
 import type { SyncClient } from "../sync/syncClient.js";
 
 export interface EditorViewProps {
@@ -37,11 +44,17 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
     }
     const domWriter = new DomWriter();
     domWriterRef.current = domWriter;
+    const sentinel = new MutationSentinel({
+      root,
+      domWriter,
+      getEngineText: () => sync.engine?.text(),
+    });
+    sentinel.start();
 
     const mountIfNewEngine = () => {
       const engine = sync.engine;
       if (engine && engine !== mountedEngineRef.current) {
-        domWriter.mount(root, engine.text());
+        sentinel.applyPatches(() => domWriter.mount(root, engine.text()));
         mountedEngineRef.current = engine;
       }
     };
@@ -52,11 +65,12 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
         mountIfNewEngine();
       }
     });
-    const detachInput = attachInputPipeline(root, { domWriter, sync });
+    const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });
 
     return () => {
       unsubscribe();
       detachInput();
+      sentinel.stop();
       domWriterRef.current = null;
       mountedEngineRef.current = null;
     };

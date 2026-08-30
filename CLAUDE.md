@@ -260,7 +260,36 @@ packages/client       @collab-editor/client   — React app + editor binding
                                                  frame, verified in syncClient.test.ts by
                                                  literally counting frames on a fake socket,
                                                  not just checking the coalescing helper in
-                                                 isolation).
+                                                 isolation). Phase 13 built src/sentinel/
+                                                 (mutationSentinel.ts) — MutationObserver-based
+                                                 DOM reconciliation, API Spec §7.7/§11.11: the
+                                                 `MutationSentinel` class watches the editor
+                                                 root (childList/subtree/characterData/
+                                                 characterDataOldValue) and treats the engine
+                                                 as authoritative — any DOM mutation NOT routed
+                                                 through its `applyPatches(fn)` wrapper is
+                                                 detected — the observer's own async callback
+                                                 still holds the records `applyPatches` never
+                                                 synchronously drained — and reverted by
+                                                 re-rendering the WHOLE subtree
+                                                 from `engine.text()`, never by interpreting
+                                                 what the foreign mutation did. Every DomWriter
+                                                 write in this codebase — inputPipeline.ts's
+                                                 insertTextAt/deleteRangeAt, and EditorView.tsx's
+                                                 initial mount and SNAPSHOT re-mounts — now runs
+                                                 inside `sentinel.applyPatches()`; `sentinel` is
+                                                 a REQUIRED (not optional) field of
+                                                 `InputPipelineDeps` specifically so a caller
+                                                 can't accidentally reintroduce an unwrapped
+                                                 write. `SentinelMetrics` (`reconciliation`/
+                                                 `desync_error`) are per-instance, not a
+                                                 page-global singleton (deliberate — see the
+                                                 Phase 13 completed-phase entry for why), queried
+                                                 via `sentinel.metrics`. e2e/support/
+                                                 inputHarness.ts and its bundle gained a
+                                                 `MutationSentinel` export for
+                                                 e2e/mutationSentinel.spec.ts (MUT-02/MUT-03,
+                                                 real Chromium/Firefox/WebKit).
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -1512,9 +1541,123 @@ EditorView.test.tsx` contributes 4 (no React Testing Library dependency —
   be sandbox resource contention, not a real failure, by re-running that
   exact test in isolation (`--workers=1`), where it passed in 4.8s.
 
+- **Phase 13** — MutationSentinel and DOM reconciliation (API Spec §7.7 the
+  sentinel, §11.11 why `takeRecords()` must be synchronous; PRD FR-CE-14;
+  RFC R5). Built against the real spec text and the exact required comment
+  text pasted in up front — no self-derive-then-correct pass needed, like
+  Phases 8-10 and 12. New `packages/client/src/sentinel/`
+  (`mutationSentinel.ts`) — see the package-table entry above for the
+  mechanism. `inputPipeline.ts`'s `InputPipelineDeps` gained a REQUIRED
+  `sentinel` field; `insertTextAt`/`deleteRangeAt` now wrap their
+  `DomWriter` calls in `sentinel.applyPatches()`. `EditorView.tsx` now
+  constructs a `MutationSentinel`, calls `.start()` once per mount, and
+  wraps both the initial mount and every SNAPSHOT re-mount in
+  `applyPatches()`.
+
+  **The required comment is verbatim in `mutationSentinel.ts`, directly
+  above `applyPatches()`**:
+  ```
+  // takeRecords() must be called SYNCHRONOUSLY here, not guarded by a boolean flag.
+  // MutationObserver callbacks are microtasks that run AFTER the synchronous write
+  // block finishes and clears any flag, so a flag-based guard makes our own writes
+  // look foreign and triggers a full re-render per keystroke — destroying PRD M3.
+  // API Spec §7.7.1, §11.11.
+  ```
+
+  **The boolean-flag experiment was actually performed, not just described,
+  and failed WORSE than the DoD's own framing implies.** The DoD says a
+  flag-based implementation makes MUT-03 fail (extra reconciliations per
+  keystroke). Actually swapping `applyPatches()`'s `try/finally { this.
+observer.takeRecords() }` for `this.BROKEN_applying = true; try { fn(); }
+finally { this.BROKEN_applying = false; }` (checked in the observer
+  callback instead of `records.length`) produced something more severe: an
+  INFINITE reconciliation loop starting from the very FIRST legitimate
+  write. The reason is exactly what the required comment warns about, one
+  level further: `reconcile()`'s OWN re-render is itself wrapped in
+  `applyPatches()` — under the broken flag, that re-render's mutation
+  records are never drained, so the observer's callback fires for THEM
+  too, sees the (already-false) flag, calls `reconcile()` again, which
+  re-renders again, which queues more undrained records, forever. Both
+  `e2e/mutationSentinel.spec.ts` tests hung and hit Playwright's 30-second
+  `page.evaluate` timeout under the broken version (confirmed on real
+  Chromium) — not a clean assertion failure, but unambiguous, real
+  evidence the flag-based approach is broken, and considerably more
+  destructive than "one extra reconciliation per keystroke." Reverted
+  immediately after confirming; `pnpm test` and the full 3-browser e2e
+  suite were re-run afterward to confirm the reverted file is
+  byte-for-byte the correct implementation again (all tests green).
+
+  **`SentinelMetrics` (`reconciliation`/`desync_error`) are per-instance,
+  not a page-global singleton** — a documented, defensible reading of
+  Scope-IN's "binding.reconciliation"/"binding.desync_error" wording
+  (naming the CONCEPT, not literally mandating a shared mutable module-
+  level object): a global counter would leak state across tests, and
+  across multiple editors on one page once that's ever a real scenario,
+  the same class of problem this project's other metrics-shaped state
+  (e.g. `ClockEvent` logs, Phase 4) has always avoided by attaching to a
+  specific instance instead. `desync_error`'s semantics are ALSO a
+  documented call, not spec-literal: it increments only if a
+  reconciliation's OWN re-render — built directly from `engine.text()` —
+  still fails to match that text afterward, a strictly worse, should-be-
+  unreachable bug distinct from an ordinary "we detected and fixed a
+  foreign mutation" event. Verified live (not decorative) via a fault-
+  injection test: a `BrokenDomWriter` subclass whose `mount()` deliberately
+  appends an extra character, proving `desync_error` actually increments
+  when reconciliation's own output disagrees with the engine, and stays 0
+  on every normal MUT-02/MUT-03 pass.
+
+  **A real caret-restoration nuance, discovered by actually running the
+  test, not assumed**: MUT-02's own harness test originally mutated the
+  exact Text node the caret was anchored inside via `textNode.data =
+"corrupted"`. This failed — not because reconciliation was wrong, but
+  because the DOM's OWN "replace data" boundary-point-adjustment algorithm
+  (which jsdom correctly implements) collapses any live Selection/Range
+  anchored inside a Text node to offset 0 the INSTANT its `.data` is fully
+  replaced — before this sentinel's necessarily-async MutationObserver
+  callback ever gets a chance to capture the "original" caret position.
+  This is not a bug in `captureCaret()`/`reconcile()`; it is an inherent
+  limit of ANY reactive, MutationObserver-based detector, confirmed by
+  reasoning about the DOM's own mutation-boundary-adjustment spec text,
+  not guessed at. `mutationSentinel.test.ts`'s primary MUT-02 test was
+  changed to use a ROGUE SIBLING NODE (an `appendChild` that never touches
+  the caret's own anchor node) — a more representative "foreign mutation"
+  shape anyway (a browser extension or stray script injecting new content,
+  not necessarily overwriting the exact node the user's caret sits in) —
+  and a SECOND test keeps the harsher "same-node replacement" scenario,
+  documenting explicitly that the restored position there is wherever the
+  DOM's own adjustment already left the selection (offset 0), not the
+  literal pre-mutation index, precisely so this limitation is recorded
+  rather than silently worked around.
+
+  **DoD verification**: `pnpm test` passes 283 tests across 33 files (up
+  from 278/32) — `packages/client/src/sentinel/mutationSentinel.test.ts`
+  contributes 5: MUT-02 (rogue-sibling revert, exact reconciliation count,
+  no operation emitted, caret restored), the same-node-replacement caret
+  edge case, a legitimate-write-produces-no-reconciliation sanity check, a
+  50-write/macrotask-boundary burst sanity check (basic MUT-03 shape,
+  jsdom), and the `desync_error` fault-injection test. `packages/client/
+src/input/inputPipeline.test.ts`'s existing 23 tests all still pass
+  unchanged in behavior with a REAL, started `MutationSentinel` now wired
+  through every harness — proving the sentinel never mistakes ordinary
+  pipeline writes for foreign ones. Separately,
+  `pnpm --filter @collab-editor/client run test:e2e` passes 64 of 66
+  browser-test-runs (the same 2 pre-existing WebKit-only `DataTransfer`
+  skips from Phase 12; nothing new skipped) across real Chromium, Firefox,
+  AND WebKit, including the two new `e2e/mutationSentinel.spec.ts` cases:
+  MUT-02 (a real `appendChild` on the live page, reverted, counted,
+  verified via `engine.stats().totalElements` being unchanged — proof no
+  operation was emitted) and MUT-03 (1,000 `insertText` `beforeinput`
+  dispatches, each from inside its own `setTimeout(..., 0)` to force a
+  genuine macrotask boundary between writes — the same task/microtask
+  shape a real separate keystroke produces, which is what actually
+  distinguishes the correct implementation from the broken flag-based one;
+  a tight synchronous loop would not have caught it, see the file's own
+  comment) — `binding.reconciliation === 0` confirmed on all three real
+  browser engines, per MUT-03's own wording.
+
 ## Current phase in progress
 
-None — Phase 12 complete, awaiting Phase 13.
+None — Phase 13 complete, awaiting Phase 14.
 
 ## What is explicitly NOT yet built
 
@@ -1544,20 +1687,32 @@ restart loses ALL document content, not just the connection, which Phase
 away. No auth (Phases 26-29) — any WebSocket client can join any document
 by guessing its id and is unconditionally granted the EDITOR role, which is
 correct for this phase and not yet a security concern since nothing is
-exposed publicly. A first React component (`EditorView`) and the full
-`beforeinput` dispatch pipeline now exist and are wired together (Phase
-12) — but no sentinel (Phase 13) and no cursor transformation under
-remote edits (Phase 32): `EditorView` re-mounts `DomWriter`'s entire
-content from `engine.text()` on every fresh SNAPSHOT and reflects only
-THIS session's own local edits; a remote peer's concurrent edit updates
-`sync.engine` correctly (Phase 3's engine, proven convergent) but is not
-yet reflected in this session's live DOM, and there is no reconciliation
-mechanism to detect or correct a DOM/engine disagreement if one ever
-occurred. IME composition (`insertCompositionText`/
-`deleteCompositionText`) never emits an operation and the browser's own
-composition UI will visibly misbehave mid-composition, exactly as
-documented — real IME support is Phase 13's sentinel. `historyUndo`/
-`historyRedo` are prevented but stubbed with no engine call (Phase 36).
+exposed publicly. A first React component (`EditorView`), the full
+`beforeinput` dispatch pipeline (Phase 12), and MutationObserver-based DOM
+reconciliation (`MutationSentinel`, Phase 13) now exist and are wired
+together — but no cursor transformation under remote edits (Phase 32):
+`EditorView` re-mounts `DomWriter`'s entire content from `engine.text()`
+on every fresh SNAPSHOT and reflects only THIS session's own local edits;
+a remote peer's concurrent edit updates `sync.engine` correctly (Phase 3's
+engine, proven convergent) but is not yet reflected in this session's live
+DOM. Reconciliation now guards against a FOREIGN mutation drifting the DOM
+from the engine, but has one inherent, documented limit worth restating
+here rather than only in the Phase 13 completed-phase entry: if a foreign
+mutation happens to replace the EXACT DOM node the user's live caret sits
+inside, the DOM's own boundary-point-adjustment behavior can move that
+caret before this (necessarily async) sentinel ever gets to observe its
+"before" position — reconciliation still correctly reverts the CONTENT in
+that case, but the restored caret position is best-effort, not guaranteed
+to be the literal pre-mutation index. IME composition
+(`insertCompositionText`/`deleteCompositionText`) still never emits an
+operation and the browser's own composition UI will still visibly
+misbehave mid-composition — real IME support was NOT part of Phase 13's
+actual scope (Phase 13 built ONLY MutationObserver-based reconciliation;
+an earlier phase's documentation had speculatively attributed IME support
+to "Phase 13's sentinel," which this correction retracts) and remains
+unbuilt, unassigned to a specific phase number in this document yet.
+`historyUndo`/`historyRedo` are prevented but stubbed with no engine call
+(Phase 36).
 No permissions; no version history; no Docker setup; no deployed
 environment. Server state
 is in-memory only and lost on restart — correct through Phase 11, not
@@ -1570,6 +1725,41 @@ trigger GitHub Actions runs).
 
 ## Key technical decisions with source citations
 
+- **A `MutationObserver`-based "did I cause this write" guard must be
+  synchronous (`observer.takeRecords()` in a `finally` block), never a
+  boolean flag — and the failure mode is worse than "extra reconciliations
+  per keystroke."** Phase 13 actually swapped the correct implementation
+  for a flag-based one and ran the real e2e suite against it: rather than
+  merely mis-firing once per keystroke (the DoD's own framing), the broken
+  version entered an INFINITE reconciliation loop starting from the very
+  first legitimate write, because `reconcile()`'s own corrective re-render
+  is itself wrapped in the same guard — under the flag, that re-render's
+  own mutation records are never drained, so the observer's callback fires
+  for them too, sees the (already-cleared) flag, reconciles again, forever.
+  Both e2e tests hung and hit Playwright's 30-second timeout. The general
+  lesson: a reactive detector guarding against ITS OWN writes must
+  distinguish "did I write this" using information that survives past the
+  microtask boundary where the detector's own callback runs — a
+  synchronously-cleared flag never does, but synchronously draining the
+  observer's OWN queue (leaving nothing for the async callback to see)
+  does. — API Spec §7.7.1, §11.11; PRD M3.
+- **A live DOM `Selection`/`Range` is not a reliable source of "the caret
+  position before this mutation" once the mutation has already happened.**
+  The DOM's own CharacterData "replace data" algorithm adjusts any
+  Selection/Range boundary point anchored inside the affected node the
+  INSTANT `.data` is reassigned — before any `MutationObserver` callback
+  (necessarily async) gets a chance to read it. A reactive DOM-reconciler
+  can only ever capture whatever the LIVE selection says AT THE MOMENT its
+  callback runs, which may already differ from the true pre-mutation
+  position if the mutation touched the caret's own anchor node. This is
+  not fixable by reading Selection more cleverly; it's fixable only by
+  tracking caret position through an independent, proactive channel (not
+  yet needed in this project — no phase before 32 requires perfect caret
+  fidelity through an arbitrary foreign mutation, only through this
+  project's OWN edits, which never hit this path since they go through
+  `applyPatches()` and never trigger reconciliation at all). Discovered
+  empirically (a test's assumption failed, not predicted in advance) —
+  see the Phase 13 completed-phase entry for the exact repro.
 - **A mutation-testing check passing is not evidence it can catch its
   target mutant — only a hand-trace of the MUTATED algorithm against
   that exact input is.** Phase 6's first M2 and M9 targeted checks both
@@ -1892,20 +2082,21 @@ Test Plan §7.1 requires real browsers specifically because jsdom does not
 implement real Selection/Range quirks, and DOM-03's whole point is that
 Chromium and WebKit disagree on what an empty, focused contenteditable's
 DOM looks like. `e2e/build-bundle.mjs` (esbuild) bundles TWO scripts: `
-packages/client/src/binding` into `window.Binding` (Phase 11) and, new
-this phase, `e2e/support/inputHarness.ts` into `window.InputHarness` —
-`DomWriter`/`SyncClient`/`Engine`/`attachInputPipeline` bundled together
-for `e2e/inputPipeline.spec.ts`, kept as a test-only e2e support file
+packages/client/src/binding` into `window.Binding` (Phase 11) and
+`e2e/support/inputHarness.ts` into `window.InputHarness` —
+`DomWriter`/`SyncClient`/`Engine`/`attachInputPipeline`/`MutationSentinel`
+(the last added Phase 13) bundled together for `e2e/inputPipeline.spec.ts`
+and `e2e/mutationSentinel.spec.ts`, kept as a test-only e2e support file
 rather than a production package export (see the Phase 12 completed-phase
 entry above for why `Engine` specifically needed a bundle-only re-export).
 There is no dev server in this project yet, so every spec injects its
 bundle directly via `page.addScriptTag` rather than navigating to a
 running app. Currently PASSES: 55 DOM-01/DOM-03 test-runs (Phase 11, ×3
-browsers now instead of ×2) plus 25 of 27 `inputPipeline.spec.ts`
-test-runs (Phase 12; 2 skipped, both WebKit-only, for the documented
+browsers) plus 64 of 66 `inputPipeline.spec.ts`/`mutationSentinel.spec.ts`
+test-runs (Phases 12-13; 2 skipped, both WebKit-only, for the documented
 `DataTransfer` protected-mode limitation — see the Phase 12 entry).
 
-`pnpm test` currently passes: 278 tests across 32 files, including
+`pnpm test` currently passes: 283 tests across 33 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
@@ -1966,11 +2157,17 @@ row reachable without a real OS/clipboard trigger plus the 20-inputType
 tsx` (4 tests, jsdom, `react-dom/client` + `act` directly — no React
 Testing Library dependency), and `packages/client/src/sync/wireHelpers.
 test.ts` (5 tests, new this phase) plus one new `syncClient.test.ts` case
-covering the "2,000 chars → ONE frame on a fake socket" assertion.
+covering the "2,000 chars → ONE frame on a fake socket" assertion, and
+Phase 13's `packages/client/src/sentinel/mutationSentinel.test.ts` (5
+tests, jsdom: MUT-02 via a rogue-sibling-node mutation, the same-node-
+replacement caret-restoration edge case, a legitimate-write sanity check,
+a 50-write/macrotask-boundary burst sanity check, and the `desync_error`
+fault-injection test).
 Real-browser coverage (DOM-01's round trip, DOM-03's element-selection
-normalization, and Phase 12's `inputPipeline.spec.ts`, against real
-Chromium, Firefox, AND WebKit via Playwright) is separate from `pnpm
-test` — see "How to run the Playwright suite" below.
+normalization, Phase 12's `inputPipeline.spec.ts`, and Phase 13's
+`mutationSentinel.spec.ts`, against real Chromium, Firefox, AND WebKit via
+Playwright) is separate from `pnpm test` — see "How to run the Playwright
+suite" below.
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),
