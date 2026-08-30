@@ -140,8 +140,40 @@ packages/server      @collab-editor/server    — Express + WebSocket gateway, D
                                                  this phase. Depends on engine + protocol.
 packages/client       @collab-editor/client   — React app + editor binding
                                                  (DomWriter, input pipeline, presence).
-                                                 The only package with DOM lib types.
-                                                 Depends on engine + protocol.
+                                                 The only package with DOM lib types. Phase
+                                                 10 built src/sync/, the browser-side
+                                                 connection manager — no editor binding or
+                                                 DOM writer exists yet: syncClient.ts
+                                                 (SyncClient — socket lifecycle via an
+                                                 injectable WebSocketLike interface so tests
+                                                 can drive it with vi.useFakeTimers() instead
+                                                 of real network I/O; the real global
+                                                 WebSocket, available in both browsers and
+                                                 modern Node, is the default); backoff.ts
+                                                 (Backoff — full-jitter exponential, API Spec
+                                                 §3.10); connectionState.ts (ObservableValue,
+                                                 a minimal pub/sub, no external state
+                                                 library); gapTracker.ts (SequenceGapTracker,
+                                                 API Spec §3.7.5); unackedQueue.ts
+                                                 (UnackedQueue, API Spec §7.9, keyed by origin
+                                                 stamp); snapshotSeed.ts
+                                                 (seedEngineFromSnapshot — rebuilds a fresh
+                                                 Engine from a SNAPSHOT by replaying it as
+                                                 synthetic remote operations through the
+                                                 engine's own applyRemote()/drain(), never a
+                                                 separate direct-mutation path); wireHelpers.ts
+                                                 (client-side duplicates of the server's
+                                                 ingest.ts conversion helpers — client must
+                                                 never depend on @collab-editor/server at
+                                                 runtime); headlessHarness.ts (no-React
+                                                 connectPair/runConvergenceWorkload/
+                                                 waitForConvergence/waitForState, used by this
+                                                 phase's own tests and reusable by later
+                                                 phases). Depends on engine + protocol;
+                                                 @collab-editor/server is a devDependency
+                                                 (test-only, for spinning up a real server in
+                                                 integration tests — never imported by
+                                                 production sync/ code).
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -1037,9 +1069,120 @@ engine.text() === "a"`), a text frame closing with 1003, a missing-
   convergence still working end-to-end through the new handshake; and
   the two real-connection heartbeat checks described above.
 
+- **Phase 10** — Client sync layer (API Spec §3.10 backoff, §7.9 unacked
+  queue, §3.7.5 sequence gaps; PRD FR-OF-3). Built against the real spec
+  text pasted in up front — no self-derive-then-correct pass needed, like
+  Phases 8 and 9. New `packages/client/src/sync/` — see the package-table
+  entry above for the file-by-file breakdown. No UI, no DOM binding, no
+  React — exactly Scope-IN's boundary; `engine` is the one public surface
+  a future editor-binding phase will read from.
+
+  **A design question the phase brief didn't answer directly, resolved by
+  necessity rather than by asking**: SNAPSHOT hands the client a
+  structure-form node list (Phase 9's placeholder serialization), but
+  `Engine` has no public "load state directly" constructor or mutator —
+  the only way its internal `nodes`/`byKey`/tombstones are ever allowed to
+  change is through `applyRemote()`'s normal ready()/integrate() pipeline.
+  `snapshotSeed.ts`'s `seedEngineFromSnapshot` resolves this by replaying
+  every snapshot node as the synthetic remote operation(s) that would have
+  produced it — an Insert from the node's own fields, plus (for a
+  tombstoned node) a Delete whose `id` is exactly the node's `deletedBy`
+  (Engine Spec §4.5: `applyDelete` sets `node.deletedBy = op.id`, so
+  `deletedBy` already IS the winning delete's own identity — replaying
+  that one synthetic delete reproduces the tombstone with correct
+  attribution without replaying every historical concurrent delete that
+  raced for it). Nodes are fed in the snapshot's own structural order,
+  which is NOT a correctness requirement — a node's `originLeft` is always
+  structurally to its left (already replayed) but `originRight` is always
+  structurally to its RIGHT (not yet replayed), so most inserts buffer on
+  first attempt and resolve once their `originRight` is replayed later in
+  the same pass, via the exact same `applyRemote()`/`drain()` fixpoint
+  mechanism the convergence fuzzer already exercises 60,000 times over
+  (Test Plan §2.2). This is the same "lean on the engine's own robustness
+  rather than inventing a separate mutation path" reasoning behind several
+  earlier phases' choices, applied to a new problem.
+
+  **Connection-state naming, an application-level call, not a byte-layout
+  one**: `connecting` is reserved for the very first `connect()` attempt,
+  before this client has EVER reached `synced`; every later automatic
+  retry (after any drop, for any reason including a sequence-gap-forced
+  close) is `reconnecting`, whether it's mid-backoff-wait or mid-connect —
+  from a caller's perspective there's nothing actionable to distinguish
+  those two sub-steps. `offline` is reserved for an explicit
+  `disconnect()` call — the one state with no automatic path back to
+  `synced`. This mapping isn't dictated by the reference text (which only
+  names the four states, not their triggers) but follows the same
+  "reasonable, defensible, clearly documented" latitude Phase 8 used for
+  its `documentId` interim binding and Phase 9 used for WELCOME's
+  participant-list membership.
+
+  **The "socket survives 60 seconds" timer starts at socket OPEN, not at
+  SNAPSHOT/synced.** §3.10's own text says "a socket survives 60
+  seconds," and its worked example ("a socket that dies immediately after
+  WELCOME must not reset the backoff") is satisfied either way since that
+  scenario is well under 60s regardless of which starting point is used —
+  so the literal wording was followed rather than the alternative
+  (arming it at full-handshake-completion instead), and this is flagged
+  explicitly in `syncClient.ts`'s own comment as untested territory
+  beyond that one example, since this project's real server always
+  completes the handshake near-instantly.
+
+  **OP_ACK/OP_REJECT handling was a real bug caught by the type checker,
+  not just a design gap**: an early draft called a `handleOps(seq, ops)`
+  helper uniformly for every OPS message, but `OpAckMessage`/
+  `OpRejectMessage` (API Spec §3.5.7/§3.5.8) carry no `seq` field at all
+  (Phase 7's corrected batch-message shape) — accessing `.seq` on that
+  union would not even compile. Fixed by dispatching on `msg.kind` first:
+  `opAck` acks the given ids out of the unacked queue, `opReject` gives up
+  on the given ids (no retry/error-surface logic this phase), and only
+  the remaining five bidirectional types reach the seq-tracking path. No
+  live server sends either message yet (Phase 16), so this path is
+  exercised by unit tests with synthetic frames, same as Phase 9's
+  `ErrorMessage`/`GoodbyeMessage`.
+
+  **DoD verification, mapped explicitly since not every scenario is best
+  proven the same way**:
+  - *"Two headless clients... converge over 1,000 operations"* — a real
+    end-to-end test (`headlessHarness.test.ts`) against a real
+    `createCollabServer()`, two real `SyncClient`s using the real global
+    `WebSocket`, 1,000 alternating local inserts, engines compared by
+    `.text()` equality. Passes in under a second on localhost.
+  - *"Killing the server... both reconnect and converge on restart"* —
+    also real end-to-end: the real server is closed, both clients'
+    `state` is asserted to reach `"reconnecting"`, a NEW server is bound
+    to the EXACT SAME port (this project has no persistence yet, so the
+    restarted document is legitimately empty — the test asserts fresh
+    post-reconnect convergence, not survival of pre-crash content), both
+    clients are asserted to reach `"synced"` again, and a second
+    convergence workload proves the reconnected session is fully live.
+  - *"Backoff intervals are jittered — log 20 reconnects, confirm not
+    identical"* — proven at the `Backoff` class level directly
+    (`backoff.test.ts`), not via 20 real reconnects against a real
+    server: this asserts the actual jitter mechanism (`random() *
+    computed`, full jitter, not half) rather than a timing-dependent
+    proxy for it, and runs in milliseconds instead of tens of seconds.
+  - *"A socket that dies within 60s does not reset backoff — crash-loop 5
+    times, interval grows"* and *"connection state transitions are
+    observable and correct"* — proven with a real `SyncClient` driven by
+    a fake, fully synchronous `WebSocketLike` plus `vi.useFakeTimers()`
+    (`syncClient.test.ts`): real network I/O cannot be driven precisely
+    enough in lockstep with fake timers to deterministically test a
+    60-second boundary condition without either flaking or actually
+    waiting a minute per test. `reconnectAttemptCount` (a real
+    observability property, not test-only) is asserted to grow across 5
+    quick crash cycles and to reset only after one connection survives
+    the full 60s window — including the exact "dies immediately after
+    WELCOME" case named in §3.10's own text.
+
+  `pnpm test` passes 180 tests across 24 files (up from 147/19) —
+  `packages/client/src/sync/*.test.ts` contributes 34: `backoff.test.ts`
+  (5), `gapTracker.test.ts` (6), `unackedQueue.test.ts` (6),
+  `syncClient.test.ts` (13, fake-socket/fake-timer-driven), and
+  `headlessHarness.test.ts` (3, real server + real WebSocket, no mocks).
+
 ## Current phase in progress
 
-None — Phase 9 complete, awaiting Phase 10.
+None — Phase 10 complete, awaiting Phase 11.
 
 ## What is explicitly NOT yet built
 
@@ -1053,22 +1196,28 @@ EXPECTED to be reworked in Phase 20, not a finished format. The OPS and
 CONTROL channels both now flow end to end (Phases 7-9); PRESENCE message
 types and any presence broadcast do not exist yet (Phase 31) — a stale
 session is only logged/marked, never actually removed from anything.
-Reconnection (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.7) is not built —
-only fresh connections work; a client that disconnects and reconnects
-completes a brand-new fresh handshake (with a brand-new replica id) rather
-than resuming. Session-inactivity eviction (10 minutes with no PING) is
-scaffolded (constant defined, cited to §11.4) but not wired to anything —
-Phase 21's concern. No persistence (no database schema, no snapshotting,
-no acks — `DocumentCoordinator`'s `opsSinceSnap`/`lastSnapAt` fields exist
-but are unused no-ops, Phases 15-17; `watermarks` is live as of Phase 9 but
-only in memory, nothing durable); no auth (Phases 26-29) — any WebSocket
-client can join any document by guessing its id and is unconditionally
-granted the EDITOR role, which is correct for this phase and not yet a
-security concern since nothing is exposed publicly; no client (no React
-app, no editor binding, no DOM rendering); no permissions; no offline/
-reconciliation logic; no version history; no Docker setup; no deployed
-environment. Server state is in-memory only and lost on restart — correct
-through Phase 9, not yet for anything after Phase 15. GitHub branch-
+Reconnection catch-up (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.7) is not
+built server-side — only fresh handshakes work, so every reconnect (Phase
+10's `SyncClient` now performs these automatically, with real backoff) gets
+a brand-new replica id and a full fresh SNAPSHOT, never a delta. Session-
+inactivity eviction (10 minutes with no PING) is scaffolded (constant
+defined, cited to §11.4) but not wired to anything — Phase 21's concern.
+No persistence (no database schema, no snapshotting, no acks —
+`DocumentCoordinator`'s `opsSinceSnap`/`lastSnapAt` fields exist but are
+unused no-ops, Phases 15-17; `watermarks` is live as of Phase 9 but only in
+memory, nothing durable; `SyncClient`'s unacked-operation queue is
+in-memory only too, IndexedDB is Phase 22) — this means a real coordinator
+restart loses ALL document content, not just the connection, which Phase
+10's own kill-and-restart test explicitly accounts for rather than assumes
+away. No auth (Phases 26-29) — any WebSocket client can join any document
+by guessing its id and is unconditionally granted the EDITOR role, which is
+correct for this phase and not yet a security concern since nothing is
+exposed publicly. No React app, no editor binding, no DOM rendering, no
+DomWriter (`packages/client` has a real connection layer now but nothing
+that touches the DOM yet); no permissions; no version history; no Docker
+setup; no deployed environment. Server state is in-memory only and lost on
+restart — correct through Phase 10, not yet for anything after Phase 15.
+GitHub branch-
 protection required-status-check wiring for
 `convergence`/`properties`/`nightly-mutation-matrix` remains a manual,
 one-time repo-settings action, as does the nightly workflow's first
@@ -1384,7 +1533,7 @@ pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constru
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 ```
 
-`pnpm test` currently passes: 147 tests across 19 files, including
+`pnpm test` currently passes: 180 tests across 24 files, including
 `packages/engine/src/engine.test.ts` (10 tests — Phase 1's identifier/clock
 tests plus Phase 3's five origin-bounded-integration tests: the §10.1,
 §10.3, §10.5, and §10.7 worked-trace hand-verifications plus one longer
@@ -1421,7 +1570,18 @@ property test), plus `packages/server/src/handshake.test.ts` (5 tests),
 SNAPSHOT handshake rather than Phase 8's `documentId` query param — see
 the Phase 9 completed-phase entry above for what each test covers,
 including the 50-cycle distinct-replica-id check and the two real-bug
-fixes that check surfaced).
+fixes that check surfaced), and Phase 10's `packages/client/src/sync/
+*.test.ts` (34 tests): `backoff.test.ts` (5, the full-jitter envelope
+math and the 20-non-identical-delays check), `gapTracker.test.ts` (6),
+`unackedQueue.test.ts` (6), `syncClient.test.ts` (13, a fake but fully
+synchronous `WebSocketLike` driven together with `vi.useFakeTimers()` —
+handshake/SYNC_COMPLETE, snapshot seeding, sequence-gap-triggers-
+reconnect, and the full backoff-reset-only-after-60s matrix including
+the "dies immediately after WELCOME" case from §3.10's own text), and
+`headlessHarness.test.ts` (3, real server + real global `WebSocket`, no
+mocks: 1,000-operation convergence, and the kill-the-server/restart-on-
+the-same-port/reconnect/re-converge scenario with connection-state
+sequence assertions).
 
 `pnpm test:convergence` currently PASSES for all six required configs
 (Test Plan §2.2): 10,000/10,000 seeds converge in each (60,000 total),

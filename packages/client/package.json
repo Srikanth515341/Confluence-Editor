@@ -13,5 +13,9 @@
   "dependencies": {
     "@collab-editor/engine": "workspace:*",
     "@collab-editor/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@collab-editor/server": "workspace:*",
+    "typescript": "^5.6.3"
   }
 }

@@ -12,25 +12,29 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 9 — sync handshake (fresh connection).** A WebSocket
-connection now completes a real HELLO → WELCOME → SNAPSHOT →
-SYNC_COMPLETE exchange on the CONTROL channel before any document
-operation is accepted: the server allocates a permanent, never-reused
-OBSEQ replica id, admits the session as an editor, and sends it the
-document's full current state (a structure-form SNAPSHOT, decoded and
-verified to exactly match what earlier clients inserted — including
-across three simultaneous joiners). A 3-second client PING keeps the
-connection live and gets a PONG back on CONTROL; 8 seconds without one
-marks a session's presence stale. `packages/server` runs a real Express
-+ WebSocket server end to end: `/v1/rt` (subprotocol `obseq.v1`, binary
-frames only), one `DocumentCoordinator` per open document running the
-same OBSEQ engine as clients (replica id 0 reserved for the server),
-operations decoded/applied/re-stamped/broadcast to every other
-connected peer, and three fully separate physical send queues per
-connection (OPS, CONTROL, PRESENCE) drained in strict priority order.
-Persistence, acks, auth, presence, and reconnection (CATCHUP) are still
-not built (Phases 15-17, 23, 26-29, 31) — state is in-memory only and
-lost on restart, which is correct through this phase.
+🚧 **Phase 10 — client sync layer.** `packages/client/src/sync/` is a
+real, headless (no React, no DOM) browser-side connection manager:
+`SyncClient` owns the socket lifecycle, the HELLO/WELCOME/SNAPSHOT/
+SYNC_COMPLETE handshake, a 3-second heartbeat, an unacked-operation
+queue keyed by origin stamp, and reconnection with full-jitter
+exponential backoff (base 500 ms, factor 2, cap 30 s — the counter
+resets only once a connection survives a full 60 seconds, so a
+crash-looping server is never hammered at 500 ms forever). A sequence
+gap (an OPS frame arriving ahead of what's expected) is applied
+immediately regardless, tracked, and — if it persists 5 seconds —
+resolved by closing the socket and letting the ordinary reconnect path
+fetch a fresh SNAPSHOT, rather than building a second repair mechanism.
+Two headless `SyncClient`s were run against a real server end to end:
+1,000 alternating operations converge in under a second, and killing
+the server mid-session, then restarting it, drives both clients through
+`reconnecting` back to `synced` with a fresh replica id each, converging
+again on new content. `packages/server`'s real HELLO → WELCOME →
+SNAPSHOT → SYNC_COMPLETE handshake (Phase 9) and full Express + WebSocket
+gateway (Phase 8) back all of this. Persistence, acks, auth, presence,
+and server-side reconnection catch-up (CATCHUP) are still not built
+(Phases 15-17, 23, 26-29, 31) — every reconnect gets a full fresh
+snapshot, never a delta, and a real coordinator restart loses all
+document content, not just the connection.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -140,6 +144,7 @@ runs this at full scale on a schedule.
 | Binary wire codec (OPS channel)         | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)       |
 | WebSocket gateway + Document Coordinator| ✅ Phase 8 (in-memory)                                                     |
 | Sync handshake + heartbeat (fresh conn.)| ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)|
+| Client sync layer (SyncClient)          | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet) |
 | Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
 | Client (editor binding, presence)       | ⏳ not started                                                             |
 | Offline & reconciliation                | ⏳ not started                                                             |
