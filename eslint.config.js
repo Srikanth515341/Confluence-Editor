@@ -48,7 +48,17 @@ const engineSyntaxBan = [
 
 export default tseslint.config(
   {
-    ignores: ["**/dist/**", "**/build/**", "**/coverage/**", "**/node_modules/**", "**/.turbo/**"],
+    ignores: [
+      "**/dist/**",
+      "**/build/**",
+      "**/coverage/**",
+      "**/node_modules/**",
+      "**/.turbo/**",
+      // Phase 11: esbuild-generated Playwright test bundle — not source, gitignored, never linted.
+      "**/e2e/.bundle/**",
+      "**/playwright-report/**",
+      "**/test-results/**",
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

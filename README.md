@@ -12,29 +12,28 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 10 — client sync layer.** `packages/client/src/sync/` is a
-real, headless (no React, no DOM) browser-side connection manager:
-`SyncClient` owns the socket lifecycle, the HELLO/WELCOME/SNAPSHOT/
-SYNC_COMPLETE handshake, a 3-second heartbeat, an unacked-operation
-queue keyed by origin stamp, and reconnection with full-jitter
-exponential backoff (base 500 ms, factor 2, cap 30 s — the counter
-resets only once a connection survives a full 60 seconds, so a
-crash-looping server is never hammered at 500 ms forever). A sequence
-gap (an OPS frame arriving ahead of what's expected) is applied
-immediately regardless, tracked, and — if it persists 5 seconds —
-resolved by closing the socket and letting the ordinary reconnect path
-fetch a fresh SNAPSHOT, rather than building a second repair mechanism.
-Two headless `SyncClient`s were run against a real server end to end:
-1,000 alternating operations converge in under a second, and killing
-the server mid-session, then restarting it, drives both clients through
-`reconnecting` back to `synced` with a fresh replica id each, converging
-again on new content. `packages/server`'s real HELLO → WELCOME →
-SNAPSHOT → SYNC_COMPLETE handshake (Phase 9) and full Express + WebSocket
-gateway (Phase 8) back all of this. Persistence, acks, auth, presence,
-and server-side reconnection catch-up (CATCHUP) are still not built
-(Phases 15-17, 23, 26-29, 31) — every reconnect gets a full fresh
-snapshot, never a delta, and a real coordinator restart loses all
-document content, not just the connection.
+🚧 **Phase 11 — render model and position mapping.**
+`packages/client/src/binding/` implements the bidirectional mapping
+between the engine's visible (Unicode scalar) indices and real DOM
+positions — the exact unit mismatch that breaks on the first emoji if
+you reach for `String.length`. `DomWriter` is the sole module allowed
+to touch the editor subtree, maintaining a render index of runs (each
+backed by one DOM Text node, capped at 512 scalars) with incremental
+maintenance on insert/delete and a dev-build assertion that fires if
+the index and the DOM ever disagree. Verified against 7 Unicode
+fixtures (ASCII, diacritics, an astral emoji, a ZWJ family sequence,
+regional-indicator flags, Devanagari matras, Hangul) — round-tripping
+every visible position, confirming the caret never lands inside a
+surrogate pair, and confirming a real Phase-3 `Engine` agrees on what
+"visible index" means. This phase also stood up **Playwright**, the
+first real-browser test infrastructure in this project: the same
+mapping is exercised against real Chromium AND real WebKit (not
+jsdom, which can't reproduce real Selection/Range quirks), including
+the well-known case where the two browsers disagree about what an
+empty, focused contenteditable's DOM looks like. Input handling, the
+sentinel, and cursor transformation under remote edits are still not
+built (Phases 12, 13, 32) — nothing connects a keystroke to `DomWriter`
+yet.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -145,6 +144,7 @@ runs this at full scale on a schedule.
 | WebSocket gateway + Document Coordinator| ✅ Phase 8 (in-memory)                                                     |
 | Sync handshake + heartbeat (fresh conn.)| ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)|
 | Client sync layer (SyncClient)          | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet) |
+| DOM render model + position mapping     | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)       |
 | Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
 | Client (editor binding, presence)       | ⏳ not started                                                             |
 | Offline & reconciliation                | ⏳ not started                                                             |
