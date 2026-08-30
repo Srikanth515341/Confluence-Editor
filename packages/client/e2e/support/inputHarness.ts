@@ -10,3 +10,4 @@ export { Engine } from "@collab-editor/engine";
 export { DomWriter } from "../../src/binding/index.js";
 export { SyncClient } from "../../src/sync/syncClient.js";
 export { attachInputPipeline } from "../../src/input/inputPipeline.js";
+export { MutationSentinel } from "../../src/sentinel/mutationSentinel.js";

@@ -33,15 +33,36 @@ export interface HarnessSyncClient {
   localDelete(visibleIndex: number, count: number): unknown;
 }
 
+export interface HarnessSentinelMetrics {
+  readonly reconciliation: number;
+  readonly desync_error: number;
+}
+
+export interface HarnessMutationSentinel {
+  readonly metrics: HarnessSentinelMetrics;
+  start(): void;
+  stop(): void;
+  applyPatches(fn: () => void): void;
+}
+
 declare global {
   interface Window {
     InputHarness: {
       Engine: new (replicaId: number) => HarnessEngine;
       DomWriter: new () => HarnessDomWriter;
       SyncClient: new (opts: { url: string; documentId: string }) => HarnessSyncClient;
+      MutationSentinel: new (deps: {
+        root: Element;
+        domWriter: HarnessDomWriter;
+        getEngineText: () => string | undefined;
+      }) => HarnessMutationSentinel;
       attachInputPipeline: (
         root: Element,
-        deps: { domWriter: HarnessDomWriter; sync: HarnessSyncClient },
+        deps: {
+          domWriter: HarnessDomWriter;
+          sync: HarnessSyncClient;
+          sentinel: HarnessMutationSentinel;
+        },
       ) => () => void;
     };
   }

@@ -12,33 +12,28 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 12 — input pipeline.**
-`packages/client/src/input/` captures every `beforeinput` event on a
-real contenteditable root and translates it into engine operations —
-the browser is never allowed to mutate the document itself
-(`event.preventDefault()` fires unconditionally, verified across 20
-distinct `inputType`s). The full API/Protocol/Data Spec §7.4.2
-dispatch table is implemented: typing, autocorrect/spellcheck
-replacement, paste and drag-and-drop (coalesced into a single
-`OP_INSERT_RUN` wire frame rather than one frame per character —
-verified by literally counting frames on a socket), cut, and deletion
-at grapheme-cluster/word/line granularity via `Intl.Segmenter` rather
-than a regex. `packages/client/src/editor/EditorView.tsx` is this
-project's first React component: a contenteditable root that mounts
-`DomWriter` from a caller-connected `SyncClient` and wires the input
-pipeline in. Two real bugs surfaced only by actually running the new
-input-pipeline suite in real browsers, not by unit tests alone: typing
-"hello" landing as "olleh" (the browser's own caret never advances once
-every native edit is prevented — fixed by manually repositioning the
-live `Selection` after each mutation), and real Firefox removing only
-part of a family-emoji grapheme cluster on Backspace (a browser's own
-`getTargetRanges()` cannot be trusted for cluster boundaries — only
-`Intl.Segmenter` can). Playwright now also runs against real Firefox,
-alongside Chromium and WebKit. No IME/composition handling and no
-cursor transformation under remote edits yet (Phases 13, 32) — typing,
-pasting, and deleting in a single browser session works end to end;
-a second replica's concurrent edits are not yet reflected live in this
-session's DOM.
+🚧 **Phase 13 — MutationSentinel and DOM reconciliation.**
+`packages/client/src/sentinel/` adds a `MutationObserver`-based guard
+over the editor root: the engine is always authoritative, so ANY DOM
+mutation not made through `DomWriter` — a browser extension, devtools,
+a future bug — is detected and reverted by re-rendering the whole
+subtree from the engine's own text, never by interpreting what the
+foreign write did. The one subtlety this whole mechanism turns on:
+`observer.takeRecords()` must be called SYNCHRONOUSLY, right after each
+of this project's own writes, never guarded by a boolean flag — an
+actual (deliberately temporary) experiment swapping in a flag-based
+guard didn't just mis-fire once per keystroke as expected, it entered
+an infinite reconciliation loop from the very first write and hung the
+browser, confirmed against real Chromium before being reverted. Every
+write `packages/client/src/input/inputPipeline.ts` and
+`EditorView.tsx` make now flows through this same guard. Reconciliation
+and desync counts are real, queryable per-instance metrics, not log
+lines — the only early-warning instrument for a silent DOM/engine
+drift. No cursor transformation under remote edits yet (Phase 32) and
+no IME/composition support (unbuilt, not yet assigned to a phase) —
+typing, pasting, deleting, and now DOM-tamper recovery all work
+end-to-end in a single browser session, verified against real
+Chromium, Firefox, and WebKit.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -151,8 +146,9 @@ runs this at full scale on a schedule.
 | Client sync layer (SyncClient)          | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet) |
 | DOM render model + position mapping     | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)       |
 | Input pipeline (beforeinput → ops)      | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component) |
+| MutationSentinel (DOM reconciliation)    | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics) |
 | Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
-| Sentinel + cursor transform under remote edits | ⏳ not started (Phases 13, 32)                                      |
+| Cursor transform under remote edits      | ⏳ not started (Phase 32)                                                 |
 | Offline & reconciliation                | ⏳ not started                                                             |
 | Permissions                             | ⏳ not started                                                             |
 | Version history                         | ⏳ not started                                                             |

@@ -4,8 +4,9 @@
 // stay DOM-free. Phase 10 built src/sync/ (the connection manager); Phase
 // 11 built src/binding/ (DomWriter, render index, position mapping); Phase
 // 12 built src/input/ (the beforeinput dispatch pipeline) and src/editor/
-// (the React component) — no sentinel (Phase 13) or cursor transformation
-// under remote edits (Phase 32) exists yet.
+// (the React component); Phase 13 built src/sentinel/ (MutationObserver-
+// based DOM reconciliation) — no cursor transformation under remote edits
+// (Phase 32) exists yet.
 
 export const CLIENT_PACKAGE_NAME = "@collab-editor/client";
 
@@ -13,3 +14,4 @@ export * from "./sync/index.js";
 export * from "./binding/index.js";
 export * from "./input/index.js";
 export * from "./editor/index.js";
+export * from "./sentinel/index.js";

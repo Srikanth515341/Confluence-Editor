@@ -12,6 +12,7 @@ import {
   type DomWriter,
 } from "../binding/index.js";
 import type { SyncClient } from "../sync/syncClient.js";
+import type { MutationSentinel } from "../sentinel/index.js";
 import {
   clusterAfter,
   clusterBefore,
@@ -20,10 +21,17 @@ import {
   wordBefore,
 } from "./graphemeSegmentation.js";
 
-/** Everything one `beforeinput` handler call needs — no hidden global state. */
+/**
+ * Everything one `beforeinput` handler call needs — no hidden global state.
+ * `sentinel` is REQUIRED, not optional: every `DomWriter` write below runs
+ * through `sentinel.applyPatches()` (Phase 13, API Spec §7.7.1) rather than
+ * calling `domWriter.insertText`/`deleteRange` bare, so a caller can never
+ * accidentally reintroduce a DOM mutation the sentinel doesn't know about.
+ */
 export interface InputPipelineDeps {
   readonly domWriter: DomWriter;
   readonly sync: SyncClient;
+  readonly sentinel: MutationSentinel;
 }
 
 interface VisRange {
@@ -107,7 +115,9 @@ function insertTextAt(deps: InputPipelineDeps, at: number, text: string): void {
     return;
   }
   deps.sync.localInsertText(at, text);
-  deps.domWriter.insertText(at, text, deps.sync.engine?.text());
+  deps.sentinel.applyPatches(() => {
+    deps.domWriter.insertText(at, text, deps.sync.engine?.text());
+  });
   placeCaretAt(deps, at + Array.from(text).length); // Array.from: scalar count, not UTF-16 length
 }
 
@@ -116,7 +126,9 @@ function deleteRangeAt(deps: InputPipelineDeps, at: number, count: number): void
     return;
   }
   deps.sync.localDelete(at, count);
-  deps.domWriter.deleteRange(at, count, deps.sync.engine?.text());
+  deps.sentinel.applyPatches(() => {
+    deps.domWriter.deleteRange(at, count, deps.sync.engine?.text());
+  });
   placeCaretAt(deps, at);
 }
 
