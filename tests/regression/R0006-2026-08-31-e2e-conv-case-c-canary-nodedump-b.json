@@ -1,0 +1,42 @@
+{
+  "id": "R0006",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "Case C canary fired a 6th time, same run as R0005, iteration 6 of 8. Same exact pattern as R0005: client index 1 (firefox) ends up drastically ahead of the other two clients and the server's own replay, which remain in perfect agreement with each other.",
+  "harness": "packages/client/_debugNodeDump.mjs, same run as R0005, iteration 6 of 8",
+  "scenario": {
+    "description": "Same E2E-CONV-01-shaped scenario as R0001-R0005.",
+    "seedText": "the quick brown fox!",
+    "markerScheme": "index0(chromium)=A, index1(firefox)=B, index2(webkit)=C — see R0005's note on replica-id vs array-index.",
+    "typingIntervalMs": 200,
+    "delayMsEachDirection": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 6,
+    "iterationsInRun": 8,
+    "iterationsResult": "iter0 OK, iter1 CRASH (see R0005), iter2 OK, iter3 OK, iter4 OK, iter5 OK, iter6 THIS FAILURE, iter7 OK (6/8 passed)"
+  },
+  "failureType": "engine-canary-crash",
+  "exactError": "Error: integrate(): Case C reached with candidate 56:3 whose destination would have moved past 55:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+  "nodeCountsAtFailure": {
+    "client0_chromium": 637,
+    "client1_firefox": 895,
+    "client2_webkit": 637,
+    "serverReplay": 637
+  },
+  "structuralDiff": {
+    "serverVsClient0": "identical node arrays (0 differences)",
+    "serverVsClient2": "identical node arrays (0 differences)",
+    "serverVsClient1_firstDiffIndex": 1,
+    "serverVsClient1_diffDetail": {
+      "serverNodeAtIndex1": { "id": { "c": 295, "r": 2 }, "originLeft": null, "originRight": { "c": 290, "r": 2 }, "bind": false, "deleted": false, "deletedBy": null, "value": 67 },
+      "firefoxNodeAtIndex1": { "id": { "c": 314, "r": 3 }, "originLeft": null, "originRight": { "c": 295, "r": 2 }, "bind": false, "deleted": false, "deletedBy": null, "value": 66 },
+      "serverContextAroundIndex1": ["314:2", "295:2", "299:2", "309:1"],
+      "firefoxContextAroundIndex1": ["314:2", "314:3", "295:2", "308:3"]
+    }
+  },
+  "keyObservation": "Identical pattern to R0005, same run, different iteration, different random typing content and node ids: client index 1 (firefox) diverges by having ~258 MORE nodes than everyone else, while chromium/webkit/server all agree exactly. Two independent occurrences in the same 8-run batch, both implicating the SAME array slot (and therefore the same browser engine, since slot-to-engine mapping was fixed for this whole run). This strengthens, but does not yet prove, the 'Firefox-specific' hypothesis over the 'array-slot/timing-artifact' hypothesis — see R0005's recommendedNextStep (slot permutation) for how to actually distinguish them.",
+  "reproducibilityCaveat": "Same as R0005 — full node-level ground truth captured, not a byte-exact wire-trace reproducer.",
+  "relatedEntries": ["R0001", "R0002", "R0003", "R0004", "R0005"],
+  "status": "RESOLVED (test-infrastructure, not product) — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. Same resolution as R0005: Firefox was not confirmed unique to this failure mode; traced to the test harness's delay-injection layer, not the product. Entry retained per Rule 2, not removed."
+}

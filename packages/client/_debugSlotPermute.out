@@ -1,0 +1,87 @@
+{"ts":"2026-08-31T11:55:03.711Z","level":"info","message":"server.listening","port":65523}
+{"ts":"2026-08-31T11:55:06.782Z","level":"info","message":"ws.open","sessionId":"b1bd52b6-c3f5-4de1-aa17-577de4811cb5"}
+{"ts":"2026-08-31T11:55:06.837Z","level":"info","message":"ws.open","sessionId":"e2964c74-747a-45b5-b516-da9a0f966a29"}
+{"ts":"2026-08-31T11:55:06.871Z","level":"info","message":"ws.connect","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"b1bd52b6-c3f5-4de1-aa17-577de4811cb5","replicaId":1}
+{"ts":"2026-08-31T11:55:06.963Z","level":"info","message":"ws.connect","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"e2964c74-747a-45b5-b516-da9a0f966a29","replicaId":2}
+{"ts":"2026-08-31T11:55:07.057Z","level":"info","message":"ws.syncComplete","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"b1bd52b6-c3f5-4de1-aa17-577de4811cb5","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:55:07.179Z","level":"info","message":"ws.syncComplete","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"e2964c74-747a-45b5-b516-da9a0f966a29","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:55:07.363Z","level":"info","message":"ws.open","sessionId":"2f4c220b-2ff8-49bb-8612-b73132d4c837"}
+{"ts":"2026-08-31T11:55:07.472Z","level":"info","message":"ws.connect","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"2f4c220b-2ff8-49bb-8612-b73132d4c837","replicaId":3}
+{"ts":"2026-08-31T11:55:07.711Z","level":"info","message":"ws.syncComplete","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"2f4c220b-2ff8-49bb-8612-b73132d4c837","lastServerSeq":0,"resentCount":0}
+[SLOTPERMUTE] iter 0 order=["chromium","firefox","webkit"]: OK domLen=[893,893,893] nodeCounts=[893,893,893] serverNodeCount=893 pending=[0,0,0] 
+{"ts":"2026-08-31T11:56:11.015Z","level":"info","message":"ws.disconnect","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"b1bd52b6-c3f5-4de1-aa17-577de4811cb5","code":1001}
+{"ts":"2026-08-31T11:56:11.032Z","level":"info","message":"ws.disconnect","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"e2964c74-747a-45b5-b516-da9a0f966a29","code":1001}
+{"ts":"2026-08-31T11:56:11.060Z","level":"info","message":"ws.disconnect","documentId":"4c5d3a6a-c79f-43c5-82e4-260fc99cf247","sessionId":"2f4c220b-2ff8-49bb-8612-b73132d4c837","code":1001}
+{"ts":"2026-08-31T11:56:11.463Z","level":"info","message":"server.listening","port":54571}
+{"ts":"2026-08-31T11:56:14.392Z","level":"info","message":"ws.open","sessionId":"f29230ee-61a9-423b-8fc2-bd52dbee0dc1"}
+{"ts":"2026-08-31T11:56:14.425Z","level":"info","message":"ws.open","sessionId":"739e8864-738f-4aac-bc44-d40d4c6af9e3"}
+{"ts":"2026-08-31T11:56:14.518Z","level":"info","message":"ws.connect","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"f29230ee-61a9-423b-8fc2-bd52dbee0dc1","replicaId":1}
+{"ts":"2026-08-31T11:56:14.521Z","level":"info","message":"ws.connect","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"739e8864-738f-4aac-bc44-d40d4c6af9e3","replicaId":2}
+{"ts":"2026-08-31T11:56:14.707Z","level":"info","message":"ws.syncComplete","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"739e8864-738f-4aac-bc44-d40d4c6af9e3","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:56:14.735Z","level":"info","message":"ws.syncComplete","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"f29230ee-61a9-423b-8fc2-bd52dbee0dc1","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:56:15.054Z","level":"info","message":"ws.open","sessionId":"5720617a-0313-4978-91c4-6846ae524f06"}
+{"ts":"2026-08-31T11:56:15.148Z","level":"info","message":"ws.connect","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"5720617a-0313-4978-91c4-6846ae524f06","replicaId":3}
+{"ts":"2026-08-31T11:56:15.411Z","level":"info","message":"ws.syncComplete","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"5720617a-0313-4978-91c4-6846ae524f06","lastServerSeq":0,"resentCount":0}
+[SLOTPERMUTE] iter 1 order=["firefox","webkit","chromium"]: OK domLen=[890,890,890] nodeCounts=[890,890,890] serverNodeCount=890 pending=[0,0,0] 
+{"ts":"2026-08-31T11:57:18.824Z","level":"info","message":"ws.disconnect","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"739e8864-738f-4aac-bc44-d40d4c6af9e3","code":1001}
+{"ts":"2026-08-31T11:57:18.866Z","level":"info","message":"ws.disconnect","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"f29230ee-61a9-423b-8fc2-bd52dbee0dc1","code":1006}
+{"ts":"2026-08-31T11:57:18.885Z","level":"info","message":"ws.disconnect","documentId":"f667ea84-5be2-454a-889a-fcfbe9c2bed1","sessionId":"5720617a-0313-4978-91c4-6846ae524f06","code":1001}
+{"ts":"2026-08-31T11:57:19.346Z","level":"info","message":"server.listening","port":49621}
+{"ts":"2026-08-31T11:57:22.572Z","level":"info","message":"ws.open","sessionId":"57355a26-f467-49e4-8030-aa3e58ccb955"}
+{"ts":"2026-08-31T11:57:22.600Z","level":"info","message":"ws.open","sessionId":"1f0ee8bd-1566-498d-acad-2aee08c6729d"}
+{"ts":"2026-08-31T11:57:22.665Z","level":"info","message":"ws.connect","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"57355a26-f467-49e4-8030-aa3e58ccb955","replicaId":1}
+{"ts":"2026-08-31T11:57:22.725Z","level":"info","message":"ws.connect","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"1f0ee8bd-1566-498d-acad-2aee08c6729d","replicaId":2}
+{"ts":"2026-08-31T11:57:22.851Z","level":"info","message":"ws.syncComplete","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"57355a26-f467-49e4-8030-aa3e58ccb955","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:57:22.941Z","level":"info","message":"ws.syncComplete","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"1f0ee8bd-1566-498d-acad-2aee08c6729d","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:57:23.240Z","level":"info","message":"ws.open","sessionId":"914c4eb1-581d-4bfc-a97c-622518cea18d"}
+{"ts":"2026-08-31T11:57:23.343Z","level":"info","message":"ws.connect","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"914c4eb1-581d-4bfc-a97c-622518cea18d","replicaId":3}
+{"ts":"2026-08-31T11:57:23.545Z","level":"info","message":"ws.syncComplete","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"914c4eb1-581d-4bfc-a97c-622518cea18d","lastServerSeq":0,"resentCount":0}
+[SLOTPERMUTE] iter 2 order=["webkit","chromium","firefox"]: OK domLen=[891,891,891] nodeCounts=[891,891,891] serverNodeCount=891 pending=[0,0,0] 
+{"ts":"2026-08-31T11:58:26.884Z","level":"info","message":"ws.disconnect","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"57355a26-f467-49e4-8030-aa3e58ccb955","code":1001}
+{"ts":"2026-08-31T11:58:26.928Z","level":"info","message":"ws.disconnect","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"1f0ee8bd-1566-498d-acad-2aee08c6729d","code":1006}
+{"ts":"2026-08-31T11:58:26.948Z","level":"info","message":"ws.disconnect","documentId":"5ab478b8-3c1c-41a6-bc2b-cd2696513de3","sessionId":"914c4eb1-581d-4bfc-a97c-622518cea18d","code":1001}
+{"ts":"2026-08-31T11:58:27.393Z","level":"info","message":"server.listening","port":52159}
+{"ts":"2026-08-31T11:58:30.546Z","level":"info","message":"ws.open","sessionId":"0a5e9940-7537-4b50-80d6-922782b46c30"}
+{"ts":"2026-08-31T11:58:30.549Z","level":"info","message":"ws.open","sessionId":"fca85666-64e7-4d7a-bf75-671b6d24713e"}
+{"ts":"2026-08-31T11:58:30.639Z","level":"info","message":"ws.connect","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"fca85666-64e7-4d7a-bf75-671b6d24713e","replicaId":1}
+{"ts":"2026-08-31T11:58:30.668Z","level":"info","message":"ws.connect","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"0a5e9940-7537-4b50-80d6-922782b46c30","replicaId":2}
+{"ts":"2026-08-31T11:58:30.827Z","level":"info","message":"ws.syncComplete","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"fca85666-64e7-4d7a-bf75-671b6d24713e","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:58:30.887Z","level":"info","message":"ws.syncComplete","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"0a5e9940-7537-4b50-80d6-922782b46c30","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:58:31.226Z","level":"info","message":"ws.open","sessionId":"452a05dd-98d2-49b3-a1dc-6b60f4dffe84"}
+{"ts":"2026-08-31T11:58:31.329Z","level":"info","message":"ws.connect","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"452a05dd-98d2-49b3-a1dc-6b60f4dffe84","replicaId":3}
+{"ts":"2026-08-31T11:58:31.562Z","level":"info","message":"ws.syncComplete","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"452a05dd-98d2-49b3-a1dc-6b60f4dffe84","lastServerSeq":0,"resentCount":0}
+[SLOTPERMUTE] iter 3 order=["chromium","webkit","firefox"]: OK domLen=[890,890,890] nodeCounts=[890,890,890] serverNodeCount=890 pending=[0,0,0] 
+{"ts":"2026-08-31T11:59:34.804Z","level":"info","message":"ws.disconnect","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"fca85666-64e7-4d7a-bf75-671b6d24713e","code":1001}
+{"ts":"2026-08-31T11:59:34.829Z","level":"info","message":"ws.disconnect","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"0a5e9940-7537-4b50-80d6-922782b46c30","code":1001}
+{"ts":"2026-08-31T11:59:34.865Z","level":"info","message":"ws.disconnect","documentId":"7ff3528f-90b5-4c87-bd8f-e587926977c9","sessionId":"452a05dd-98d2-49b3-a1dc-6b60f4dffe84","code":1001}
+{"ts":"2026-08-31T11:59:35.304Z","level":"info","message":"server.listening","port":49344}
+{"ts":"2026-08-31T11:59:38.534Z","level":"info","message":"ws.open","sessionId":"e39ed98f-42c2-41ae-8fd9-12eebf1ab4eb"}
+{"ts":"2026-08-31T11:59:38.563Z","level":"info","message":"ws.open","sessionId":"cbe80b9c-6aac-4e6c-a993-b245e5e4a1a9"}
+{"ts":"2026-08-31T11:59:38.628Z","level":"info","message":"ws.connect","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"e39ed98f-42c2-41ae-8fd9-12eebf1ab4eb","replicaId":1}
+{"ts":"2026-08-31T11:59:38.687Z","level":"info","message":"ws.connect","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"cbe80b9c-6aac-4e6c-a993-b245e5e4a1a9","replicaId":2}
+{"ts":"2026-08-31T11:59:38.798Z","level":"info","message":"ws.syncComplete","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"e39ed98f-42c2-41ae-8fd9-12eebf1ab4eb","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:59:38.905Z","level":"info","message":"ws.syncComplete","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"cbe80b9c-6aac-4e6c-a993-b245e5e4a1a9","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:59:39.168Z","level":"info","message":"ws.open","sessionId":"61f41934-7734-4b30-ab31-26bf2e9f3110"}
+{"ts":"2026-08-31T11:59:39.274Z","level":"info","message":"ws.connect","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"61f41934-7734-4b30-ab31-26bf2e9f3110","replicaId":3}
+{"ts":"2026-08-31T11:59:39.474Z","level":"info","message":"ws.syncComplete","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"61f41934-7734-4b30-ab31-26bf2e9f3110","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:00:08.496Z","level":"warn","message":"presence.stale","sessionId":"61f41934-7734-4b30-ab31-26bf2e9f3110","replicaId":3,"thresholdMs":8000}
+[SLOTPERMUTE] iter 4 order=["firefox","chromium","webkit"]: SERVER-CRASH: Error: integrate(): Case C reached with candidate 123:3 whose destination would have moved past 122:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). domLen=[893,702,702] nodeCounts=[893,702,702] serverNodeCount=702 pending=[0,0,0] 
+  >>> DIVERGED CLIENT: slot 0 = engine "firefox" (893 nodes vs server's 702)
+{"ts":"2026-08-31T12:00:42.848Z","level":"info","message":"ws.disconnect","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"e39ed98f-42c2-41ae-8fd9-12eebf1ab4eb","code":1001}
+{"ts":"2026-08-31T12:00:42.886Z","level":"info","message":"ws.disconnect","documentId":"63384094-8ddc-4ec2-afe6-f4bdd9086be3","sessionId":"cbe80b9c-6aac-4e6c-a993-b245e5e4a1a9","code":1006}
+{"ts":"2026-08-31T12:00:43.352Z","level":"info","message":"server.listening","port":58476}
+{"ts":"2026-08-31T12:00:46.416Z","level":"info","message":"ws.open","sessionId":"67b2e5cc-6dc3-4557-bfe0-9103ad88ff7f"}
+{"ts":"2026-08-31T12:00:46.430Z","level":"info","message":"ws.open","sessionId":"f00d1588-d244-468c-8d58-35853e09ec25"}
+{"ts":"2026-08-31T12:00:46.511Z","level":"info","message":"ws.connect","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"67b2e5cc-6dc3-4557-bfe0-9103ad88ff7f","replicaId":1}
+{"ts":"2026-08-31T12:00:46.555Z","level":"info","message":"ws.connect","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"f00d1588-d244-468c-8d58-35853e09ec25","replicaId":2}
+{"ts":"2026-08-31T12:00:46.699Z","level":"info","message":"ws.syncComplete","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"67b2e5cc-6dc3-4557-bfe0-9103ad88ff7f","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:00:46.774Z","level":"info","message":"ws.syncComplete","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"f00d1588-d244-468c-8d58-35853e09ec25","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:00:47.147Z","level":"info","message":"ws.open","sessionId":"b59d0c82-cc56-4ed1-a2dc-d92b53382ca5"}
+{"ts":"2026-08-31T12:00:47.251Z","level":"info","message":"ws.connect","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"b59d0c82-cc56-4ed1-a2dc-d92b53382ca5","replicaId":3}
+{"ts":"2026-08-31T12:00:47.444Z","level":"info","message":"ws.syncComplete","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"b59d0c82-cc56-4ed1-a2dc-d92b53382ca5","lastServerSeq":0,"resentCount":0}
+[SLOTPERMUTE] iter 5 order=["webkit","firefox","chromium"]: OK domLen=[892,892,892] nodeCounts=[892,892,892] serverNodeCount=892 pending=[0,0,0] 
+{"ts":"2026-08-31T12:01:50.849Z","level":"info","message":"ws.disconnect","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"67b2e5cc-6dc3-4557-bfe0-9103ad88ff7f","code":1001}
+{"ts":"2026-08-31T12:01:50.892Z","level":"info","message":"ws.disconnect","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"f00d1588-d244-468c-8d58-35853e09ec25","code":1006}
+{"ts":"2026-08-31T12:01:50.912Z","level":"info","message":"ws.disconnect","documentId":"5b91d3e1-fc24-42b9-97c5-02816721b00c","sessionId":"b59d0c82-cc56-4ed1-a2dc-d92b53382ca5","code":1001}
+
+5/6 passed (SLOTPERMUTE diagnostic run)

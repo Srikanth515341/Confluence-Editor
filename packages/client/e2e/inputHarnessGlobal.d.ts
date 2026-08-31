@@ -29,6 +29,9 @@ export interface HarnessEngine {
 
 export interface HarnessSyncClient {
   engine: HarnessEngine | null;
+  readonly state: { readonly value: string };
+  /** TEST-ONLY (SyncClient's own doc comment) — sets `engine` AND flips `state` to "synced" together, bypassing a real handshake. */
+  seedForTesting(engine: HarnessEngine): void;
   localInsertText(visibleIndex: number, text: string): unknown;
   localDelete(visibleIndex: number, count: number): unknown;
 }

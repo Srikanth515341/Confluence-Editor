@@ -1,0 +1,61 @@
+{
+  "id": "R0004",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "SILENT cross-client divergence — no assertion, no canary, no exception, pendingCount()===0 on all three clients — yet one real client (webkit) ended up with a document that is byte-different from, and 3 characters shorter than, the other two real clients AND the server's own independent operation-log replay. This is the most serious of the four findings: the product's core convergence guarantee actually failed and nothing caught it structurally.",
+  "harness": "packages/client/_debugNativeRelay60s.mjs, using Playwright's native context.routeWebSocket() + WebSocketRoute.connectToServer() — same harness and same 5-iteration run as R0002/R0003, iteration 0 of 5 (the FIRST iteration of that run).",
+  "scenario": {
+    "description": "Same E2E-CONV-01-shaped scenario as R0001-R0003.",
+    "seedText": "the quick brown fox!",
+    "markerScheme": "one fixed single-character marker per client: chromium=A(client0), firefox=B(client1), webkit=C(client2)",
+    "typingIntervalMs": 200,
+    "delayMsEachDirection": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 0,
+    "iterationsInRun": 5,
+    "iterationsResult": "iter0 THIS FAILURE, iter1 OK, iter2 CRASH (see R0002), iter3 CRASH (see R0003), iter4 OK (2/5 passed)"
+  },
+  "failureType": "silent-cross-client-divergence",
+  "measuredResult": {
+    "domTextLengths": { "client0_chromium": 697, "client1_firefox": 697, "client2_webkit": 694 },
+    "pendingCounts": [0, 0, 0],
+    "replayOk": true,
+    "replayTextLength": 697,
+    "diffFindings": {
+      "client0_vs_client1": "byte-identical (0 differences)",
+      "client0_vs_serverReplay": "byte-identical (0 differences) — i.e. client0 and client1 both match the server's OWN independently-replayed operation log exactly",
+      "client0_vs_client2": "first differing character at index 98; client2 is a genuinely different, shorter document, not merely a truncation at the end",
+      "diffContext": {
+        "client0_around_index_98": "BAACBAAAABBBAACBBCBCBAABBBBBBB",
+        "client2_around_index_98": "BAACBAAAABBBAACCBCBAABBBBBBBAA"
+      }
+    }
+  },
+  "consoleLogExcerpt": [
+    "{\"ts\":\"2026-08-31T11:31:27.903Z\",\"level\":\"info\",\"message\":\"server.listening\",\"port\":53399}",
+    "{\"ts\":\"2026-08-31T11:31:47.063Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"199657dc-f89d-4b21-9ee2-05f06938e02b\"}",
+    "{\"ts\":\"2026-08-31T11:31:47.176Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"199657dc-f89d-4b21-9ee2-05f06938e02b\",\"replicaId\":1}",
+    "{\"ts\":\"2026-08-31T11:31:47.387Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"199657dc-f89d-4b21-9ee2-05f06938e02b\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:31:47.976Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"e870ffbd-a172-495c-9629-c23bfaf4861c\"}",
+    "{\"ts\":\"2026-08-31T11:31:48.289Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"e870ffbd-a172-495c-9629-c23bfaf4861c\",\"replicaId\":2}",
+    "{\"ts\":\"2026-08-31T11:31:48.693Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"e870ffbd-a172-495c-9629-c23bfaf4861c\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:31:50.585Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6\"}",
+    "{\"ts\":\"2026-08-31T11:31:50.819Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6\",\"replicaId\":3}",
+    "{\"ts\":\"2026-08-31T11:31:51.282Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:32:08.125Z\",\"level\":\"warn\",\"message\":\"presence.stale\",\"sessionId\":\"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6\",\"replicaId\":3,\"thresholdMs\":8000}",
+    "{\"ts\":\"2026-08-31T11:32:12.633Z\",\"level\":\"info\",\"message\":\"presence.fresh\",\"sessionId\":\"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6\",\"replicaId\":3}",
+    "{\"ts\":\"2026-08-31T11:32:12.671Z\",\"level\":\"info\",\"message\":\"ws.disconnect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6\",\"code\":1005}",
+    "{\"ts\":\"2026-08-31T11:32:13.485Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"b396429e-3d74-4275-9473-684727dfbd63\"}",
+    "{\"ts\":\"2026-08-31T11:32:13.589Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"b396429e-3d74-4275-9473-684727dfbd63\",\"replicaId\":4}",
+    "{\"ts\":\"2026-08-31T11:32:13.773Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"b396429e-3d74-4275-9473-684727dfbd63\",\"lastServerSeq\":223,\"resentCount\":0}",
+    "[NATIVE routeWebSocket ~150ms] iter 0 duration=60000ms: MISMATCH len=697 pending=[0,0,0] replayOk=true",
+    "{\"ts\":\"2026-08-31T11:32:55.522Z\",\"level\":\"info\",\"message\":\"ws.disconnect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"199657dc-f89d-4b21-9ee2-05f06938e02b\",\"code\":1001}",
+    "{\"ts\":\"2026-08-31T11:32:55.697Z\",\"level\":\"info\",\"message\":\"ws.disconnect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"e870ffbd-a172-495c-9629-c23bfaf4861c\",\"code\":1001}",
+    "{\"ts\":\"2026-08-31T11:32:55.821Z\",\"level\":\"info\",\"message\":\"ws.disconnect\",\"documentId\":\"b2632414-1437-413c-9d55-e9de05c1dd1a\",\"sessionId\":\"b396429e-3d74-4275-9473-684727dfbd63\",\"code\":1001}"
+  ],
+  "notableTimingDetail": "UNLIKE R0002/R0003, a real mid-session reconnect DID happen here: replicaId 3 (webkit, the client that ends up diverging) went presence-stale at 11:32:08, came back fresh at 11:32:12, then disconnected (code 1005) and reconnected as a BRAND NEW replicaId 4 at 11:32:13, receiving a fresh SNAPSHOT with lastServerSeq already at 223. The diverging client is exactly the one that reconnected mid-run. This is consistent with (but does not, by itself, prove) a bug in the reconnect/snapshot-reseed path specifically — the fresh Engine seeded from the SNAPSHOT plus whatever the client continued typing afterward apparently lost or misplaced content relative to the server's own ground truth. Combined with R0002/R0003 (canary firures with NO reconnect at all), the current honest state is: there may be TWO distinct real bugs — (a) a reconnect/reseed-path bug producing silent divergence, and (b) a separate, non-reconnect-dependent bug in real concurrent-delivery timing that trips the Case C canary — or one bug reachable through two different paths. Not yet determined; this is exactly what the node-dump root-cause work (packages/client/_debugNodeDump.mjs) is trying to isolate.",
+  "reproducibilityCaveat": "Same Rule 3 deviation as R0001-R0003: raw operationLog for this occurrence was not persisted before teardown, and worse, the diverging CLIENT's own local operation history was never captured at all (no node-dump hook existed in App.tsx at the time this run happened — that hook was added immediately afterward, specifically in response to this finding). Record is full-fidelity for provenance/pattern-matching (including the actual measured DOM-text divergence and its exact position) but is NOT a byte-exact deterministic reproducer.",
+  "relatedEntries": ["R0001", "R0002", "R0003"],
+  "status": "RESOLVED (test-infrastructure, not product) — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. Confirmed as a defect in the test harness's delay-injection layer, not in SyncClient/gateway.ts/Engine — see R0001/R0002 for the confirming send-vs-receive/direct-path evidence. Still worth noting on its own: this was the one occurrence where no assertion (canary, pendingCount, invariant) caught the failure, which is a property of the injection-layer defect (a whole batch of frames vanishing without a trace on either connection) rather than of anything the product's own safety nets were designed to catch. Entry retained per Rule 2, not removed."
+}

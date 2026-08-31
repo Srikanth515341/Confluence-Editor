@@ -1,0 +1,31 @@
+{
+  "id": "R0007",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "DECISIVE finding: Case C canary fired again with Firefox implicated as the diverging client, this time using the ORIGINAL hand-rolled delayRelay.ts (a real, separate WebSocket relay process) instead of Playwright's native routeWebSocket() — ruling out 'Playwright's Firefox WebSocket-interception fidelity' as the explanation. Firefox is now implicated in 4 of 4 node-dumped failures (R0005, R0006, one SLOTPERMUTE iteration, and this one), across TWO structurally independent injection mechanisms, independent of array-slot position.",
+  "harness": "packages/client/_debugRelayNodeDump.mjs — real delayRelay.ts WebSocket relay process (NOT Playwright routeWebSocket), with node-dump instrumentation (App.tsx's getEngineNodes(), server's /v1/documents/:id/replay-nodes) and slot-permutation (browser-to-marker-slot assignment rotated per iteration, same rotation table as the SLOTPERMUTE run)",
+  "scenario": {
+    "description": "Same E2E-CONV-01-shaped scenario as R0001-R0006, 6 iterations, browser-to-slot order rotated per iteration per the ROTATIONS table in _debugSlotPermute.mjs/_debugRelayNodeDump.mjs.",
+    "seedText": "the quick brown fox!",
+    "typingIntervalMs": 200,
+    "delayMsOneWay": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 5,
+    "iterationsInRun": 6,
+    "order": ["webkit", "firefox", "chromium"],
+    "iterationsResult": "iter0 OK, iter1 OK, iter2 OK, iter3 OK, iter4 OK, iter5 THIS FAILURE (5/6 passed)"
+  },
+  "failureType": "engine-canary-crash",
+  "exactError": "Error: integrate(): Case C reached with candidate 181:3 whose destination would have moved past 180:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+  "nodeCountsAtFailure": {
+    "slot0_webkit": 761,
+    "slot1_firefox": 896,
+    "slot2_chromium": 761,
+    "serverReplay": 761
+  },
+  "keyObservation": "Firefox (slot 1 in this run) again ends up far ahead of the server and the other two clients (896 vs 761), which agree with each other exactly — identical shape to R0005/R0006/SLOTPERMUTE-iter4. Critically, THIS run used the real, separate delayRelay.ts relay process, not Playwright's routeWebSocket() API at all. This rules out the hypothesis raised after the slot-permutation result: that Firefox's involvement was an artifact of Playwright's own WebSocket-interception fidelity for Firefox specifically (Firefox uses a structurally different remote-control protocol, Juggler, vs Chromium/WebKit's CDP). Firefox is now implicated in 4 of 4 node-dumped failures across two structurally independent injection mechanisms, independent of slot position. This is now treated as CONFIRMED: a real, product-level, Firefox-specific defect (client-side, not server/engine-side, since server + other 2 clients + independent replay all agree with each other every time) — not a testing-tool artifact of either injection mechanism.",
+  "reproducibilityCaveat": "Same as R0005/R0006 — full node-level ground truth captured (all 3 clients' node counts + server replay's node count), not a byte-exact wire-trace reproducer of this specific trial. This is the strongest entry in the corpus so far for establishing WHICH PARTY is defective (definitively the Firefox client, not the engine/server), even though the exact code path within the Firefox client's own execution is still not identified.",
+  "relatedEntries": ["R0001", "R0002", "R0003", "R0004", "R0005", "R0006"],
+  "status": "SUPERSEDED CONCLUSION, RESOLVED overall — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. This entry's own conclusion ('a real, product-level, Firefox-client-specific defect... CONFIRMED') was premature and has been corrected: a later native-routeWebSocket run froze WebKit's connection instead of Firefox's with the identical signature, showing the defect is not Firefox-exclusive. Send-vs-receive instrumentation plus an 8-run zero-injection direct-path control (0/8 freezes, vs. reproducing within 1-3 attempts under either injection mechanism) traced the actual mechanism to the test harness's delay-injection layer, not to Firefox or any other part of the shipped product. Entry retained per Rule 2, not removed — kept specifically as a documented example of a conclusion that needed correction as more evidence arrived."
+}

@@ -1,0 +1,43 @@
+{
+  "id": "R0005",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "Case C canary fired again (5th observed occurrence), this time captured with full node-level structure from all 3 clients plus the server's independent replay. Reveals a specific, repeatable pattern: the client at array index 1 (firefox, in this harness's fixed browser-launch order) ends up with MANY MORE nodes (872) than the other two clients AND the server's own replay (776 each, all three in perfect agreement with each other).",
+  "harness": "packages/client/_debugNodeDump.mjs (derived from _debugNativeRelay60s.mjs — Playwright native routeWebSocket()/connectToServer(), no custom relay process — extended to dump full node structure via a new __collabDebug.getEngineNodes() hook in App.tsx and a new server /v1/documents/:id/replay-nodes diagnostic endpoint in httpApp.ts, both added specifically to investigate R0001-R0004)",
+  "scenario": {
+    "description": "Same E2E-CONV-01-shaped scenario as R0001-R0004.",
+    "seedText": "the quick brown fox!",
+    "markerScheme": "one fixed single-character marker per array slot: index0(chromium)=A, index1(firefox)=B, index2(webkit)=C — NOTE: server-assigned replica id is NOT guaranteed to correlate with array index; replica ids are allocated first-come-first-served by actual WebSocket connect order, which can differ from browser launch order. Only the array-index/browser-identity correlation is directly verified in this entry (via page.evaluate on a specific `pages[i]`), not the replica-id correlation.",
+    "typingIntervalMs": 200,
+    "delayMsEachDirection": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 1,
+    "iterationsInRun": 8,
+    "iterationsResult": "iter0 OK, iter1 THIS FAILURE, iter2 OK, iter3 OK, iter4 OK, iter5 OK, iter6 CRASH (see R0006), iter7 OK (6/8 passed)"
+  },
+  "failureType": "engine-canary-crash",
+  "exactError": "Error: integrate(): Case C reached with candidate 215:3 whose destination would have moved past 215:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+  "nodeCountsAtFailure": {
+    "client0_chromium": 776,
+    "client1_firefox": 872,
+    "client2_webkit": 776,
+    "serverReplay": 776
+  },
+  "structuralDiff": {
+    "serverVsClient0": "identical node arrays (0 differences)",
+    "serverVsClient2": "identical node arrays (0 differences)",
+    "serverVsClient1_firstDiffIndex": 7,
+    "serverVsClient1_diffDetail": {
+      "serverNodeAtIndex7": { "id": { "c": 306, "r": 2 }, "originLeft": { "c": 298, "r": 1 }, "originRight": { "c": 268, "r": 1 }, "bind": false, "deleted": false, "deletedBy": null, "value": 65 },
+      "firefoxNodeAtIndex7": { "id": { "c": 308, "r": 3 }, "originLeft": { "c": 298, "r": 1 }, "originRight": { "c": 306, "r": 2 }, "bind": false, "deleted": false, "deletedBy": null, "value": 66 },
+      "serverContextAroundIndex7": ["298:1", "310:1", "306:2", "268:1", "311:2"],
+      "firefoxContextAroundIndex7": ["298:1", "310:1", "308:3", "306:2", "304:3"]
+    }
+  },
+  "keyObservation": "Client 1 (firefox) is the ONLY one of the three real browser clients whose local engine state disagrees with the other two AND with the server's own independently-replayed ground truth — and it disagrees by having roughly 96 MORE nodes, not different content at the same length. This is consistent with firefox's own operations failing to be fully ingested/relayed by the server (the server crashed mid-ingestion of some batch and, per gateway.ts's ingestOperation, an operation that throws is never pushed to operationLog and its containing frame is never relayed to peers) while firefox's own local engine keeps applying its own edits optimistically regardless of what the server does with them. NOT yet established whether this is specific to Firefox's browser engine/timing characteristics or simply happens to be array-slot-index 1 in this harness for an unrelated reason (e.g. a scheduling artifact of Promise.all across heterogeneous browser startup times) — see R0006 (identical slot, identical browser, same pattern) and the recommended next step below.",
+  "recommendedNextStep": "Re-run with browser-to-slot assignment permuted/shuffled across iterations (not fixed chromium=0/firefox=1/webkit=2 every time) to determine whether the 'ahead of server' client tracks the BROWSER ENGINE (firefox specifically) or the ARRAY SLOT/TIMING POSITION (whichever client happens to launch/connect in a particular relative order). This is the most direct way to narrow the hypothesis space before reading engine/server code further.",
+  "reproducibilityCaveat": "Same Rule 3 deviation as R0001-R0004: the raw wire-level operationLog was not persisted to disk before server teardown (only derived node structure was captured, via a fresh in-memory Engine replay at the moment of failure, then serialized to this fixture). This IS a meaningfully stronger record than R0001-R0004 (full node-level ground truth from all 4 parties, not just final text length), but still not a byte-exact reproducer of the original wire trace.",
+  "relatedEntries": ["R0001", "R0002", "R0003", "R0004", "R0006"],
+  "status": "RESOLVED (test-infrastructure, not product) — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. The 'recommendedNextStep' above (slot permutation) WAS carried out — see R0007 and the FINAL RESOLUTION for the outcome: Firefox was NOT confirmed as uniquely implicated (a later native-routeWebSocket run froze WebKit's connection instead, same signature), and the underlying mechanism was ultimately traced to the test harness's delay-injection layer, not the product. Entry retained per Rule 2, not removed."
+}

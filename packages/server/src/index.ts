@@ -31,13 +31,23 @@ export {
   buildWelcomeMessage,
 } from "./handshake.js";
 
+import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
 import { createCollabServer } from "./server.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
-// or `tsx src/index.ts`) — not when imported by tests, which construct their
-// own `createCollabServer()` bound to an ephemeral port.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// or `tsx src/index.ts`, Phase 14's `pnpm --filter @collab-editor/server run
+// dev`) — not when imported by tests, which construct their own
+// `createCollabServer()` bound to an ephemeral port. Compares via
+// `pathToFileURL`, NOT a hand-built `file://${process.argv[1]}` string:
+// `process.argv[1]` is a plain OS path (backslashes and no leading slash on
+// Windows — `C:\Users\...\index.ts`), while `import.meta.url` is always a
+// proper `file:///C:/Users/...` URL. The naive string-concatenation version
+// silently never matched on Windows, so the server never actually started
+// this way — caught only by actually running `pnpm run dev` for Phase 14's
+// milestone demo, not by any prior phase's tests (all of which construct
+// `createCollabServer()` directly and never exercise this branch at all).
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const config = loadConfig();
   const server = createCollabServer();
   void server.listen(config.port);

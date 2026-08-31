@@ -1,0 +1,144 @@
+{"ts":"2026-08-31T11:41:47.718Z","level":"info","message":"server.listening","port":50355}
+{"ts":"2026-08-31T11:42:01.221Z","level":"info","message":"ws.open","sessionId":"a7c59c8a-eda4-4764-8652-039595f8acc1"}
+{"ts":"2026-08-31T11:42:01.349Z","level":"info","message":"ws.connect","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"a7c59c8a-eda4-4764-8652-039595f8acc1","replicaId":1}
+{"ts":"2026-08-31T11:42:01.599Z","level":"info","message":"ws.syncComplete","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"a7c59c8a-eda4-4764-8652-039595f8acc1","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:42:01.633Z","level":"info","message":"ws.open","sessionId":"4b5d4a4e-f9f4-4f58-8e83-c78bd44c2ba1"}
+{"ts":"2026-08-31T11:42:02.006Z","level":"info","message":"ws.connect","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"4b5d4a4e-f9f4-4f58-8e83-c78bd44c2ba1","replicaId":2}
+{"ts":"2026-08-31T11:42:02.378Z","level":"info","message":"ws.syncComplete","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"4b5d4a4e-f9f4-4f58-8e83-c78bd44c2ba1","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:42:03.611Z","level":"info","message":"ws.open","sessionId":"96618bb7-7ed9-490a-8f1b-0244e29e4613"}
+{"ts":"2026-08-31T11:42:03.804Z","level":"info","message":"ws.connect","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"96618bb7-7ed9-490a-8f1b-0244e29e4613","replicaId":3}
+{"ts":"2026-08-31T11:42:04.096Z","level":"info","message":"ws.syncComplete","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"96618bb7-7ed9-490a-8f1b-0244e29e4613","lastServerSeq":0,"resentCount":0}
+[NODEDUMP] iter 0: OK len=[865,865,865] pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:43:07.843Z","level":"info","message":"ws.disconnect","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"a7c59c8a-eda4-4764-8652-039595f8acc1","code":1001}
+{"ts":"2026-08-31T11:43:07.855Z","level":"info","message":"ws.disconnect","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"4b5d4a4e-f9f4-4f58-8e83-c78bd44c2ba1","code":1001}
+{"ts":"2026-08-31T11:43:07.909Z","level":"info","message":"ws.disconnect","documentId":"76972efb-22b0-4b2f-8580-5dc646e42d51","sessionId":"96618bb7-7ed9-490a-8f1b-0244e29e4613","code":1001}
+{"ts":"2026-08-31T11:43:09.056Z","level":"info","message":"server.listening","port":64956}
+{"ts":"2026-08-31T11:43:15.976Z","level":"info","message":"ws.open","sessionId":"2a0ca8e6-4b7c-437e-a27d-07032fcc90f3"}
+{"ts":"2026-08-31T11:43:16.008Z","level":"info","message":"ws.open","sessionId":"b5b3b3ce-9d1b-4b65-84f4-5eebc5f2b353"}
+{"ts":"2026-08-31T11:43:16.100Z","level":"info","message":"ws.connect","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"2a0ca8e6-4b7c-437e-a27d-07032fcc90f3","replicaId":1}
+{"ts":"2026-08-31T11:43:16.104Z","level":"info","message":"ws.connect","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"b5b3b3ce-9d1b-4b65-84f4-5eebc5f2b353","replicaId":2}
+{"ts":"2026-08-31T11:43:16.293Z","level":"info","message":"ws.syncComplete","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"b5b3b3ce-9d1b-4b65-84f4-5eebc5f2b353","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:43:16.319Z","level":"info","message":"ws.syncComplete","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"2a0ca8e6-4b7c-437e-a27d-07032fcc90f3","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:43:17.132Z","level":"info","message":"ws.open","sessionId":"150009ac-3e83-4738-93e5-bfd4008c1f5e"}
+{"ts":"2026-08-31T11:43:17.238Z","level":"info","message":"ws.connect","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"150009ac-3e83-4738-93e5-bfd4008c1f5e","replicaId":3}
+{"ts":"2026-08-31T11:43:17.496Z","level":"info","message":"ws.syncComplete","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"150009ac-3e83-4738-93e5-bfd4008c1f5e","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:44:04.529Z","level":"warn","message":"presence.stale","sessionId":"150009ac-3e83-4738-93e5-bfd4008c1f5e","replicaId":3,"thresholdMs":8000}
+[NODEDUMP] iter 1: SERVER-CRASH: Error: integrate(): Case C reached with candidate 215:3 whose destination would have moved past 215:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=[776,872,776] pending=[0,0,0] replayOk=true 
+
+=== FAILURE DETAIL, iter 1 (doc fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6, port 64956) ===
+  client 0 (chromium): 776 nodes
+  client 1 (firefox): 872 nodes
+  client 2 (webkit): 776 nodes
+  server replay: 776 nodes
+  [server vs client0(chromium)] no structural diff found (identical node arrays)
+  [server vs client1(firefox)] first structural diff at index 7:
+    a: {"id":{"c":306,"r":2},"originLeft":{"c":298,"r":1},"originRight":{"c":268,"r":1},"bind":false,"deleted":false,"deletedBy":null,"value":65}
+    b: {"id":{"c":308,"r":3},"originLeft":{"c":298,"r":1},"originRight":{"c":306,"r":2},"bind":false,"deleted":false,"deletedBy":null,"value":66}
+    context (a): [ '298:1', '310:1', '306:2', '268:1', '311:2' ]
+    context (b): [ '298:1', '310:1', '308:3', '306:2', '304:3' ]
+  [server vs client2(webkit)] no structural diff found (identical node arrays)
+=== END FAILURE DETAIL ===
+
+{"ts":"2026-08-31T11:44:22.517Z","level":"info","message":"ws.disconnect","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"b5b3b3ce-9d1b-4b65-84f4-5eebc5f2b353","code":1001}
+{"ts":"2026-08-31T11:44:22.621Z","level":"info","message":"ws.disconnect","documentId":"fa8f5d1f-d1e8-4ef0-b77f-edd1076cbea6","sessionId":"2a0ca8e6-4b7c-437e-a27d-07032fcc90f3","code":1006}
+{"ts":"2026-08-31T11:44:23.537Z","level":"info","message":"server.listening","port":56127}
+{"ts":"2026-08-31T11:44:31.039Z","level":"info","message":"ws.open","sessionId":"61fed857-4263-42fc-b884-8dbc814abbe9"}
+{"ts":"2026-08-31T11:44:31.047Z","level":"info","message":"ws.open","sessionId":"37ee869c-9569-4005-ae40-da762b28a310"}
+{"ts":"2026-08-31T11:44:31.150Z","level":"info","message":"ws.connect","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"61fed857-4263-42fc-b884-8dbc814abbe9","replicaId":1}
+{"ts":"2026-08-31T11:44:31.202Z","level":"info","message":"ws.connect","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"37ee869c-9569-4005-ae40-da762b28a310","replicaId":2}
+{"ts":"2026-08-31T11:44:31.347Z","level":"info","message":"ws.syncComplete","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"61fed857-4263-42fc-b884-8dbc814abbe9","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:44:31.421Z","level":"info","message":"ws.syncComplete","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"37ee869c-9569-4005-ae40-da762b28a310","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:44:33.090Z","level":"info","message":"ws.open","sessionId":"866709d8-57d8-4a0c-9f0d-679fa139e206"}
+{"ts":"2026-08-31T11:44:33.301Z","level":"info","message":"ws.connect","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"866709d8-57d8-4a0c-9f0d-679fa139e206","replicaId":3}
+{"ts":"2026-08-31T11:44:33.513Z","level":"info","message":"ws.syncComplete","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"866709d8-57d8-4a0c-9f0d-679fa139e206","lastServerSeq":0,"resentCount":0}
+[NODEDUMP] iter 2: OK len=[892,892,892] pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:45:36.967Z","level":"info","message":"ws.disconnect","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"61fed857-4263-42fc-b884-8dbc814abbe9","code":1001}
+{"ts":"2026-08-31T11:45:37.003Z","level":"info","message":"ws.disconnect","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"37ee869c-9569-4005-ae40-da762b28a310","code":1001}
+{"ts":"2026-08-31T11:45:37.045Z","level":"info","message":"ws.disconnect","documentId":"15066edd-f013-4121-ae0b-724dc1069806","sessionId":"866709d8-57d8-4a0c-9f0d-679fa139e206","code":1001}
+{"ts":"2026-08-31T11:45:37.503Z","level":"info","message":"server.listening","port":53149}
+{"ts":"2026-08-31T11:45:40.849Z","level":"info","message":"ws.open","sessionId":"f513f97f-1861-48b7-96fe-ec86346c67b7"}
+{"ts":"2026-08-31T11:45:40.850Z","level":"info","message":"ws.open","sessionId":"8d8e1ae0-999e-47af-bf31-635cf0fcef4f"}
+{"ts":"2026-08-31T11:45:40.943Z","level":"info","message":"ws.connect","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"8d8e1ae0-999e-47af-bf31-635cf0fcef4f","replicaId":1}
+{"ts":"2026-08-31T11:45:40.971Z","level":"info","message":"ws.connect","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"f513f97f-1861-48b7-96fe-ec86346c67b7","replicaId":2}
+{"ts":"2026-08-31T11:45:41.132Z","level":"info","message":"ws.syncComplete","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"8d8e1ae0-999e-47af-bf31-635cf0fcef4f","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:45:41.192Z","level":"info","message":"ws.syncComplete","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"f513f97f-1861-48b7-96fe-ec86346c67b7","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:45:41.537Z","level":"info","message":"ws.open","sessionId":"b8049e41-e57e-47f6-90bb-c4ea225c168c"}
+{"ts":"2026-08-31T11:45:41.638Z","level":"info","message":"ws.connect","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"b8049e41-e57e-47f6-90bb-c4ea225c168c","replicaId":3}
+{"ts":"2026-08-31T11:45:41.884Z","level":"info","message":"ws.syncComplete","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"b8049e41-e57e-47f6-90bb-c4ea225c168c","lastServerSeq":0,"resentCount":0}
+[NODEDUMP] iter 3: OK len=[816,816,816] pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:46:45.399Z","level":"info","message":"ws.disconnect","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"8d8e1ae0-999e-47af-bf31-635cf0fcef4f","code":1001}
+{"ts":"2026-08-31T11:46:45.420Z","level":"info","message":"ws.disconnect","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"f513f97f-1861-48b7-96fe-ec86346c67b7","code":1001}
+{"ts":"2026-08-31T11:46:45.504Z","level":"info","message":"ws.disconnect","documentId":"39f8c59b-5480-46d1-9dcd-1fbb51391367","sessionId":"b8049e41-e57e-47f6-90bb-c4ea225c168c","code":1001}
+{"ts":"2026-08-31T11:46:46.135Z","level":"info","message":"server.listening","port":62154}
+{"ts":"2026-08-31T11:46:51.713Z","level":"info","message":"ws.open","sessionId":"43d46faa-5e4c-4fef-b668-b9c047481f75"}
+{"ts":"2026-08-31T11:46:51.732Z","level":"info","message":"ws.open","sessionId":"4ba9382b-9747-47ef-9653-7a4a802c4a05"}
+{"ts":"2026-08-31T11:46:51.823Z","level":"info","message":"ws.connect","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"4ba9382b-9747-47ef-9653-7a4a802c4a05","replicaId":1}
+{"ts":"2026-08-31T11:46:51.835Z","level":"info","message":"ws.connect","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"43d46faa-5e4c-4fef-b668-b9c047481f75","replicaId":2}
+{"ts":"2026-08-31T11:46:52.003Z","level":"info","message":"ws.syncComplete","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"4ba9382b-9747-47ef-9653-7a4a802c4a05","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:46:52.023Z","level":"info","message":"ws.syncComplete","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"43d46faa-5e4c-4fef-b668-b9c047481f75","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:46:52.827Z","level":"info","message":"ws.open","sessionId":"b92bf472-07ae-4185-acd4-c9263994b427"}
+{"ts":"2026-08-31T11:46:52.962Z","level":"info","message":"ws.connect","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"b92bf472-07ae-4185-acd4-c9263994b427","replicaId":3}
+{"ts":"2026-08-31T11:46:53.332Z","level":"info","message":"ws.syncComplete","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"b92bf472-07ae-4185-acd4-c9263994b427","lastServerSeq":0,"resentCount":0}
+[NODEDUMP] iter 4: OK len=[861,861,861] pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:47:56.842Z","level":"info","message":"ws.disconnect","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"4ba9382b-9747-47ef-9653-7a4a802c4a05","code":1001}
+{"ts":"2026-08-31T11:47:56.866Z","level":"info","message":"ws.disconnect","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"43d46faa-5e4c-4fef-b668-b9c047481f75","code":1006}
+{"ts":"2026-08-31T11:47:56.880Z","level":"info","message":"ws.disconnect","documentId":"60d02ae4-dcb8-406f-bb94-77a30688cd25","sessionId":"b92bf472-07ae-4185-acd4-c9263994b427","code":1001}
+{"ts":"2026-08-31T11:47:57.322Z","level":"info","message":"server.listening","port":58492}
+{"ts":"2026-08-31T11:48:00.239Z","level":"info","message":"ws.open","sessionId":"304fa013-b2b7-4298-b2ca-b2a11240ac6c"}
+{"ts":"2026-08-31T11:48:00.325Z","level":"info","message":"ws.connect","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"304fa013-b2b7-4298-b2ca-b2a11240ac6c","replicaId":1}
+{"ts":"2026-08-31T11:48:00.351Z","level":"info","message":"ws.open","sessionId":"bf8ac3c4-8b90-4595-bd69-ac5854bc4081"}
+{"ts":"2026-08-31T11:48:00.511Z","level":"info","message":"ws.syncComplete","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"304fa013-b2b7-4298-b2ca-b2a11240ac6c","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:48:00.540Z","level":"info","message":"ws.connect","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"bf8ac3c4-8b90-4595-bd69-ac5854bc4081","replicaId":2}
+{"ts":"2026-08-31T11:48:00.759Z","level":"info","message":"ws.syncComplete","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"bf8ac3c4-8b90-4595-bd69-ac5854bc4081","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:48:01.136Z","level":"info","message":"ws.open","sessionId":"d6788602-6a1b-4641-b311-f364a6ee234f"}
+{"ts":"2026-08-31T11:48:01.240Z","level":"info","message":"ws.connect","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"d6788602-6a1b-4641-b311-f364a6ee234f","replicaId":3}
+{"ts":"2026-08-31T11:48:01.456Z","level":"info","message":"ws.syncComplete","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"d6788602-6a1b-4641-b311-f364a6ee234f","lastServerSeq":0,"resentCount":0}
+[NODEDUMP] iter 5: OK len=[893,893,893] pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:49:04.798Z","level":"info","message":"ws.disconnect","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"304fa013-b2b7-4298-b2ca-b2a11240ac6c","code":1001}
+{"ts":"2026-08-31T11:49:04.818Z","level":"info","message":"ws.disconnect","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"bf8ac3c4-8b90-4595-bd69-ac5854bc4081","code":1001}
+{"ts":"2026-08-31T11:49:04.865Z","level":"info","message":"ws.disconnect","documentId":"6b76d056-2631-4422-8aa9-6ab24d8d2e73","sessionId":"d6788602-6a1b-4641-b311-f364a6ee234f","code":1001}
+{"ts":"2026-08-31T11:49:05.269Z","level":"info","message":"server.listening","port":50215}
+{"ts":"2026-08-31T11:49:08.074Z","level":"info","message":"ws.open","sessionId":"75c88f2e-501e-4f18-bd45-1b97381f5a5d"}
+{"ts":"2026-08-31T11:49:08.081Z","level":"info","message":"ws.open","sessionId":"9b2802b1-1878-4740-aa0b-357a905fe96b"}
+{"ts":"2026-08-31T11:49:08.160Z","level":"info","message":"ws.connect","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"75c88f2e-501e-4f18-bd45-1b97381f5a5d","replicaId":1}
+{"ts":"2026-08-31T11:49:08.173Z","level":"info","message":"ws.connect","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"9b2802b1-1878-4740-aa0b-357a905fe96b","replicaId":2}
+{"ts":"2026-08-31T11:49:08.348Z","level":"info","message":"ws.syncComplete","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"75c88f2e-501e-4f18-bd45-1b97381f5a5d","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:49:08.361Z","level":"info","message":"ws.syncComplete","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"9b2802b1-1878-4740-aa0b-357a905fe96b","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:49:08.677Z","level":"info","message":"ws.open","sessionId":"7b6ff870-22da-4fe5-a253-c13ad133b918"}
+{"ts":"2026-08-31T11:49:08.774Z","level":"info","message":"ws.connect","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"7b6ff870-22da-4fe5-a253-c13ad133b918","replicaId":3}
+{"ts":"2026-08-31T11:49:09.022Z","level":"info","message":"ws.syncComplete","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"7b6ff870-22da-4fe5-a253-c13ad133b918","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:49:23.025Z","level":"warn","message":"presence.stale","sessionId":"7b6ff870-22da-4fe5-a253-c13ad133b918","replicaId":3,"thresholdMs":8000}
+[NODEDUMP] iter 6: SERVER-CRASH: Error: integrate(): Case C reached with candidate 56:3 whose destination would have moved past 55:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=[637,895,637] pending=[0,0,0] replayOk=true 
+
+=== FAILURE DETAIL, iter 6 (doc d35641fa-d9cf-422b-a92d-1bdd9b677d56, port 50215) ===
+  client 0 (chromium): 637 nodes
+  client 1 (firefox): 895 nodes
+  client 2 (webkit): 637 nodes
+  server replay: 637 nodes
+  [server vs client0(chromium)] no structural diff found (identical node arrays)
+  [server vs client1(firefox)] first structural diff at index 1:
+    a: {"id":{"c":295,"r":2},"originLeft":null,"originRight":{"c":290,"r":2},"bind":false,"deleted":false,"deletedBy":null,"value":67}
+    b: {"id":{"c":314,"r":3},"originLeft":null,"originRight":{"c":295,"r":2},"bind":false,"deleted":false,"deletedBy":null,"value":66}
+    context (a): [ '314:2', '295:2', '299:2', '309:1' ]
+    context (b): [ '314:2', '314:3', '295:2', '308:3' ]
+  [server vs client2(webkit)] no structural diff found (identical node arrays)
+=== END FAILURE DETAIL ===
+
+{"ts":"2026-08-31T11:50:12.703Z","level":"info","message":"ws.disconnect","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"75c88f2e-501e-4f18-bd45-1b97381f5a5d","code":1001}
+{"ts":"2026-08-31T11:50:12.732Z","level":"info","message":"ws.disconnect","documentId":"d35641fa-d9cf-422b-a92d-1bdd9b677d56","sessionId":"9b2802b1-1878-4740-aa0b-357a905fe96b","code":1001}
+{"ts":"2026-08-31T11:50:13.283Z","level":"info","message":"server.listening","port":57502}
+{"ts":"2026-08-31T11:50:16.229Z","level":"info","message":"ws.open","sessionId":"927460f3-15c1-4875-9c40-d0a02b2ddf23"}
+{"ts":"2026-08-31T11:50:16.247Z","level":"info","message":"ws.open","sessionId":"3ae7d63c-5fa6-4f2f-a049-1562e815eec1"}
+{"ts":"2026-08-31T11:50:16.312Z","level":"info","message":"ws.connect","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"927460f3-15c1-4875-9c40-d0a02b2ddf23","replicaId":1}
+{"ts":"2026-08-31T11:50:16.372Z","level":"info","message":"ws.connect","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"3ae7d63c-5fa6-4f2f-a049-1562e815eec1","replicaId":2}
+{"ts":"2026-08-31T11:50:16.498Z","level":"info","message":"ws.syncComplete","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"927460f3-15c1-4875-9c40-d0a02b2ddf23","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:50:16.590Z","level":"info","message":"ws.syncComplete","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"3ae7d63c-5fa6-4f2f-a049-1562e815eec1","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:50:16.780Z","level":"info","message":"ws.open","sessionId":"bb6fafe1-aa49-4d4e-af4f-e2b2912b7b73"}
+{"ts":"2026-08-31T11:50:16.888Z","level":"info","message":"ws.connect","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"bb6fafe1-aa49-4d4e-af4f-e2b2912b7b73","replicaId":3}
+{"ts":"2026-08-31T11:50:17.110Z","level":"info","message":"ws.syncComplete","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"bb6fafe1-aa49-4d4e-af4f-e2b2912b7b73","lastServerSeq":0,"resentCount":0}
+[NODEDUMP] iter 7: OK len=[893,893,893] pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:51:20.532Z","level":"info","message":"ws.disconnect","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"927460f3-15c1-4875-9c40-d0a02b2ddf23","code":1001}
+{"ts":"2026-08-31T11:51:20.562Z","level":"info","message":"ws.disconnect","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"3ae7d63c-5fa6-4f2f-a049-1562e815eec1","code":1006}
+{"ts":"2026-08-31T11:51:20.589Z","level":"info","message":"ws.disconnect","documentId":"cef5794f-f572-4c73-855a-ca01ed91b715","sessionId":"bb6fafe1-aa49-4d4e-af4f-e2b2912b7b73","code":1001}
+
+6/8 passed at duration=60000ms (NODEDUMP diagnostic run)

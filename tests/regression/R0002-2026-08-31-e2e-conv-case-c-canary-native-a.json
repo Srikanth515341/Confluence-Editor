@@ -1,0 +1,46 @@
+{
+  "id": "R0002",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "Engine's Case C canary fired again, this time under Playwright's NATIVE context.routeWebSocket()/connectToServer() latency injection — zero custom relay code involved at all — confirming the defect is in the real product, not in delayRelay.ts (see R0001).",
+  "harness": "packages/client/_debugNativeRelay60s.mjs, using Playwright's native context.routeWebSocket() + WebSocketRoute.connectToServer() (no delayRelay.ts, no separate relay process; a minimal in-script FIFO delay queue only delays already-real message routing that Playwright itself owns)",
+  "scenario": {
+    "description": "Same E2E-CONV-01-shaped scenario as R0001: 3 real browsers (chromium, firefox, webkit), each its own browser context with native WS-route latency injection, one real @collab-editor/server instance, 60s of continuous typing into a shared growing hot region.",
+    "seedText": "the quick brown fox!",
+    "markerScheme": "one fixed single-character marker per client: chromium=A, firefox=B, webkit=C",
+    "typingIntervalMs": 200,
+    "delayMsEachDirection": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 2,
+    "iterationsInRun": 5,
+    "iterationsResult": "iter0 MISMATCH (see R0004), iter1 OK, iter2 THIS FAILURE, iter3 CRASH (see R0003), iter4 OK (2/5 passed)"
+  },
+  "failureType": "engine-canary-crash",
+  "exactError": "Error: integrate(): Case C reached with candidate 293:3 whose destination would have moved past 290:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+  "postFailureState": {
+    "domLenClient0": 777,
+    "pendingCounts": [0, 0, 0],
+    "replayOk": true,
+    "note": "Computed after the crash, against post-crash state — see R0001's identical caveat."
+  },
+  "consoleLogExcerpt": [
+    "{\"ts\":\"2026-08-31T11:34:23.254Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"e5cbb2bb-de77-4608-a375-2fe57f616b1f\"}",
+    "{\"ts\":\"2026-08-31T11:34:23.272Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"5326433f-ae5d-444b-ab01-72ee76315b29\"}",
+    "{\"ts\":\"2026-08-31T11:34:23.372Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"5326433f-ae5d-444b-ab01-72ee76315b29\",\"replicaId\":1}",
+    "{\"ts\":\"2026-08-31T11:34:23.377Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"e5cbb2bb-de77-4608-a375-2fe57f616b1f\",\"replicaId\":2}",
+    "{\"ts\":\"2026-08-31T11:34:23.569Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"5326433f-ae5d-444b-ab01-72ee76315b29\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:34:23.593Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"e5cbb2bb-de77-4608-a375-2fe57f616b1f\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:34:24.427Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"eb228a50-772d-4edf-bdc0-25dbd5915b60\"}",
+    "{\"ts\":\"2026-08-31T11:34:24.566Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"eb228a50-772d-4edf-bdc0-25dbd5915b60\",\"replicaId\":3}",
+    "{\"ts\":\"2026-08-31T11:34:24.798Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"eb228a50-772d-4edf-bdc0-25dbd5915b60\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "[NATIVE routeWebSocket ~150ms] iter 2 duration=60000ms: SERVER-CRASH: Error: integrate(): Case C reached with candidate 293:3 whose destination would have moved past 290:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=777 pending=[0,0,0] replayOk=true",
+    "{\"ts\":\"2026-08-31T11:35:28.715Z\",\"level\":\"info\",\"message\":\"ws.disconnect\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"e5cbb2bb-de77-4608-a375-2fe57f616b1f\",\"code\":1001}",
+    "{\"ts\":\"2026-08-31T11:35:28.760Z\",\"level\":\"info\",\"message\":\"ws.disconnect\",\"documentId\":\"22a50a50-ee25-438b-8212-b6aa594c13d2\",\"sessionId\":\"5326433f-ae5d-444b-ab01-72ee76315b29\",\"code\":1001}",
+    "{\"ts\":\"2026-08-31T11:35:30.121Z\",\"level\":\"warn\",\"message\":\"presence.stale\",\"sessionId\":\"eb228a50-772d-4edf-bdc0-25dbd5915b60\",\"replicaId\":3,\"thresholdMs\":8000}"
+  ],
+  "notableTimingDetail": "Unlike R0001, no reconnect (no 4th replicaId allocated) occurred before this crash — sessions 1/2/3 stayed connected throughout. This is a meaningful data point for root-causing: it shows the canary can fire WITHOUT a mid-session reconnect having happened first, which narrows the hypothesis space away from 'only the reconnect/re-seed path is buggy' and back toward something in real concurrent-delivery timing under latency more generally (see also R0004, also no-reconnect-required for its divergence... verify against R0004's log before treating this as settled).",
+  "reproducibilityCaveat": "Same Rule 3 deviation as R0001: raw operationLog for this occurrence was not persisted before teardown. Record is full-fidelity for provenance/pattern-matching, not a byte-exact reproducer.",
+  "relatedEntries": ["R0001", "R0003", "R0004"],
+  "status": "RESOLVED (test-infrastructure, not product) — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. Confirmed as a defect in the test harness's delay-injection layer (reproduced under both delayRelay.ts and Playwright's native routeWebSocket, never under a direct no-injection connection across 13 direct runs), not in SyncClient/gateway.ts/Engine. Entry retained per Rule 2, not removed."
+}

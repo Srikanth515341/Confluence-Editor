@@ -1,0 +1,87 @@
+{"ts":"2026-08-31T12:03:19.881Z","level":"info","message":"server.listening","port":64137}
+{"ts":"2026-08-31T12:03:26.434Z","level":"info","message":"ws.open","sessionId":"476ddace-23cb-462d-b8af-ed7a6e98cf73"}
+{"ts":"2026-08-31T12:03:26.504Z","level":"info","message":"ws.connect","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"476ddace-23cb-462d-b8af-ed7a6e98cf73","replicaId":1}
+{"ts":"2026-08-31T12:03:26.550Z","level":"info","message":"ws.open","sessionId":"c8ff537b-0896-46db-959c-7cef7d0d7949"}
+{"ts":"2026-08-31T12:03:26.654Z","level":"info","message":"ws.connect","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"c8ff537b-0896-46db-959c-7cef7d0d7949","replicaId":2}
+{"ts":"2026-08-31T12:03:26.689Z","level":"info","message":"ws.syncComplete","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"476ddace-23cb-462d-b8af-ed7a6e98cf73","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:03:26.842Z","level":"info","message":"ws.syncComplete","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"c8ff537b-0896-46db-959c-7cef7d0d7949","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:03:27.006Z","level":"info","message":"ws.open","sessionId":"6979cd02-206a-403c-b347-a81a330845ed"}
+{"ts":"2026-08-31T12:03:27.153Z","level":"info","message":"ws.connect","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"6979cd02-206a-403c-b347-a81a330845ed","replicaId":3}
+{"ts":"2026-08-31T12:03:27.372Z","level":"info","message":"ws.syncComplete","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"6979cd02-206a-403c-b347-a81a330845ed","lastServerSeq":0,"resentCount":0}
+[RELAY-NODEDUMP] iter 0 order=["chromium","firefox","webkit"]: OK domLen=[895,895,895] nodeCounts=[895,895,895] serverNodeCount=895 pending=[0,0,0] 
+{"ts":"2026-08-31T12:04:30.827Z","level":"info","message":"ws.disconnect","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"476ddace-23cb-462d-b8af-ed7a6e98cf73","code":1005}
+{"ts":"2026-08-31T12:04:30.838Z","level":"info","message":"ws.disconnect","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"c8ff537b-0896-46db-959c-7cef7d0d7949","code":1005}
+{"ts":"2026-08-31T12:04:30.867Z","level":"info","message":"ws.disconnect","documentId":"b84c8dc9-517f-44c4-9dab-c920460c09c4","sessionId":"6979cd02-206a-403c-b347-a81a330845ed","code":1005}
+{"ts":"2026-08-31T12:04:31.268Z","level":"info","message":"server.listening","port":60645}
+{"ts":"2026-08-31T12:04:33.987Z","level":"info","message":"ws.open","sessionId":"5fd0926b-2a64-4926-aa28-42da481a0c23"}
+{"ts":"2026-08-31T12:04:33.998Z","level":"info","message":"ws.open","sessionId":"2a062547-4476-4825-8aa5-8b724812e5d7"}
+{"ts":"2026-08-31T12:04:34.092Z","level":"info","message":"ws.connect","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"5fd0926b-2a64-4926-aa28-42da481a0c23","replicaId":1}
+{"ts":"2026-08-31T12:04:34.093Z","level":"info","message":"ws.connect","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"2a062547-4476-4825-8aa5-8b724812e5d7","replicaId":2}
+{"ts":"2026-08-31T12:04:34.277Z","level":"info","message":"ws.syncComplete","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"2a062547-4476-4825-8aa5-8b724812e5d7","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:04:34.293Z","level":"info","message":"ws.syncComplete","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"5fd0926b-2a64-4926-aa28-42da481a0c23","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:04:34.487Z","level":"info","message":"ws.open","sessionId":"9f12cff5-ca01-4516-afff-2eed7e70679b"}
+{"ts":"2026-08-31T12:04:34.623Z","level":"info","message":"ws.connect","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"9f12cff5-ca01-4516-afff-2eed7e70679b","replicaId":3}
+{"ts":"2026-08-31T12:04:34.786Z","level":"info","message":"ws.syncComplete","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"9f12cff5-ca01-4516-afff-2eed7e70679b","lastServerSeq":0,"resentCount":0}
+[RELAY-NODEDUMP] iter 1 order=["firefox","webkit","chromium"]: OK domLen=[894,894,894] nodeCounts=[894,894,894] serverNodeCount=894 pending=[0,0,0] 
+{"ts":"2026-08-31T12:05:38.220Z","level":"info","message":"ws.disconnect","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"2a062547-4476-4825-8aa5-8b724812e5d7","code":1005}
+{"ts":"2026-08-31T12:05:38.239Z","level":"info","message":"ws.disconnect","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"5fd0926b-2a64-4926-aa28-42da481a0c23","code":1005}
+{"ts":"2026-08-31T12:05:38.272Z","level":"info","message":"ws.disconnect","documentId":"7158677b-d65d-465f-9d2e-a89592fb8761","sessionId":"9f12cff5-ca01-4516-afff-2eed7e70679b","code":1005}
+{"ts":"2026-08-31T12:05:38.675Z","level":"info","message":"server.listening","port":49249}
+{"ts":"2026-08-31T12:05:41.522Z","level":"info","message":"ws.open","sessionId":"085d1378-288f-4691-a0c6-220120c48b05"}
+{"ts":"2026-08-31T12:05:41.525Z","level":"info","message":"ws.open","sessionId":"157fbaf1-9426-4d92-b5b5-5a60265a8c3c"}
+{"ts":"2026-08-31T12:05:41.608Z","level":"info","message":"ws.connect","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"157fbaf1-9426-4d92-b5b5-5a60265a8c3c","replicaId":1}
+{"ts":"2026-08-31T12:05:41.623Z","level":"info","message":"ws.connect","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"085d1378-288f-4691-a0c6-220120c48b05","replicaId":2}
+{"ts":"2026-08-31T12:05:41.776Z","level":"info","message":"ws.syncComplete","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"157fbaf1-9426-4d92-b5b5-5a60265a8c3c","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:05:41.808Z","level":"info","message":"ws.syncComplete","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"085d1378-288f-4691-a0c6-220120c48b05","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:05:41.996Z","level":"info","message":"ws.open","sessionId":"b31d416d-8018-42f7-9360-e5ee46b4d905"}
+{"ts":"2026-08-31T12:05:42.121Z","level":"info","message":"ws.connect","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"b31d416d-8018-42f7-9360-e5ee46b4d905","replicaId":3}
+{"ts":"2026-08-31T12:05:42.292Z","level":"info","message":"ws.syncComplete","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"b31d416d-8018-42f7-9360-e5ee46b4d905","lastServerSeq":0,"resentCount":0}
+[RELAY-NODEDUMP] iter 2 order=["webkit","chromium","firefox"]: OK domLen=[895,895,895] nodeCounts=[895,895,895] serverNodeCount=895 pending=[0,0,0] 
+{"ts":"2026-08-31T12:06:45.621Z","level":"info","message":"ws.disconnect","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"157fbaf1-9426-4d92-b5b5-5a60265a8c3c","code":1005}
+{"ts":"2026-08-31T12:06:45.654Z","level":"info","message":"ws.disconnect","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"085d1378-288f-4691-a0c6-220120c48b05","code":1005}
+{"ts":"2026-08-31T12:06:45.677Z","level":"info","message":"ws.disconnect","documentId":"4ccfd416-ae73-4c40-a5d0-1ef50b392447","sessionId":"b31d416d-8018-42f7-9360-e5ee46b4d905","code":1005}
+{"ts":"2026-08-31T12:06:46.068Z","level":"info","message":"server.listening","port":61405}
+{"ts":"2026-08-31T12:06:48.729Z","level":"info","message":"ws.open","sessionId":"22ae2829-a29d-4873-9238-539fb70e56ac"}
+{"ts":"2026-08-31T12:06:48.758Z","level":"info","message":"ws.open","sessionId":"6fe7af76-d5f8-4fac-9834-853426bb9ee2"}
+{"ts":"2026-08-31T12:06:48.835Z","level":"info","message":"ws.connect","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"22ae2829-a29d-4873-9238-539fb70e56ac","replicaId":1}
+{"ts":"2026-08-31T12:06:48.836Z","level":"info","message":"ws.connect","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"6fe7af76-d5f8-4fac-9834-853426bb9ee2","replicaId":2}
+{"ts":"2026-08-31T12:06:49.004Z","level":"info","message":"ws.syncComplete","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"6fe7af76-d5f8-4fac-9834-853426bb9ee2","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:06:49.019Z","level":"info","message":"ws.syncComplete","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"22ae2829-a29d-4873-9238-539fb70e56ac","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:06:49.220Z","level":"info","message":"ws.open","sessionId":"1c80c036-9685-4170-9d42-703369f33eb4"}
+{"ts":"2026-08-31T12:06:49.368Z","level":"info","message":"ws.connect","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"1c80c036-9685-4170-9d42-703369f33eb4","replicaId":3}
+{"ts":"2026-08-31T12:06:49.564Z","level":"info","message":"ws.syncComplete","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"1c80c036-9685-4170-9d42-703369f33eb4","lastServerSeq":0,"resentCount":0}
+[RELAY-NODEDUMP] iter 3 order=["chromium","webkit","firefox"]: OK domLen=[893,893,893] nodeCounts=[893,893,893] serverNodeCount=893 pending=[0,0,0] 
+{"ts":"2026-08-31T12:07:52.779Z","level":"info","message":"ws.disconnect","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"6fe7af76-d5f8-4fac-9834-853426bb9ee2","code":1005}
+{"ts":"2026-08-31T12:07:52.816Z","level":"info","message":"ws.disconnect","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"22ae2829-a29d-4873-9238-539fb70e56ac","code":1005}
+{"ts":"2026-08-31T12:07:52.829Z","level":"info","message":"ws.disconnect","documentId":"8cd11535-f4bc-4896-8183-3ac5818768c0","sessionId":"1c80c036-9685-4170-9d42-703369f33eb4","code":1005}
+{"ts":"2026-08-31T12:07:53.237Z","level":"info","message":"server.listening","port":51552}
+{"ts":"2026-08-31T12:07:55.979Z","level":"info","message":"ws.open","sessionId":"aeb2f966-078c-495a-9e05-fb3560501662"}
+{"ts":"2026-08-31T12:07:55.984Z","level":"info","message":"ws.open","sessionId":"51bf5ab9-ca79-41b9-aeac-0acc35c6fadd"}
+{"ts":"2026-08-31T12:07:56.064Z","level":"info","message":"ws.connect","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"51bf5ab9-ca79-41b9-aeac-0acc35c6fadd","replicaId":1}
+{"ts":"2026-08-31T12:07:56.077Z","level":"info","message":"ws.connect","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"aeb2f966-078c-495a-9e05-fb3560501662","replicaId":2}
+{"ts":"2026-08-31T12:07:56.235Z","level":"info","message":"ws.syncComplete","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"51bf5ab9-ca79-41b9-aeac-0acc35c6fadd","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:07:56.267Z","level":"info","message":"ws.syncComplete","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"aeb2f966-078c-495a-9e05-fb3560501662","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:07:56.467Z","level":"info","message":"ws.open","sessionId":"cb9031a6-75b7-4a19-98b7-28c46e46b757"}
+{"ts":"2026-08-31T12:07:56.580Z","level":"info","message":"ws.connect","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"cb9031a6-75b7-4a19-98b7-28c46e46b757","replicaId":3}
+{"ts":"2026-08-31T12:07:56.753Z","level":"info","message":"ws.syncComplete","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"cb9031a6-75b7-4a19-98b7-28c46e46b757","lastServerSeq":0,"resentCount":0}
+[RELAY-NODEDUMP] iter 4 order=["firefox","chromium","webkit"]: OK domLen=[895,895,895] nodeCounts=[895,895,895] serverNodeCount=895 pending=[0,0,0] 
+{"ts":"2026-08-31T12:09:00.106Z","level":"info","message":"ws.disconnect","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"51bf5ab9-ca79-41b9-aeac-0acc35c6fadd","code":1005}
+{"ts":"2026-08-31T12:09:00.125Z","level":"info","message":"ws.disconnect","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"aeb2f966-078c-495a-9e05-fb3560501662","code":1005}
+{"ts":"2026-08-31T12:09:00.162Z","level":"info","message":"ws.disconnect","documentId":"d86c3678-fd51-457b-9139-700bad8bc615","sessionId":"cb9031a6-75b7-4a19-98b7-28c46e46b757","code":1005}
+{"ts":"2026-08-31T12:09:00.544Z","level":"info","message":"server.listening","port":51101}
+{"ts":"2026-08-31T12:09:03.272Z","level":"info","message":"ws.open","sessionId":"83a0712e-86f9-4f94-91d0-442450113f8a"}
+{"ts":"2026-08-31T12:09:03.280Z","level":"info","message":"ws.open","sessionId":"af436197-f46b-4ded-b75b-61c697075574"}
+{"ts":"2026-08-31T12:09:03.355Z","level":"info","message":"ws.connect","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"83a0712e-86f9-4f94-91d0-442450113f8a","replicaId":1}
+{"ts":"2026-08-31T12:09:03.387Z","level":"info","message":"ws.connect","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"af436197-f46b-4ded-b75b-61c697075574","replicaId":2}
+{"ts":"2026-08-31T12:09:03.525Z","level":"info","message":"ws.syncComplete","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"83a0712e-86f9-4f94-91d0-442450113f8a","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:09:03.573Z","level":"info","message":"ws.syncComplete","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"af436197-f46b-4ded-b75b-61c697075574","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:09:03.684Z","level":"info","message":"ws.open","sessionId":"1c012dda-f3d1-4c53-a62a-213ce1f04da1"}
+{"ts":"2026-08-31T12:09:03.806Z","level":"info","message":"ws.connect","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"1c012dda-f3d1-4c53-a62a-213ce1f04da1","replicaId":3}
+{"ts":"2026-08-31T12:09:04.010Z","level":"info","message":"ws.syncComplete","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"1c012dda-f3d1-4c53-a62a-213ce1f04da1","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T12:09:42.037Z","level":"warn","message":"presence.stale","sessionId":"1c012dda-f3d1-4c53-a62a-213ce1f04da1","replicaId":3,"thresholdMs":8000}
+[RELAY-NODEDUMP] iter 5 order=["webkit","firefox","chromium"]: SERVER-CRASH: Error: integrate(): Case C reached with candidate 181:3 whose destination would have moved past 180:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). domLen=[761,896,761] nodeCounts=[761,896,761] serverNodeCount=761 pending=[0,0,0] 
+  >>> DIVERGED CLIENT: slot 1 = engine "firefox" (896 nodes vs server's 761)
+{"ts":"2026-08-31T12:10:07.375Z","level":"info","message":"ws.disconnect","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"83a0712e-86f9-4f94-91d0-442450113f8a","code":1005}
+{"ts":"2026-08-31T12:10:07.390Z","level":"info","message":"ws.disconnect","documentId":"1a13f49f-329b-449a-84be-72f217179f44","sessionId":"af436197-f46b-4ded-b75b-61c697075574","code":1005}
+
+5/6 passed (RELAY-NODEDUMP diagnostic run)

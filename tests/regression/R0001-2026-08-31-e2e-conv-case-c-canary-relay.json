@@ -1,0 +1,44 @@
+{
+  "id": "R0001",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "Engine's Case C canary (Engine Spec §6.2 sub-case iii-d, Phase 6) fired on the real server, ingesting real operations from 3 real browsers over a hand-rolled ~150ms-RTT delay relay, after all 4 previously-known relay bugs were already fixed. Never fired before in 60,000 fuzz seeds + a 10^6-trial directed search (MUT-KILL-01) except under a deliberately mutated engine or an already-fixed relay bug.",
+  "harness": "packages/client/_debugRelay60s.mjs, using packages/client/e2e/support/delayRelay.ts (hand-rolled in-process WebSocket relay, ~75ms one-way / ~150ms RTT delay, strict per-connection FIFO queues, all 4 documented bugs fixed at time of this run)",
+  "scenario": {
+    "description": "E2E-CONV-01-shaped: 3 real browsers (chromium, firefox, webkit), each its own browser context, connect to one real @collab-editor/server instance (real HTTP+WS, ephemeral port) through the delay relay, and type continuously for 60s into a shared, growing hot region (up to the last 20 characters of the document).",
+    "seedText": "the quick brown fox!",
+    "markerScheme": "one fixed single-character marker per client: chromium=A, firefox=B, webkit=C",
+    "typingIntervalMs": 200,
+    "delayMs": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 2,
+    "iterationsInRun": 5,
+    "iterationsResult": "iter0 OK, iter1 OK, iter2 THIS FAILURE, iter3 OK, iter4 OK (4/5 passed)"
+  },
+  "failureType": "engine-canary-crash",
+  "exactError": "Error: integrate(): Case C reached with candidate 140:3 whose destination would have moved past 139:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+  "postFailureState": {
+    "domLenClient0": 716,
+    "pendingCounts": [0, 0, 0],
+    "replayOk": true,
+    "note": "replayOk/pendingCounts were computed by the harness AFTER the crash, against whatever state existed post-crash — not proof the run was otherwise healthy, since the exception aborted mid-ingestion of one client's frame on the server."
+  },
+  "consoleLogExcerpt": [
+    "{\"ts\":\"2026-08-31T11:17:35.858Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"f00ada16-f04d-4440-8af0-779e4f5ed025\"}",
+    "{\"ts\":\"2026-08-31T11:17:35.978Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"0fd2d119-2501-4e27-be89-8c27b34e8f81\",\"sessionId\":\"f00ada16-f04d-4440-8af0-779e4f5ed025\",\"replicaId\":1}",
+    "{\"ts\":\"2026-08-31T11:17:35.981Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"d2b89413-d1d9-4728-9b19-2593e0f54496\"}",
+    "{\"ts\":\"2026-08-31T11:17:36.081Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"0fd2d119-2501-4e27-be89-8c27b34e8f81\",\"sessionId\":\"d2b89413-d1d9-4728-9b19-2593e0f54496\",\"replicaId\":2}",
+    "{\"ts\":\"2026-08-31T11:17:36.143Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"0fd2d119-2501-4e27-be89-8c27b34e8f81\",\"sessionId\":\"f00ada16-f04d-4440-8af0-779e4f5ed025\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:17:36.268Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"0fd2d119-2501-4e27-be89-8c27b34e8f81\",\"sessionId\":\"d2b89413-d1d9-4728-9b19-2593e0f54496\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:17:36.842Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"e03d8981-46d9-4416-be8c-73f946256212\"}",
+    "{\"ts\":\"2026-08-31T11:17:36.987Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"0fd2d119-2501-4e27-be89-8c27b34e8f81\",\"sessionId\":\"e03d8981-46d9-4416-be8c-73f946256212\",\"replicaId\":3}",
+    "{\"ts\":\"2026-08-31T11:17:37.173Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"0fd2d119-2501-4e27-be89-8c27b34e8f81\",\"sessionId\":\"e03d8981-46d9-4416-be8c-73f946256212\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:18:09.190Z\",\"level\":\"warn\",\"message\":\"presence.stale\",\"sessionId\":\"e03d8981-46d9-4416-be8c-73f946256212\",\"replicaId\":3,\"thresholdMs\":8000}",
+    "[RELAY ~150ms] iter 2 duration=60000ms: SERVER-CRASH: Error: integrate(): Case C reached with candidate 140:3 whose destination would have moved past 139:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=716 pending=[0,0,0] replayOk=true"
+  ],
+  "reproducibilityCaveat": "IMPORTANT — deviates from Test Plan §2.3 Rule 3: the raw wire-level operation stream for this specific occurrence was NOT persisted before the server process for this iteration was torn down. The debug harness only logged connection events and post-hoc final-state summaries, not the operationLog itself. This entry is a full-fidelity RECORD of the failure (exact error, exact node ids involved, exact timing/config) for provenance and pattern-matching, but it is NOT a byte-exact deterministic reproducer: re-running the same script reproduces THIS CLASS of failure at roughly this observed frequency (1/5 in this run), not this exact trial. Root-cause work in progress (packages/client/_debugNodeDump.mjs) now captures full node-level structure from every client plus the server's independent replay on any future occurrence, and is being extended to persist the raw operationLog to disk on failure, specifically so a later entry in this corpus CAN satisfy Rule 3 properly.",
+  "relatedEntries": ["R0002", "R0003", "R0004"],
+  "relatedEntriesNote": "R0002/R0003 reproduce the identical failure TYPE (same Case C canary assertion, different specific node ids) using a structurally independent injection mechanism (Playwright's native routeWebSocket()/connectToServer(), zero shared code with delayRelay.ts) — this is the evidence that the defect is in the real product's sync/reconnect/engine-ingestion path, not in this relay's own ~280 lines of code. R0004 is a third, more serious failure mode (silent cross-client divergence, no assertion fires) found in the same native-injection run as R0002/R0003.",
+  "status": "RESOLVED (test-infrastructure, not product) — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. Send-vs-receive instrumentation showed the client's send() calls and bufferedAmount stayed normal while the server's per-connection receivedFrameCount froze permanently; the identical scenario run 8x with ZERO delay-injection layer (no relay, no routeWebSocket) never reproduced the freeze. Confirmed as a defect in the test harness's delay-injection layer (delayRelay.ts and, independently, Playwright's native routeWebSocket both exhibit it), not in SyncClient/gateway.ts/Engine. Entry retained per Rule 2, not removed."
+}

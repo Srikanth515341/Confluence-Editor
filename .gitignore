@@ -29,3 +29,8 @@ packages/client/e2e/.bundle/
 playwright-report/
 test-results/
 blob-report/
+
+# Phase 14: esbuild output of packages/client/scripts/serveApp.mjs — written
+# next to the committed app/index.html, never itself committed.
+packages/client/app/main.js
+packages/client/app/main.js.map

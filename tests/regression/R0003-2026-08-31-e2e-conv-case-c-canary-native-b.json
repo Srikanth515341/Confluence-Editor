@@ -1,0 +1,45 @@
+{
+  "id": "R0003",
+  "dateFound": "2026-08-31",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-14-m1-integration (Phase 14 / Milestone M1 DoD verification, in progress)",
+  "category": "e2e-conv-real-network",
+  "oneLineDescription": "Second Case C canary firing in the same native-routeWebSocket 5x60s run as R0002, different node ids. Confirms the failure is not a one-off fluke of a single iteration.",
+  "harness": "packages/client/_debugNativeRelay60s.mjs, using Playwright's native context.routeWebSocket() + WebSocketRoute.connectToServer() (identical harness to R0002, same 5-iteration run, iteration 3 of 5)",
+  "scenario": {
+    "description": "Same E2E-CONV-01-shaped scenario as R0001/R0002.",
+    "seedText": "the quick brown fox!",
+    "markerScheme": "one fixed single-character marker per client: chromium=A, firefox=B, webkit=C",
+    "typingIntervalMs": 200,
+    "delayMsEachDirection": 75,
+    "durationMs": 60000,
+    "iterationIndexInRun": 3,
+    "iterationsInRun": 5,
+    "iterationsResult": "iter0 MISMATCH (see R0004), iter1 OK, iter2 CRASH (see R0002), iter3 THIS FAILURE, iter4 OK (2/5 passed)"
+  },
+  "failureType": "engine-canary-crash",
+  "exactError": "Error: integrate(): Case C reached with candidate 179:3 whose destination would have moved past 175:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
+  "postFailureState": {
+    "domLenClient0": 697,
+    "pendingCounts": [0, 0, 0],
+    "replayOk": true,
+    "note": "Computed after the crash, against post-crash state — see R0001's identical caveat."
+  },
+  "consoleLogExcerpt": [
+    "{\"ts\":\"2026-08-31T11:35:30.943Z\",\"level\":\"info\",\"message\":\"server.listening\",\"port\":59369}",
+    "{\"ts\":\"2026-08-31T11:35:42.824Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c\"}",
+    "{\"ts\":\"2026-08-31T11:35:42.931Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"84f124af-735f-4ed3-8773-4c16bdcb0525\",\"sessionId\":\"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c\",\"replicaId\":1}",
+    "{\"ts\":\"2026-08-31T11:35:43.153Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"84f124af-735f-4ed3-8773-4c16bdcb0525\",\"sessionId\":\"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:35:43.367Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45\"}",
+    "{\"ts\":\"2026-08-31T11:35:43.518Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"84f124af-735f-4ed3-8773-4c16bdcb0525\",\"sessionId\":\"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45\",\"replicaId\":2}",
+    "{\"ts\":\"2026-08-31T11:35:43.764Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"84f124af-735f-4ed3-8773-4c16bdcb0525\",\"sessionId\":\"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:35:45.965Z\",\"level\":\"info\",\"message\":\"ws.open\",\"sessionId\":\"0535154b-5f92-48c1-be30-e2c444775a17\"}",
+    "{\"ts\":\"2026-08-31T11:35:46.109Z\",\"level\":\"info\",\"message\":\"ws.connect\",\"documentId\":\"84f124af-735f-4ed3-8773-4c16bdcb0525\",\"sessionId\":\"0535154b-5f92-48c1-be30-e2c444775a17\",\"replicaId\":3}",
+    "{\"ts\":\"2026-08-31T11:35:46.417Z\",\"level\":\"info\",\"message\":\"ws.syncComplete\",\"documentId\":\"84f124af-735f-4ed3-8773-4c16bdcb0525\",\"sessionId\":\"0535154b-5f92-48c1-be30-e2c444775a17\",\"lastServerSeq\":0,\"resentCount\":0}",
+    "{\"ts\":\"2026-08-31T11:36:27.544Z\",\"level\":\"warn\",\"message\":\"presence.stale\",\"sessionId\":\"0535154b-5f92-48c1-be30-e2c444775a17\",\"replicaId\":3,\"thresholdMs\":8000}",
+    "[NATIVE routeWebSocket ~150ms] iter 3 duration=60000ms: SERVER-CRASH: Error: integrate(): Case C reached with candidate 179:3 whose destination would have moved past 175:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=697 pending=[0,0,0] replayOk=true"
+  ],
+  "notableTimingDetail": "Same as R0002: no reconnect (no 4th replicaId allocated) occurred before this crash — all three sessions (replicaId 1/2/3) stayed connected throughout. Combined with R0002, this is important evidence AGAINST the hypothesis (raised while investigating R0001/R0002 in real time) that the defect is specific to the mid-session reconnect/snapshot-reseed path: two of three native-injection failures happened with NO reconnect involved at all. The defect must be reachable via plain sustained concurrent real-latency delivery, not only via reconnect. R0004 (which DID involve a reconnect) may be a related-but-distinct mechanism, or the same one — not yet determined.",
+  "reproducibilityCaveat": "Same Rule 3 deviation as R0001/R0002: raw operationLog for this occurrence was not persisted before teardown. Record is full-fidelity for provenance/pattern-matching, not a byte-exact reproducer.",
+  "relatedEntries": ["R0001", "R0002", "R0004"],
+  "status": "RESOLVED (test-infrastructure, not product) — see tests/regression/README.md's FINAL RESOLUTION section, 2026-08-31. Confirmed as a defect in the test harness's delay-injection layer (reproduced under both delayRelay.ts and Playwright's native routeWebSocket, never under a direct no-injection connection across 13 direct runs), not in SyncClient/gateway.ts/Engine. Entry retained per Rule 2, not removed."
+}

@@ -35,7 +35,7 @@ afterEach(() => {
 /** A `SyncClient` that is never actually connected — `engine` is set directly and `state` is driven manually, the same no-network trick `inputPipeline.test.ts` uses. */
 function makeSyncedClient(initialText = ""): SyncClient {
   const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-  sync.engine = new Engine(1);
+  sync.seedForTesting(new Engine(1));
   if (initialText.length > 0) {
     sync.localInsertText(0, initialText);
   }
@@ -70,14 +70,16 @@ describe("EditorView", () => {
     expect(editable.textContent).toBe("");
 
     act(() => {
-      sync.engine = new Engine(1);
-      sync.localInsertText(0, "later");
-    });
-    // SyncClient has no public "force synced" API (there is no offline edit queue this phase) — the
-    // component only reacts to real state transitions, so drive the same `ObservableValue.set` the
-    // real handshake would call, via its public `Observable<T>` surface cast back to the concrete type.
-    act(() => {
-      (sync.state as unknown as { set(v: "synced"): void }).set("synced");
+      // Populate the engine's content via the low-level `Engine` API (which has no "synced"
+      // concept at all) BEFORE marking the client synced — exactly mirroring a real SNAPSHOT,
+      // which always already contains its content by the time a client learns it's synced.
+      // `seedForTesting` then flips `state` to "synced" in one step, which is what actually fires
+      // EditorView's `state.subscribe` reaction and reads `engine.text()` — already "later" by then.
+      const engine = new Engine(1);
+      for (const ch of "later") {
+        engine.localInsert(engine.text().length, ch.codePointAt(0)!);
+      }
+      sync.seedForTesting(engine);
     });
 
     expect(editable.textContent).toBe("later");

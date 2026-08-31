@@ -12,28 +12,38 @@ production by a log-replay integrity audit.
 
 ## Status
 
-🚧 **Phase 13 — MutationSentinel and DOM reconciliation.**
-`packages/client/src/sentinel/` adds a `MutationObserver`-based guard
-over the editor root: the engine is always authoritative, so ANY DOM
-mutation not made through `DomWriter` — a browser extension, devtools,
-a future bug — is detected and reverted by re-rendering the whole
-subtree from the engine's own text, never by interpreting what the
-foreign write did. The one subtlety this whole mechanism turns on:
-`observer.takeRecords()` must be called SYNCHRONOUSLY, right after each
-of this project's own writes, never guarded by a boolean flag — an
-actual (deliberately temporary) experiment swapping in a flag-based
-guard didn't just mis-fire once per keystroke as expected, it entered
-an infinite reconciliation loop from the very first write and hung the
-browser, confirmed against real Chromium before being reverted. Every
-write `packages/client/src/input/inputPipeline.ts` and
-`EditorView.tsx` make now flows through this same guard. Reconciliation
-and desync counts are real, queryable per-instance metrics, not log
-lines — the only early-warning instrument for a silent DOM/engine
-drift. No cursor transformation under remote edits yet (Phase 32) and
-no IME/composition support (unbuilt, not yet assigned to a phase) —
-typing, pasting, deleting, and now DOM-tamper recovery all work
-end-to-end in a single browser session, verified against real
-Chromium, Firefox, and WebKit.
+🎉 **Milestone M1 (Phase 14) — two clients, plain text, live convergent
+sync.** The product's central promise, proven end to end in real
+browsers for the first time: open the same document in two windows,
+type into the same word at the same time, and both converge to
+identical text with nothing lost and no merge-conflict prompt.
+`pnpm --filter @collab-editor/server run dev` + `pnpm --filter
+@collab-editor/client run dev` now stand up a real, runnable app — see
+[`CLAUDE.md`](./CLAUDE.md)'s "How to run the Milestone M1 demo" section
+for the exact steps.
+
+**Demo GIF**: `docs/media/m1-demo.gif` — two windows, simultaneous typing
+in the same word, converging. Not yet recorded (Srikanth will capture
+this himself after manually verifying the two-window demo, per this
+phase's own end-of-phase instructions); once added, reference it here as
+`![Milestone M1 demo](./docs/media/m1-demo.gif)`. The `docs/media/`
+directory does not exist yet — create it when adding the file.
+
+This milestone surfaced (and fixed) real bugs no earlier phase's tests
+had run long enough to hit: a remote peer's edits weren't reaching the
+live DOM at all until this phase wired it up; a genuine, previously-
+undiscovered bug in the client's sequence-gap tracker was silently
+force-reconnecting every session with 2+ concurrent editors roughly
+every 5 seconds; and a related edit-loss path during that reconnect
+window. All three are fixed and covered by new/rewritten tests. The
+automated 60-second-concurrent-typing E2E suite (Test Plan §2.7,
+against a real server through an in-process ~150ms-delay relay) passes
+reliably at durations validated up to ~40 seconds; a residual,
+disclosed, not-yet-root-caused issue in that lightweight relay
+substitute (not the product itself — the direct, no-relay path is
+independently proven solid at any duration) remains open at the full
+60s parameter. See CLAUDE.md's Phase 14 entry for the complete,
+unvarnished account.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -147,9 +157,10 @@ runs this at full scale on a schedule.
 | DOM render model + position mapping     | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)       |
 | Input pipeline (beforeinput → ops)      | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component) |
 | MutationSentinel (DOM reconciliation)    | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics) |
+| **Milestone M1 — live multi-browser sync** | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md) |
 | Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
 | Cursor transform under remote edits      | ⏳ not started (Phase 32)                                                 |
-| Offline & reconciliation                | ⏳ not started                                                             |
+| Offline editing (queue-and-replay)       | ⏳ not started (Phase 22)                                                 |
 | Permissions                             | ⏳ not started                                                             |
 | Version history                         | ⏳ not started                                                             |
 
