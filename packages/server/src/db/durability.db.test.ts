@@ -227,11 +227,10 @@ describe("Phase 16 DoD — coordinator warm start (API Spec §6.2)", () => {
     }
 
     // Second coordinator, SAME documentId, fresh in-memory state (simulates a server restart —
-    // nothing here reuses `first`'s engine or operationLog, only what's durably in Postgres).
+    // nothing here reuses `first`'s engine, only what's durably in Postgres).
     const second = await buildReadyCoordinator(documentId);
     expect(second.engine.text()).toBe("abc");
     expect(second.engine.pending.length).toBe(0); // the DoD's own assertion
-    expect(second.operationLog).toHaveLength(3);
     expect(second.currentSeq).toBe(3n);
   });
 
@@ -327,6 +326,9 @@ describe("Phase 16 DoD — broadcast latency is unaffected by a slow database", 
         await new Promise((resolve) => setTimeout(resolve, 500));
         return realStore.commitOperations(input);
       },
+      loadFullOperationLog: (id: string) => realStore.loadFullOperationLog(id),
+      writeSnapshot: (input: Parameters<typeof realStore.writeSnapshot>[0]) =>
+        realStore.writeSnapshot(input),
     };
     const coordinator = new DocumentCoordinator(documentId, delayedStore);
     await coordinator.ready;

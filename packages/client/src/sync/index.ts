@@ -18,7 +18,7 @@ export {
   waitForState,
   type HeadlessPair,
 } from "./headlessHarness.js";
-export { seedEngineFromSnapshot } from "./snapshotSeed.js";
+export { seedEngineFromSnapshot } from "@collab-editor/protocol";
 export {
   PING_INTERVAL_MS,
   SyncClient,

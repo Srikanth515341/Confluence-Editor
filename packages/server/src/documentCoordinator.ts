@@ -1,7 +1,12 @@
-import { Engine, type Operation } from "@collab-editor/engine";
-import { SessionRole, type ParticipantInfo } from "@collab-editor/protocol";
+import { Engine } from "@collab-editor/engine";
+import {
+  SessionRole,
+  replaySnapshotNodesInto,
+  type ParticipantInfo,
+} from "@collab-editor/protocol";
 import type { AckBatcher } from "./ackBatcher.js";
 import type { OperationStore } from "./db/operationStore.js";
+import { SNAPSHOT_OP_THRESHOLD, SNAPSHOT_TIME_THRESHOLD_MS } from "./snapshotter.js";
 import type { ConnectionSendQueues } from "./sendQueues.js";
 
 /**
@@ -51,8 +56,8 @@ export interface CoordinatorSession {
  * server-side engine instance every connected session's operations flow
  * through. Fields exactly match API Spec §6.1's list; `watermarks` is now
  * live (updated from each session's PING, §3.6.11 — mirrors
- * `sessions.last_ack_seq`); `opsSinceSnap`/`lastSnapAt` remain unused
- * scaffolding for Phase 17.
+ * `sessions.last_ack_seq`); `opsSinceSnap`/`lastSnapAt` are live as of
+ * Phase 17 (RFC §13.2's MAYBE-SNAPSHOT — see snapshotter.ts).
  */
 export class DocumentCoordinator {
   readonly documentId: string;
@@ -71,79 +76,93 @@ export class DocumentCoordinator {
 
   /** Per-replica last-acknowledged seq, updated on every PING's `lastAppliedSeq` (§3.6.11: "server updates the session's ... last-acked-seq on receipt"). Mirrors `sessions.last_ack_seq` — real persistence is Phase 16. */
   readonly watermarks = new Map<number, bigint>();
-  /** Scaffolding for Phase 17 (snapshotting). Unused this phase. */
+
+  /** Operations committed since the last successful snapshot write (or since warm start, if none yet) — snapshotter.ts's own MAYBE-SNAPSHOT() trigger reads and resets this. */
   opsSinceSnap = 0;
-  /** Scaffolding for Phase 17 (snapshotting). Unused this phase. */
-  lastSnapAt: Date | null = null;
-
+  /** When the last snapshot was written, OR when warm start completed if none has been written yet since — the baseline snapshotter.ts's 30-second trigger measures from. Never `null`: an unset baseline (e.g. "since epoch") would make a fresh coordinator's very first operation immediately due by the time-based trigger, which isn't the intent of "30 seconds since [something became stale]." */
+  lastSnapAt: Date;
+  /** True while a snapshot write is in flight (snapshotter.ts) — prevents scheduling a second, overlapping write for the same coordinator. */
+  snapshotInFlight = false;
   /**
-   * Every operation this coordinator has ever ingested, in ingestion order
-   * (gateway.ts's `ingestOperation`, appended AFTER `applyRemote` — see that
-   * call site's own comment for why append order there is safe to replay
-   * later regardless of cross-connection interleaving). NOT persistence
-   * (Phases 15-17 own that) — this is an in-memory-only recording that
-   * exists specifically so `/v1/documents/:id/replay` (httpApp.ts) can
-   * reconstruct the document from scratch in a BRAND NEW `Engine`,
-   * independent of this coordinator's own live-incrementally-applied
-   * `engine` instance. Test Plan §2.7 E2E-CONV-01 assertion 3 needs exactly
-   * this independence: comparing a client's DOM against this coordinator's
-   * own already-running `engine` would only ever catch a bug in ingestion,
-   * never a bug shared between the client's and server's identical `Engine`
-   * code — replaying into a FRESH engine from the raw log is the same
-   * "ground truth" argument, just harder for a subtly-corrupted live
-   * instance to fake.
+   * RFC §13.2's cadence (500 ops / 30s), as instance fields rather than
+   * only the module-level constants (snapshotter.ts) — test-only
+   * injection point (constructor parameter below), so a test can prove
+   * the "does not measurably affect operation latency" DoD claim by
+   * comparing a coordinator with real thresholds against one whose
+   * thresholds can never be reached, without needing to fake timers or
+   * actually commit hundreds of operations to observe the disabled case.
+   * Production code never overrides these — every real construction site
+   * (gateway.ts) uses the two-argument constructor, leaving both at their
+   * RFC-specified defaults.
    */
-  readonly operationLog: Operation[] = [];
+  readonly snapshotOpThreshold: number;
+  readonly snapshotTimeThresholdMs: number;
 
   /**
-   * Resolves once warm start (API Spec §6.2) has replayed the persisted
-   * log into `engine` and restored `currentSeq` from `documents.
-current_seq`. gateway.ts's handshake handler awaits this before
-   * completing HELLO, so no client can ever observe a coordinator's
-   * WELCOME/SNAPSHOT before its own warm start has finished — including
-   * the very first connection to a brand-new document, whose warm start
-   * still runs (and legitimately returns an empty log) so the
-   * documents/users provisioning in `operationStore.warmStart` always
-   * happens before any operation from that connection could be
-   * persisted.
+   * Resolves once warm start (API Spec §6.2, extended by Phase 17's
+   * snapshot-aware §6.4) has seeded `engine` from the latest snapshot (if
+   * any) and replayed the operation-log SUFFIX after it, and restored
+   * `currentSeq` from `documents.current_seq`. gateway.ts's handshake
+   * handler awaits this before completing HELLO, so no client can ever
+   * observe a coordinator's WELCOME/SNAPSHOT before its own warm start
+   * has finished — including the very first connection to a brand-new
+   * document, whose warm start still runs (and legitimately returns no
+   * snapshot and an empty suffix) so the documents/users provisioning in
+   * `operationStore.warmStart` always happens before any operation from
+   * that connection could be persisted.
    */
   readonly ready: Promise<void>;
 
   private readonly sessions = new Map<string, CoordinatorSession>();
   private nextReplicaId = 1;
 
-  constructor(documentId: string, operationStore: OperationStore) {
+  constructor(
+    documentId: string,
+    operationStore: OperationStore,
+    snapshotThresholds?: { readonly opThreshold?: number; readonly timeThresholdMs?: number },
+  ) {
     this.documentId = documentId;
     this.operationStore = operationStore;
+    this.snapshotOpThreshold = snapshotThresholds?.opThreshold ?? SNAPSHOT_OP_THRESHOLD;
+    this.snapshotTimeThresholdMs =
+      snapshotThresholds?.timeThresholdMs ?? SNAPSHOT_TIME_THRESHOLD_MS;
+    this.lastSnapAt = new Date(); // provisional — warmStart() below sets the real baseline once it completes
     this.ready = this.warmStart();
   }
 
   /**
-   * API Spec §6.2. Replays the persisted operation log (in seq order,
-   * which is causally valid order — see writePath.ts: an operation is
-   * only ever assigned a seq after `engine.applyRemote` already accepted
-   * it live, so replaying in that same order reproduces the same
-   * causal-readiness path) into a brand-new `engine`, then asserts the
-   * DoD's own requirement: `pendingCount() === 0`. A nonempty `pending`
-   * here means some persisted operation's causal dependency is MISSING
-   * from the log entirely (e.g. a row deleted directly from the table,
+   * API Spec §6.2/§6.4. Seeds `engine` from the latest persisted snapshot
+   * (if any — `replaySnapshotNodesInto`, `@collab-editor/protocol`), then
+   * replays only the operation-log SUFFIX after it (in seq order, which
+   * is causally valid order — see writePath.ts: an operation is only
+   * ever assigned a seq after `engine.applyRemote` already accepted it
+   * live, so replaying in that same order reproduces the same
+   * causal-readiness path). Then asserts the DoD's own requirement:
+   * `pendingCount() === 0`. A nonempty `pending` here means some
+   * persisted operation's causal dependency is MISSING from the snapshot
+   * + suffix entirely (e.g. a row deleted directly from the table,
    * bypassing this code path, or genuine corruption) — silently starting
    * this coordinator with a partially-applied document would be worse
    * than failing loudly before any client ever sees it, so this throws
    * rather than continuing.
    */
   private async warmStart(): Promise<void> {
-    const { ops, currentSeq } = await this.operationStore.warmStart(this.documentId);
-    for (const op of ops) {
+    const { snapshotNodes, suffixOps, currentSeq } = await this.operationStore.warmStart(
+      this.documentId,
+    );
+    if (snapshotNodes) {
+      replaySnapshotNodesInto(this.engine, snapshotNodes);
+    }
+    for (const op of suffixOps) {
       this.engine.applyRemote(op);
-      this.operationLog.push(op);
     }
     if (this.engine.pending.length !== 0) {
       throw new Error(
-        `DocumentCoordinator.warmStart: ${this.engine.pending.length} operation(s) never became ready after replaying ${ops.length} persisted operations for document ${this.documentId} — the log is missing a causal dependency`,
+        `DocumentCoordinator.warmStart: ${this.engine.pending.length} operation(s) never became ready after seeding${snapshotNodes ? ` from a ${snapshotNodes.length}-node snapshot and` : ""} replaying ${suffixOps.length} suffix operation(s) for document ${this.documentId} — the log is missing a causal dependency`,
       );
     }
     this.currentSeq = currentSeq;
+    this.lastSnapAt = new Date(); // the real baseline — see this field's own doc comment
   }
 
   get sessionCount(): number {

@@ -12,6 +12,20 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 17 — snapshots and coordinator warm start.** A coordinator no
+longer replays a document's full operation history from genesis on
+every restart: RFC §13.2's MAYBE-SNAPSHOT() (500 operations or 30
+seconds, whichever comes first) periodically persists the materialized
+text and full node structure off the write path's hot path, and warm
+start now loads the latest snapshot plus only the operations after it —
+verified byte-identical to a full genesis replay on a 5,000-operation
+document, and warm-starting a 50,000-operation document in well under 2
+seconds. Snapshots are explicitly documented as server-side-only and
+non-deterministic in structure across replicas (only the materialized
+content is — block splitting means two replicas can reach the same
+document through different tombstone histories). See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 17 entry for the full account.
+
 **Phase 16 — operation log and acknowledgement-implies-durability.**
 Every operation is now durably committed to Postgres BEFORE its client
 is acknowledged (API/Protocol/Data Spec §6.3), while broadcasting to
@@ -196,8 +210,9 @@ runs this at full scale on a schedule.
 | MutationSentinel (DOM reconciliation)      | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics)   |
 | **Milestone M1 — live multi-browser sync** | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md) |
 | Database schema + migrations               | ✅ Phase 15 (all 8 API Spec §2 tables, constraint-tested against real Postgres)                            |
-| Operation log + durable acknowledgement    | ✅ **Phase 16** (broadcast before commit, ack after — DUR-04-tested; warm start from the persisted log)    |
-| Snapshotting, auth, presence               | ⏳ not started (Phase 17, 26-29, 31)                                                                       |
+| Operation log + durable acknowledgement    | ✅ Phase 16 (broadcast before commit, ack after — DUR-04-tested; warm start from the persisted log)        |
+| Snapshots + snapshot-aware warm start      | ✅ **Phase 17** (RFC §13.2 MAYBE-SNAPSHOT, 500 ops/30s, off the hot path; <2s warm start at 50k ops)       |
+| Auth, presence                             | ⏳ not started (Phases 26-29, 31)                                                                          |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
 | Offline editing (queue-and-replay)         | ⏳ not started (Phase 22)                                                                                  |
 | Permissions                                | ⏳ not started                                                                                             |

@@ -26,6 +26,7 @@ import {
 import type { CoordinatorSession, DocumentCoordinator } from "./documentCoordinator.js";
 import { toOperations } from "./ingest.js";
 import { logger } from "./logger.js";
+import { maybeScheduleSnapshot } from "./snapshotter.js";
 
 /**
  * DUR-04's mutation switch. Reading `process.env` (not a constructor
@@ -148,9 +149,6 @@ export async function processIncomingOperation(
   // the relayed/acked seq below is the STARTING seq of that range, not a single shared value.
   const startSeq = coordinator.currentSeq + 1n;
   coordinator.currentSeq += BigInt(ops.length);
-  for (const op of ops) {
-    coordinator.operationLog.push(op);
-  }
 
   // Step 7: BROADCAST to peers, BEFORE the transaction below. The relay keeps msg's ORIGINAL
   // compact run/batch wire shape — never expanded into individual OP_INSERT frames — only its
@@ -208,4 +206,12 @@ export async function processIncomingOperation(
     hooks.simulateCrashAtCommitPoint?.();
     session.ackBatcher.add(ackEntries);
   }
+
+  // Not one of API Spec §6.3's nine steps — this project's own addition, RFC §13.2's
+  // MAYBE-SNAPSHOT() (Phase 17). Reached only once the commit above has actually succeeded.
+  // Deliberately NOT awaited: scheduling is synchronous and cheap (two field reads, one
+  // comparison), and any actual snapshot work it triggers is deferred off this function's own
+  // completion entirely (snapshotter.ts) — this line must never be what makes
+  // processIncomingOperation take longer to resolve.
+  maybeScheduleSnapshot(coordinator, ops.length);
 }
