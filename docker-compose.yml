@@ -1,0 +1,24 @@
+# Local-dev-only Postgres for Phase 15 (API/Protocol/Data Spec v1.0 §2).
+# No production deployment config exists yet (that's later, per CLAUDE.md's
+# "What is explicitly NOT yet built"). Credentials/db name match
+# .env.example's DATABASE_URL exactly — change one, change both.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: collab_editor
+    ports:
+      - "5432:5432"
+    volumes:
+      - collab_editor_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d collab_editor"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  collab_editor_pg_data:

@@ -364,7 +364,19 @@ packages/client       @collab-editor/client   — React app + editor binding
                                                  Test Plan §2.7 E2E-CONV-01..04, manually
                                                  launching all three browser ENGINES together
                                                  in one test (not per-project), its own
-                                                 `convergence` Playwright project.
+                                                 `convergence` Playwright project. Phase 15 added
+                                                 the database schema (API Spec §2, all eight
+                                                 tables) via node-pg-migrate migrations
+                                                 (`migrations/`), a `pg.Pool` wrapper
+                                                 (`src/db/pool.ts`), a seed script
+                                                 (`scripts/seed.ts`), and a DoD test suite run
+                                                 against a real Postgres instance
+                                                 (`src/db/schema.db.test.ts`, `pnpm test:db`) —
+                                                 see that phase's own entry for the full
+                                                 breakdown. NOT wired into
+                                                 `documentCoordinator.ts`/`gateway.ts` yet; the
+                                                 coordinator remains in-memory only until the
+                                                 write path lands (Phases 16-17).
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -1979,16 +1991,210 @@ ts`) — all pre-existing tests from Phases 12-13, none of which needed
   test-infrastructure task, not a blocker to Milestone M1's actual
   deliverable.
 
+- **Phase 15** — Database schema and migrations (API/Protocol/Data Design
+  Spec v1.0 §2.2–§2.8; PRD FR-PS-1, FR-PM-1). The user supplied the real
+  §2.2–§2.8 DDL verbatim, with the explicit instruction "do not modify
+  column names, types, or constraints" — so, unlike Phases 5 and 7, there
+  was no self-derive-then-correct pass here; the DDL below is that text,
+  unmodified, split across seven migration files and run for real against
+  a real Postgres instance (not merely typechecked).
+
+  **Tooling choice: node-pg-migrate, not Prisma Migrate** — recorded here
+  per this phase's own instruction to record the choice. Prisma Migrate
+  generates SQL from a declarative `schema.prisma` file; expressing
+  `CREATE RULE ... DO INSTEAD NOTHING` (operations' append-only guarantee)
+  and a partial unique index gated on `WHERE role = 'owner'`
+  (`docperm_single_owner_idx`) through Prisma's schema language would mean
+  translating the spec's own literal DDL into a different representation
+  and hoping the generated SQL matches — exactly the kind of translation
+  step this phase's "use this DDL as-is" instruction was written to avoid.
+  node-pg-migrate's `pgm.sql(...)` runs the spec's DDL nearly character
+  for character, including its own inline SQL comments, which is the
+  most direct way to satisfy "do not modify" literally.
+
+  **Seven migration files, not one, and not eight** — one per API Spec
+  §2 subsection (`§2.2` → `§2.3` → `§2.4` → `§2.5` → `§2.6` → `§2.7`),
+  except `§2.8` (`version_marks` + `audit_runs`), which is kept as ONE
+  migration because the spec itself presents them as one section:
+  `packages/server/migrations/`:
+  `1788134400000_create-users.js`,
+  `1788134460000_create-documents.js`,
+  `1788134520000_create-document-permissions.js`,
+  `1788134580000_create-sessions.js`,
+  `1788134640000_create-operations.js`,
+  `1788134700000_create-snapshots.js`,
+  `1788134760000_create-version-marks-and-audit-runs.js`. Each file's
+  `up` is the spec's DDL verbatim (as one `pgm.sql()` call); each file's
+  `down` drops what it created, in FK-safe order (a table before the enum
+  type it depends on) — node-pg-migrate runs `down` migrations in the
+  REVERSE of `up` order automatically (file 7 down first, ..., file 1
+  last), which is what makes `users` (created first, referenced by
+  everything) get dropped last, without this phase needing to reason
+  about global drop order by hand. Files are plain ESM (`export const
+up/down`, not `module.exports`), because `packages/server/package.json`
+  declares `"type": "module"` and node-pg-migrate loads migration files
+  as ES modules under that setting — this is the tool's own native
+  convention, not a departure from it.
+
+  **A real, if minor, mistake caught only by actually running the
+  migrations, not by writing them carefully**: the first version of these
+  files was named `0001_...` through `0007_...` — plain sequential
+  integers, not real timestamps. `node-pg-migrate up` ran them
+  successfully (they still sort correctly), but printed "Can't determine
+  timestamp for 000N" for every file — a warning, not a failure, but an
+  unexplained one in what should be routine `pnpm db:migrate` output.
+  Fixed by renaming to real epoch-millisecond prefixes
+  (`1788134400000_...`, 2026-08-31T00:00:00Z plus 60-second increments)
+  — node-pg-migrate's own documented convention — which is why the
+  filenames above look like real timestamps rather than `0001`/`0002`.
+  Caught the same way this project has caught most of its real bugs since
+  Phase 8: by actually running the command, not by reasoning about
+  whether the tool would accept plain integers.
+
+  **The append-only guarantee (`operations_no_update`/
+  `operations_no_delete`) was verified as a live behavior, not assumed
+  from reading the DDL**: `packages/server/src/db/schema.db.test.ts`
+  inserts a row, issues a real `UPDATE ... SET payload = ...`, and
+  asserts the stored `payload` is byte-for-byte unchanged (not that the
+  query errored — `DO INSTEAD NOTHING` makes it a genuine no-op, not a
+  rejection); a separate test issues a real `DELETE` and asserts the row
+  is still there. Both pass against a real, migrated Postgres instance
+  via Docker Compose.
+
+  **The single-owner and duplicate-stamp constraints were verified as
+  live rejections**: inserting a second `document_permissions` row with
+  `role = 'owner'` for the same `document_id` (a different `user_id`)
+  throws `duplicate key value violates unique constraint
+"docperm_single_owner_idx"`; inserting a second `operations` row with the
+  same `(document_id, stamp_r, stamp_c)` at a DIFFERENT `seq` throws the
+  same class of error against `operations_stamp_uq` — proving this is
+  duplicate-OPERATION suppression (API Spec §9.1's layer 3), not merely a
+  `seq` collision the primary key would have caught anyway.
+
+  **The EXPLAIN test needed a real, and non-obvious, correction after its
+  first run genuinely failed** — the kind of finding this project's own
+  "green isn't evidence until checked at the right scale" lesson
+  (Phases 5/7/14) predicts, one level down at the level of a single SQL
+  query plan rather than a whole test suite. The first version populated
+  only 2 documents × 500 rows (1,000 total) and asked Postgres to plan
+  `WHERE document_id = $1 AND seq > $2 ORDER BY seq` for one of them.
+  Postgres chose `Sort + Seq Scan`, correctly — the target document was
+  50% of the whole table, and a sequential scan genuinely IS cheaper than
+  an index lookup at that selectivity. This would have been a plausible
+  but wrong test: it looked like it was testing "does the index get
+  used," but was actually testing "does Postgres's planner make a
+  reasonable choice on a not-representative table," which happened to
+  answer "no" for the DoD's expected reason. Fixed by populating a table
+  the reconnection query's REAL selectivity profile resembles: 60
+  documents × 2,000 rows each (120,000 total, one target document being
+  under 2% of the table), inserted via a single `unnest(...) CROSS JOIN
+generate_series(...)` statement rather than 120,000 individually
+  parameterized rows (both for speed and to stay under Postgres's
+  per-statement parameter limit), followed by an explicit `ANALYZE` so
+  the planner has real statistics rather than none. Against that table,
+  `EXPLAIN` shows `Index Scan using operations_pkey` with no `Seq Scan`
+  anywhere in the plan — the actual DoD claim, now verified against data
+  shaped like what the reconnection query will really see in production
+  (many documents, one of them queried at a time), not an arbitrary small
+  fixture. The bulk insert itself is slow enough (~15-18s baseline) that
+  this phase raised `vitest.db.config.ts`'s `testTimeout`/`hookTimeout`
+  from the 5s/10s defaults — first to 30s (caught by the suite's own
+  first run timing out, not anticipated in advance), then to 60s after a
+  SECOND real observation: a run that happened to overlap another `pnpm
+test` invocation took 40s and blew through the 30s budget. 60s was
+  chosen to leave genuine headroom rather than trade one flaky threshold
+  for a merely-less-flaky one.
+
+  **`pgmigrations` (node-pg-migrate's own bookkeeping table, tracking
+  which migrations have run) is excluded from the "exactly eight tables"
+  assertion** in `schema.db.test.ts`, with a comment explaining why: it's
+  an implementation detail of the chosen migration tool, not one of API
+  Spec §2's eight tables. Caught the same way as the items above — the
+  test's first run failed with a real, present ninth table, not
+  predicted before running it.
+
+  **`packages/server/src/db/`** (new): `pool.ts` (`createPool()`, a thin
+  `pg.Pool` wrapper) and `schema.db.test.ts` (the DoD suite, described
+  above). **Explicitly NOT wired into `documentCoordinator.ts`/
+  `gateway.ts` this phase** — the write path (persisting real operations/
+  snapshots as the coordinator processes them) is Phases 16-17; Phase
+  15's own scope is schema + migrations + seed only, and the coordinator
+  remains in-memory-only exactly as before. `config.ts`'s `ServerConfig`
+  gained a required `databaseUrl` field (read from `DATABASE_URL`,
+  previously listed in `.env.example` but never read by any code) — used
+  today only by `pool.ts`'s callers (the seed script, the DoD tests), not
+  by `index.ts`'s server startup path.
+
+  **`packages/server/scripts/seed.ts`** (new): inserts one fixed-UUID dev
+  user, one fixed-UUID document owned by that user, and that document's
+  (necessarily singular, per `docperm_single_owner_idx`) owner permission
+  row — all via `ON CONFLICT ... DO NOTHING`, so `pnpm db:seed` is safe
+  to run repeatedly against the same database (verified: ran twice in a
+  row, second run left the row counts unchanged). `password_hash` is
+  seeded with a literal, obviously-not-a-real-hash placeholder string —
+  password hashing doesn't exist until auth (Phases 26-29), and the
+  column is `NOT NULL`, so seeding needs *some* value; the placeholder is
+  deliberately unusable as a real hash so it can never be mistaken for
+  one later.
+
+  **`docker-compose.yml`** (new, repo root): a single `postgres:16-alpine`
+  service, credentials/db name matching `.env.example`'s `DATABASE_URL`
+  exactly (`postgres:postgres@localhost:5432/collab_editor`), a named
+  volume for data persistence across container restarts, and a
+  healthcheck (`pg_isready`) so `docker compose up -d` followed
+  immediately by `pnpm db:migrate` doesn't race a not-yet-ready database
+  — local dev only, no production deployment config exists yet.
+
+  **DoD verification, all against a real, Docker-Composed Postgres
+  instance — not mocked**: `pnpm db:migrate` creates all eight tables
+  from a clean database (verified twice: once from an empty volume, once
+  again after a full `pnpm db:reset`); `pnpm db:reset`
+  (`node-pg-migrate down -m migrations 0` followed by `up`) was run to
+  completion, confirmed the database returns to exactly `pgmigrations`
+  (i.e. every one of the eight tables actually dropped) at the down-0
+  step, then rebuilds cleanly; `pnpm test:db`
+  (`packages/server/vitest.db.config.ts`, gated out of the default `pnpm
+test` for the same reason convergence/properties/mutation are — see "How
+  to run the test suite" below) passes all 7 tests: the two existence
+  checks, the UPDATE/DELETE no-op checks, the two constraint-rejection
+  checks, and the EXPLAIN check, all described above. `pnpm test`
+  (301 tests, unrelated to this phase) and `pnpm lint`/`pnpm
+format:check`/`pnpm typecheck` were re-run afterward to confirm nothing
+  outside this phase's own new files regressed. One PRE-EXISTING,
+  unrelated typecheck failure was found this way (out of Phase 15's own
+  scope, not caused by it): `packages/server/src/heartbeat.test.ts`
+  didn't set the `receivedFrameCount` field Phase 14 added to
+  `CoordinatorSession` for its send/receive frame-counting investigation
+  (`documentCoordinator.ts`) — confirmed via `git log`/`git show` against
+  `d0447cf` (the Phase 14 merge commit) that this predates Phase 15's own
+  branch entirely, and via `git status` that neither file was touched by
+  Phase 15's own work. Since this failure blocked `pnpm typecheck` at the
+  repo root — and therefore blocked CI, `.github/workflows/ci.yml`'s
+  `Typecheck` step running unguarded ahead of `Test`/`Adversarial suite`
+  in the single `ci` job — it was fixed as a SEPARATE, explicitly-labeled
+  one-line change once flagged and confirmed with Srikanth, touching only
+  `heartbeat.test.ts`'s `fakeSession()` test fixture (added
+  `receivedFrameCount: 0`, a correct fixed value since this fixture never
+  exercises frame receipt) — no other Phase 14 file was touched. `pnpm
+typecheck` now passes cleanly across all six workspace packages; `pnpm
+test` still passes all 301 tests afterward.
+
 ## Current phase in progress
 
-None — Phase 14 (Milestone M1) complete. The one item carried forward
-from this phase's own DoD verification (the delay-relay substitute's
-intermittent full-60-second failure) was fully root-caused the same day
-and confirmed as a test-infrastructure defect, not a product defect —
-see the Phase 14 entry's final bullets above and
-`tests/regression/README.md`'s "FINAL RESOLUTION" section for the
-complete evidence trail. No known product-side gap remains open from
-this phase.
+None — Phase 15 (database schema and migrations) complete. All eight API
+Spec §2 tables exist, migrated and verified against a real Postgres
+instance, with every named constraint live and tested (append-only rules,
+single-owner partial unique index, duplicate-stamp suppression, and the
+primary-key range scan the reconnection query depends on). The database
+is not yet wired into the server's write path — `documentCoordinator.ts`
+and `gateway.ts` remain exactly as Phase 14 left them, in-memory only —
+that's Phases 16-17. A pre-existing, unrelated typecheck failure
+(`heartbeat.test.ts` missing Phase 14's `receivedFrameCount` field,
+predating Phase 15 entirely) was found during this phase's own
+verification, confirmed to block CI, and fixed as a separate one-line
+change once flagged — see the Phase 15 entry above. `pnpm typecheck`
+passes cleanly at the repo root; no known product-side or tooling gap
+remains open from this phase.
 
 ## What is explicitly NOT yet built
 
@@ -2008,15 +2214,21 @@ built server-side — only fresh handshakes work, so every reconnect (Phase
 a brand-new replica id and a full fresh SNAPSHOT, never a delta. Session-
 inactivity eviction (10 minutes with no PING) is scaffolded (constant
 defined, cited to §11.4) but not wired to anything — Phase 21's concern.
-No persistence (no database schema, no snapshotting, no acks —
+No persistence WIRED INTO THE SERVER YET (no snapshotting, no acks —
 `DocumentCoordinator`'s `opsSinceSnap`/`lastSnapAt` fields exist but are
-unused no-ops, Phases 15-17; `watermarks` is live as of Phase 9 but only in
-memory, nothing durable; `SyncClient`'s unacked-operation queue is
+still unused no-ops, Phases 16-17; `watermarks` is live as of Phase 9 but
+only in memory, nothing durable; `SyncClient`'s unacked-operation queue is
 in-memory only too, IndexedDB is Phase 22) — this means a real coordinator
-restart loses ALL document content, not just the connection, which Phase
-10's own kill-and-restart test explicitly accounts for rather than assumes
-away. No auth (Phases 26-29) — any WebSocket client can join any document
-by guessing its id and is unconditionally granted the EDITOR role, which is
+restart still loses ALL document content, not just the connection, exactly
+as Phase 10's own kill-and-restart test accounts for. **The database
+SCHEMA itself now exists** (Phase 15: all eight API Spec §2 tables,
+migrated and constraint-tested against a real Postgres instance via
+`pnpm db:migrate`) — what's still missing is the server code that
+actually reads from and writes to it; `documentCoordinator.ts`/
+`gateway.ts` are untouched by Phase 15 and remain exactly as in-memory as
+Phase 14 left them. No auth (Phases 26-29) — any WebSocket client can join
+any document by guessing its id and is unconditionally granted the
+EDITOR role, which is
 correct for this phase and not yet a security concern since nothing is
 exposed publicly. A React component (`EditorView`), the full `beforeinput`
 dispatch pipeline (Phase 12), MutationObserver-based DOM reconciliation
@@ -2391,13 +2603,35 @@ test:convergence`), excluded from root `vitest.config.ts`'s default
 
 ```bash
 pnpm install
-cp .env.example .env   # PORT is now read by packages/server/src/config.ts (Phase 8)
+cp .env.example .env   # PORT (Phase 8) and DATABASE_URL (Phase 15) are read by
+                        # packages/server/src/config.ts
 pnpm lint
 pnpm format:check
 pnpm typecheck
 pnpm check:purity
 pnpm test
 ```
+
+## How to run Postgres locally (Phase 15)
+
+```bash
+docker compose up -d   # starts postgres:16-alpine, credentials matching .env.example
+pnpm db:migrate         # runs every migration in packages/server/migrations/ (node-pg-migrate)
+pnpm db:seed            # optional — inserts one dev user + one dev document (idempotent)
+```
+
+Other commands: `pnpm db:migrate:down` (rolls back the most recent
+migration), `pnpm db:reset` (rolls back to zero, then migrates back up —
+this is how migration reversibility is actually tested, not merely
+asserted). `pnpm test:db` runs the schema/constraint DoD suite
+(`packages/server/src/db/schema.db.test.ts`) against whatever database
+`DATABASE_URL` points at — requires `docker compose up -d` and `pnpm
+db:migrate` to have been run first; see "How to run the test suite"
+below for why it's gated out of the default `pnpm test`. The database is
+**not** wired into the server's own read/write path yet — `pnpm run
+dev`'s server still runs entirely in-memory, exactly as in Phase 14; the
+schema exists and is fully tested, but nothing in `documentCoordinator.ts`
+or `gateway.ts` talks to it (Phases 16-17).
 
 **As of Phase 14, both halves of the app can actually be run standalone —
 see "How to run the M1 demo" below.** `packages/server` now has `pnpm run
@@ -2456,6 +2690,7 @@ pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each
 pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
+pnpm test:db           # schema/constraint DoD suite (Phase 15) — requires a real, migrated Postgres
 ```
 
 ### The Playwright suite (real browsers, Phase 11-12)
@@ -2631,3 +2866,24 @@ reduced sanity budget this command uses); the authoritative full
 10^6-trial MUT-KILL-01 run is separate (`MUT_KILL_01_BUDGET=1000000`,
 what the nightly workflow sets) — see the Phase 6 completed-phase entry
 above for its result.
+
+`pnpm test:db` currently PASSES: all 7 tests in
+`packages/server/src/db/schema.db.test.ts`, run against a real,
+Docker-Composed Postgres instance — table/index existence (all eight API
+Spec §2 tables plus every named constraint from Phase 15's scope table),
+the `operations` append-only rules (a real `UPDATE` and a real `DELETE`
+both verified as silent no-ops, not merely non-erroring), the
+`docperm_single_owner_idx` and `operations_stamp_uq` rejections (verified
+as real thrown Postgres errors, not application-level checks), and the
+reconnection-query `EXPLAIN` check (`Index Scan using operations_pkey`,
+no `Seq Scan`, against a 120,000-row table shaped like the query's real
+production selectivity profile — see the Phase 15 completed-phase entry
+for why the first, smaller version of this specific test was wrong).
+Excluded from the default `pnpm test` (requires `docker compose up -d` +
+`pnpm db:migrate` first; most dev/CI environments don't have a Postgres
+instance running by default) — same reasoning as
+convergence/properties/mutation. Not yet wired into CI as its own job;
+that requires a Postgres service container in the GitHub Actions
+workflow, which Phase 15's own scope didn't ask for and wasn't added
+here to avoid scope creep — worth flagging for whichever future phase
+next touches `.github/workflows/ci.yml`.

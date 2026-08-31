@@ -25,6 +25,11 @@ function fakeSession(replicaId = 1): CoordinatorSession {
     lastPingAt: Date.now(),
     presenceStale: false,
     staleTimer: undefined,
+    // Phase 14's diagnostic-only counter (documentCoordinator.ts's
+    // CoordinatorSession.receivedFrameCount) — this fixture never
+    // exercises frame receipt, so 0 is a correct fixed value, not a
+    // placeholder standing in for real behavior.
+    receivedFrameCount: 0,
   };
 }
 

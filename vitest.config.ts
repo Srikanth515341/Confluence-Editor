@@ -24,6 +24,13 @@ export default defineConfig({
       // (packages/testkit/vitest.mutation.config.ts), never swept into
       // the default run.
       "**/mutation/**/*.test.ts",
+      // Phase 15's schema DoD suite requires a real, migrated Postgres
+      // instance (`docker compose up -d` + `pnpm db:migrate`) — most
+      // dev/CI environments don't have one running by default, so it's
+      // gated separately via `pnpm test:db`
+      // (packages/server/vitest.db.config.ts), same reasoning as the
+      // three suites above.
+      "**/db/**/*.db.test.ts",
     ],
     environment: "node",
     globals: false,
