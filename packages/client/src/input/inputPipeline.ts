@@ -7,6 +7,7 @@
 import {
   domToVis,
   scalarToUtf16,
+  totalVisibleLength,
   utf16ToScalar,
   visToDom,
   type DomWriter,
@@ -40,8 +41,31 @@ interface VisRange {
 }
 
 /**
+ * `domToVis` throws if `node` doesn't belong to any run in `index` — which
+ * can legitimately happen now (Phase 14): a REMOTE operation can trigger a
+ * full re-mount (EditorView's `onRemoteOpsApplied`) asynchronously, between
+ * the moment a `beforeinput` event is dispatched and the moment this
+ * handler actually reads the live `Selection`, leaving that Selection
+ * anchored to a Text node `mount()` already replaced. Falling back to the
+ * end of the CURRENT document — rather than letting the exception escape
+ * and silently drop the keystroke entirely — is what actually matters here:
+ * losing a user's local edit to an unlucky race is a correctness bug (data
+ * loss), whereas landing it at the wrong position under that same rare
+ * race is merely a UX rough edge, in the same spirit as Phase 12's
+ * `captureCaret` fallback and squarely inside "cursor precision under
+ * concurrent remote edits is Phase 32's job, not this one's."
+ */
+function safeDomToVis(index: DomWriter["index"], node: Node, offset: number): number {
+  try {
+    return domToVis(index, node, offset);
+  } catch {
+    return totalVisibleLength(index);
+  }
+}
+
+/**
  * Reads `event.getTargetRanges()` (Input Events Level 2) and maps its
- * first range into visible (scalar) indices via {@link domToVis} — the
+ * first range into visible (scalar) indices via {@link safeDomToVis} — the
  * browser's own notion of what a `beforeinput` event would have modified,
  * available for autocorrect/spellcheck replacement and IME commits where
  * it can differ from the CURRENT selection. `null` when unsupported or
@@ -54,8 +78,8 @@ function targetRange(ev: InputEvent, deps: InputPipelineDeps): VisRange | null {
   if (!first) {
     return null;
   }
-  const a = domToVis(deps.domWriter.index, first.startContainer, first.startOffset);
-  const b = domToVis(deps.domWriter.index, first.endContainer, first.endOffset);
+  const a = safeDomToVis(deps.domWriter.index, first.startContainer, first.startOffset);
+  const b = safeDomToVis(deps.domWriter.index, first.endContainer, first.endOffset);
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
 
@@ -66,8 +90,8 @@ function liveSelectionRange(deps: InputPipelineDeps): VisRange {
     return { start: 0, end: 0 };
   }
   const range = sel.getRangeAt(0);
-  const a = domToVis(deps.domWriter.index, range.startContainer, range.startOffset);
-  const b = domToVis(deps.domWriter.index, range.endContainer, range.endOffset);
+  const a = safeDomToVis(deps.domWriter.index, range.startContainer, range.startOffset);
+  const b = safeDomToVis(deps.domWriter.index, range.endContainer, range.endOffset);
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
 
@@ -232,8 +256,15 @@ function deleteLineBackward(ev: InputEvent, deps: InputPipelineDeps): void {
 export function handleBeforeInput(ev: InputEvent, deps: InputPipelineDeps): void {
   ev.preventDefault();
 
-  if (!deps.sync.engine) {
-    return; // not synced yet — nothing to apply against (no offline edit queue this phase)
+  if (!deps.sync.engine || deps.sync.state.value !== "synced") {
+    // Not synced yet, OR currently reconnecting (Phase 14 correction): `sync.engine` is
+    // deliberately preserved, never nulled, across a disconnect (SyncClient's own `onClose`
+    // comment) — checking for null alone would let a local edit land on an engine reference a
+    // fresh SNAPSHOT is about to replace wholesale, silently orphaning it (a real, confirmed bug
+    // — see SyncClient.requireEngine's own doc comment for the full account). No offline edit
+    // queue exists this phase (Phase 22's job) — an edit attempted while reconnecting is simply
+    // not applied, exactly like an edit attempted before the very first sync.
+    return;
   }
 
   switch (ev.inputType) {

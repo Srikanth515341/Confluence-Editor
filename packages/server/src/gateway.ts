@@ -85,6 +85,10 @@ function ingestOperation(
   const ops = toOperations(msg);
   for (const op of ops) {
     coordinator.engine.applyRemote(op);
+    // Appended in the SAME order applied here — see operationLog's own doc comment
+    // (documentCoordinator.ts) for why this order is safe to replay later regardless of how
+    // operations from different connections interleaved on the way in.
+    coordinator.operationLog.push(op);
   }
   coordinator.currentSeq += 1n;
   const relay: OpsMessage = { ...msg, seq: Number(coordinator.currentSeq) };
@@ -169,6 +173,7 @@ export function createGateway(httpServer: HttpServer): Gateway {
         lastPingAt: Date.now(),
         presenceStale: false,
         staleTimer: undefined,
+        receivedFrameCount: 0,
       };
       coordinator.join(session);
       bound = { coordinator, session };
@@ -238,6 +243,12 @@ export function createGateway(httpServer: HttpServer): Gateway {
         handleHandshake(bytes);
         return;
       }
+
+      // Diagnostic-only counter (see CoordinatorSession.receivedFrameCount's doc comment) —
+      // counts every frame that actually reaches this handler, any channel, before any
+      // decode/dispatch, so it reflects what the server truly received regardless of what
+      // happens to the frame afterward.
+      bound.session.receivedFrameCount += 1;
 
       const channel = peekChannel(bytes);
       if (channel === Channel.OPS) {

@@ -58,6 +58,9 @@ export default tseslint.config(
       "**/e2e/.bundle/**",
       "**/playwright-report/**",
       "**/test-results/**",
+      // Phase 14: esbuild output of packages/client/scripts/serveApp.mjs — not source, gitignored.
+      "**/app/main.js",
+      "**/app/main.js.map",
     ],
   },
   js.configs.recommended,
@@ -65,7 +68,7 @@ export default tseslint.config(
   eslintConfigPrettier,
   // --- Plain Node scripts (build tooling, not part of any package) ---
   {
-    files: ["scripts/**/*.mjs", "*.config.{js,ts}", "*.config.mjs"],
+    files: ["scripts/**/*.mjs", "*.config.{js,ts}", "*.config.mjs", "packages/*/scripts/**/*.mjs"],
     languageOptions: {
       globals: { ...globals.node },
     },

@@ -20,7 +20,7 @@ import {
 } from "@collab-editor/protocol";
 import { Backoff, BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { ObservableValue, type ConnectionState, type Observable } from "./connectionState.js";
-import { GAP_RECONNECT_TIMEOUT_MS, SequenceGapTracker } from "./gapTracker.js";
+import { SequenceGapTracker } from "./gapTracker.js";
 import { seedEngineFromSnapshot } from "./snapshotSeed.js";
 import { UnackedQueue } from "./unackedQueue.js";
 import { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
@@ -110,7 +110,6 @@ export class SyncClient {
   private pingTimer: ReturnType<typeof setInterval> | undefined;
 
   private readonly gapTracker = new SequenceGapTracker();
-  private gapReconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   private readonly unacked = new UnackedQueue();
   /** The seq PING reports — the highest seq this client has ever applied, NOT the gap tracker's contiguous value (§3.7.5's "apply anyway" means these can legitimately differ while a gap is open). */
@@ -121,6 +120,25 @@ export class SyncClient {
     this.documentId = opts.documentId;
     this.createSocket = opts.createSocket ?? defaultCreateSocket;
     this.onReconnectScheduled = opts.onReconnectScheduled;
+  }
+
+  /**
+   * TEST-ONLY: seeds `engine` directly and marks this client `synced`,
+   * bypassing a real handshake entirely — never called by production code.
+   * This project's own test suites and e2e harnesses use it throughout to
+   * exercise the input pipeline/sentinel/editor against a real `Engine`
+   * without a real network (`sendFrame` already no-ops when `ws` is null,
+   * which it stays here). Exists as a named, documented method — not a
+   * bare `sync.engine = ...` assignment scattered across call sites —
+   * specifically so it also flips `state` to `"synced"`: since Phase 14's
+   * `requireEngine()` correction checks `state.value === "synced"`, not
+   * just `engine !== null` (see that method's own doc comment for why),
+   * a bare engine assignment alone no longer satisfies `localInsertText`/
+   * `localDelete`/`localInsert`'s precondition.
+   */
+  seedForTesting(engine: Engine): void {
+    this.engine = engine;
+    this.stateValue.set("synced");
   }
 
   /** Opens (or re-opens) the connection. Safe to call once; automatic reconnection after a drop does not need it called again. */
@@ -206,8 +224,28 @@ export class SyncClient {
     return this.backoff.attemptCount;
   }
 
+  /**
+   * Requires BOTH a non-null engine AND `state.value === "synced"` — Phase
+   * 14 correction: `engine` is deliberately preserved (never nulled) across
+   * a disconnect (see `onClose`'s own comment), so checking for null alone
+   * does not catch the "reconnecting" window between an old connection
+   * dropping and a fresh SNAPSHOT replacing `engine` wholesale. A local
+   * edit minted against the OLD (soon-to-be-discarded) engine reference
+   * during that window would apply locally, attempt to send over a socket
+   * that's already gone, and then be silently ORPHANED the instant the new
+   * snapshot replaces `engine` — a real, confirmed data-loss path, found
+   * only by running a real multi-client session long enough to reconnect
+   * mid-edit (Test Plan §2.7's own E2E-CONV-01/-02). Throwing here instead
+   * of silently operating on a doomed reference is the same "throws if not
+   * currently synced" contract `localInsert`'s own doc comment already
+   * promised — this closes the gap between that promise and what the code
+   * actually checked. `EditorView`'s input pipeline (inputPipeline.ts)
+   * checks `state.value === "synced"` BEFORE ever reaching this call, so a
+   * real user typing during a reconnect never actually hits this throw —
+   * it's a backstop for direct/programmatic callers.
+   */
   private requireEngine(): Engine {
-    if (!this.engine) {
+    if (!this.engine || this.stateValue.value !== "synced") {
       throw new Error("SyncClient: not synced yet — call after state becomes 'synced'");
     }
     return this.engine;
@@ -305,7 +343,6 @@ export class SyncClient {
     this.unacked.clear(); // whatever this client sent under a PRIOR connection is already reflected in this fresh snapshot (or lost with that connection) — nothing to resend against a brand-new replica identity
     this.gapTracker.reset(seq);
     this.highestAppliedSeq = seq;
-    this.clearGapReconnectTimer();
 
     this.sendControl({ kind: "syncComplete", lastServerSeq: seq, resentCount: 0 });
 
@@ -353,15 +390,38 @@ export class SyncClient {
     }
     this.highestAppliedSeq = Math.max(this.highestAppliedSeq, seq);
     this.gapTracker.observe(seq);
-    if (this.gapTracker.hasGap && this.gapReconnectTimer === undefined) {
-      this.gapReconnectTimer = setTimeout(() => this.onGapPersisted(), GAP_RECONNECT_TIMEOUT_MS);
+    // Reconnection off a stalled `gapTracker` is checked on the ping cadence (`startPingTimer`),
+    // not armed here — see gapTracker.ts's own doc comment for why a per-call timer keyed off
+    // "any single missing seq number" was the actual bug this phase found and fixed.
+    if (ops.length > 0) {
+      this.notifyRemoteOpsApplied();
     }
   }
 
-  /** §3.7.5: "If the gap persists for 5 seconds, close the socket and reconnect... Do not build a second gap-repair mechanism; reconnection already is one." */
-  private onGapPersisted(): void {
-    this.gapReconnectTimer = undefined;
-    this.ws?.close();
+  private readonly remoteOpsListeners = new Set<() => void>();
+
+  /**
+   * Subscribes to "one or more REMOTE operations were just applied to
+   * `engine`" (Phase 14 — this client's own local edits do NOT fire this;
+   * `EditorView` already updates the DOM for those directly via
+   * `DomWriter`). Without this, nothing tells the DOM layer a peer's edit
+   * landed at all — `engine.text()` converges correctly on its own, but a
+   * live `EditorView` would keep showing only this session's own edits
+   * forever, discovered by actually running the two-window manual demo
+   * this milestone exists to prove, not predicted in advance. Returns an
+   * unsubscribe function.
+   */
+  onRemoteOpsApplied(listener: () => void): () => void {
+    this.remoteOpsListeners.add(listener);
+    return () => {
+      this.remoteOpsListeners.delete(listener);
+    };
+  }
+
+  private notifyRemoteOpsApplied(): void {
+    for (const listener of this.remoteOpsListeners) {
+      listener();
+    }
   }
 
   private onClose(_ev: { code: number; reason: string }): void {
@@ -389,21 +449,28 @@ export class SyncClient {
     this.survivedTimer = setTimeout(() => this.backoff.reset(), BACKOFF_RESET_AFTER_MS);
   }
 
+  /**
+   * Sends PING on every tick UNLESS `gapTracker.hasStalled()` — reusing the
+   * existing ping cadence to periodically re-check for a genuine stall,
+   * rather than a separate one-shot timer armed the instant any single gap
+   * opens (Phase 14's own correction — see gapTracker.ts's doc comment).
+   * The tradeoff: a real stall is detected somewhere between 5s and
+   * `5s + PING_INTERVAL_MS` after it begins, not at exactly 5s — acceptable
+   * for a resilience heuristic, and far simpler than maintaining a second,
+   * independently-armed/cleared timer.
+   */
   private startPingTimer(): void {
     this.pingTimer = setInterval(() => {
+      if (this.gapTracker.hasStalled()) {
+        this.ws?.close();
+        return; // don't also send a PING on a socket we just decided to close
+      }
       this.sendControl({
         kind: "ping",
         clientTimeMs: Date.now(),
         lastAppliedSeq: this.highestAppliedSeq,
       });
     }, PING_INTERVAL_MS);
-  }
-
-  private clearGapReconnectTimer(): void {
-    if (this.gapReconnectTimer !== undefined) {
-      clearTimeout(this.gapReconnectTimer);
-      this.gapReconnectTimer = undefined;
-    }
   }
 
   /** Timers tied to ONE connection's lifetime — always cleared on close, whether that close leads to a reconnect or to `offline`. */
@@ -416,7 +483,6 @@ export class SyncClient {
       clearInterval(this.pingTimer);
       this.pingTimer = undefined;
     }
-    this.clearGapReconnectTimer();
   }
 
   private clearAllTimers(): void {

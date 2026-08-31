@@ -12,7 +12,7 @@ import {
   type WelcomeMessage,
 } from "@collab-editor/protocol";
 import { randomUUID } from "node:crypto";
-import { SyncClient, type WebSocketLike } from "./syncClient.js";
+import { PING_INTERVAL_MS, SyncClient, type WebSocketLike } from "./syncClient.js";
 import { BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { GAP_RECONNECT_TIMEOUT_MS } from "./gapTracker.js";
 
@@ -279,7 +279,7 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     });
   }
 
-  it("applies an out-of-order operation anyway, and records a gap without advancing lastServerSeq", () => {
+  it("applies an out-of-order operation anyway, and records a gap (informational) without freezing progress", () => {
     const ws = synced();
     expect(client.hasSequenceGap).toBe(false);
 
@@ -288,25 +288,39 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     expect(client.hasSequenceGap).toBe(true);
   });
 
-  it("closes the socket and reconnects once the gap persists for 5 seconds", () => {
+  it("closes the socket once NO further seq arrives for GAP_RECONNECT_TIMEOUT_MS, re-checked on the ping cadence", () => {
     const ws = synced();
-    ws.triggerMessage(opInsertFrame(5, 1));
+    ws.triggerMessage(opInsertFrame(5, 1)); // one gap-y frame, then total silence from the server
     expect(ws.closed).toBe(false);
 
-    vi.advanceTimersByTime(GAP_RECONNECT_TIMEOUT_MS - 1);
-    expect(ws.closed).toBe(false);
-
-    vi.advanceTimersByTime(1);
+    // The stall check runs on the ping timer (every PING_INTERVAL_MS), not a separate one-shot
+    // timer — advance past both the stall threshold AND the next ping tick that observes it.
+    vi.advanceTimersByTime(GAP_RECONNECT_TIMEOUT_MS + PING_INTERVAL_MS);
     expect(ws.closed).toBe(true);
     expect(client.state.value).toBe("reconnecting");
   });
 
-  it("a fresh SNAPSHOT after reconnecting clears the gap", () => {
+  it("this client's own permanently-excluded operations (a real gap that will NEVER close) do NOT trigger a reconnect as long as OTHER traffic keeps arriving", () => {
+    const ws = synced();
+    // Simulate a sustained exchange where every OTHER seq is this client's own (never observed) —
+    // exactly Test Plan §2.7 E2E-CONV-01's real-world shape, and the actual Phase 14 finding.
+    let seq = 1;
+    for (let i = 0; i < 20; i++) {
+      vi.advanceTimersByTime(200);
+      seq += 2;
+      ws.triggerMessage(opInsertFrame(seq, 1));
+    }
+    expect(client.hasSequenceGap).toBe(true); // still informationally "gappy" — that's expected and fine
+    expect(ws.closed).toBe(false); // but NEVER stalled, so never force-reconnected
+    expect(client.state.value).toBe("synced");
+  });
+
+  it("a fresh SNAPSHOT after a genuine reconnect clears the gap", () => {
     const ws = synced();
     ws.triggerMessage(opInsertFrame(5, 1));
     expect(client.hasSequenceGap).toBe(true);
 
-    vi.advanceTimersByTime(GAP_RECONNECT_TIMEOUT_MS);
+    vi.advanceTimersByTime(GAP_RECONNECT_TIMEOUT_MS + PING_INTERVAL_MS); // let the stall actually close the socket
     vi.advanceTimersByTime(35_000); // let the scheduled reconnect fire (capped backoff well under this)
     const ws2 = sockets[sockets.length - 1]!;
     ws2.triggerOpen();

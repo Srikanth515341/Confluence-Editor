@@ -37,7 +37,7 @@ describe("MutationSentinel — MUT-02: a direct DOM mutation is detected and rev
     document.body.appendChild(root);
     const domWriter = new DomWriter();
     const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-    sync.engine = new Engine(1);
+    sync.seedForTesting(new Engine(1));
     sync.localInsertText(0, "hello");
     const sentinel = new MutationSentinel({
       root,
@@ -96,7 +96,7 @@ describe("MutationSentinel — MUT-02: a direct DOM mutation is detected and rev
     document.body.appendChild(root);
     const domWriter = new DomWriter();
     const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-    sync.engine = new Engine(1);
+    sync.seedForTesting(new Engine(1));
     sync.localInsertText(0, "hello");
     const sentinel = new MutationSentinel({
       root,
@@ -140,7 +140,7 @@ describe("MutationSentinel — MUT-02: a direct DOM mutation is detected and rev
     document.body.appendChild(root);
     const domWriter = new DomWriter();
     const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-    sync.engine = new Engine(1);
+    sync.seedForTesting(new Engine(1));
     const sentinel = new MutationSentinel({
       root,
       domWriter,
@@ -165,7 +165,7 @@ describe("MutationSentinel — a burst of legitimate writes produces zero reconc
     document.body.appendChild(root);
     const domWriter = new DomWriter();
     const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-    sync.engine = new Engine(1);
+    sync.seedForTesting(new Engine(1));
     const sentinel = new MutationSentinel({
       root,
       domWriter,
@@ -208,7 +208,7 @@ describe("MutationSentinel — desync_error (Scope-IN: renderIndex disagrees wit
     document.body.appendChild(root);
     const domWriter = new BrokenDomWriter();
     const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-    sync.engine = new Engine(1);
+    sync.seedForTesting(new Engine(1));
     sync.localInsertText(0, "ok");
     const sentinel = new MutationSentinel({
       root,

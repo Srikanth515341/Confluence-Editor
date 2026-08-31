@@ -37,7 +37,7 @@ function makeHarness(initialText = ""): Harness {
   document.body.appendChild(root); // jsdom's Selection API expects live-document nodes
   const domWriter = new DomWriter();
   const sync = new SyncClient({ url: "ws://unused", documentId: "doc" });
-  sync.engine = new Engine(1);
+  sync.seedForTesting(new Engine(1));
   const sentinel = new MutationSentinel({
     root,
     domWriter,

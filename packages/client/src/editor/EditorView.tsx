@@ -12,17 +12,27 @@
 // any OTHER mutation — a browser extension, devtools, a future bug — and
 // reverts it, treating the engine as authoritative (API Spec §7.7, RFC R5).
 //
-// No cursor transformation under remote edits (Phase 32) exists yet: this
-// component re-mounts DomWriter's ENTIRE content from `engine.text()` on
-// every fresh SNAPSHOT (a real (re)connect), and otherwise reflects only
-// this session's OWN local edits — a remote peer's concurrent edit updates
-// `sync.engine` correctly (Phase 3's engine, proven convergent) but is not
-// yet reflected in this session's live DOM, exactly as the project's "what
-// is NOT yet built" section documents.
+// Phase 14 wires `sync.onRemoteOpsApplied` in too: on every batch of
+// REMOTE operations (this session's own edits already update the DOM
+// directly, via DomWriter, from the input pipeline), this component
+// re-mounts the WHOLE subtree from `engine.text()` — through the SAME
+// `sentinel.applyPatches()` wrapper — and does a best-effort caret restore
+// (capture this session's own visible-index position, remount, restore
+// that SAME numeric index). This is NOT cursor transformation (Phase 32):
+// a remote insert/delete before the local caret should shift its index by
+// the change's length to stay in the same RELATIVE spot, which this does
+// not do — restoring the identical raw index is the simplest thing that
+// keeps typing usable at all when remote edits interleave (discovered
+// necessary by actually running a two-window manual test during this
+// phase's own development — without ANY re-render on remote ops, a peer's
+// edits never appeared in this session's DOM at all, only in `engine.text()`,
+// which would have made Milestone M1's whole premise unverifiable in a
+// real browser). Real relative-position preservation across concurrent
+// remote edits remains Phase 32's job.
 
 import { useEffect, useRef } from "react";
 import type { Engine } from "@collab-editor/engine";
-import { DomWriter } from "../binding/index.js";
+import { DomWriter, domToVis, totalVisibleLength, visToDom } from "../binding/index.js";
 import { attachInputPipeline } from "../input/index.js";
 import { MutationSentinel } from "../sentinel/index.js";
 import type { SyncClient } from "../sync/syncClient.js";
@@ -65,10 +75,55 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
         mountIfNewEngine();
       }
     });
+
+    // Arrow expressions, not function declarations — TS narrows a captured `const` (here, `root`
+    // after the early-return above) through an arrow closure but not reliably through a hoisted
+    // function declaration, since the latter could in principle be invoked before the narrowing
+    // check runs.
+    /** Best-effort: see this file's own header comment for why this is a numeric-index restore, not real cursor transformation. */
+    const captureCaretVisIndex = (): number => {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) {
+        return 0;
+      }
+      try {
+        const range = sel.getRangeAt(0);
+        return domToVis(domWriter.index, range.startContainer, range.startOffset);
+      } catch {
+        return 0;
+      }
+    };
+
+    const restoreCaretVisIndex = (visIndex: number): void => {
+      const sel = window.getSelection();
+      if (!sel) {
+        return;
+      }
+      const total = totalVisibleLength(domWriter.index);
+      const clamped = Math.max(0, Math.min(visIndex, total));
+      const pos = visToDom(domWriter.index, root, clamped);
+      const range = document.createRange();
+      range.setStart(pos.node, pos.offset);
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    };
+
+    const unsubscribeRemoteOps = sync.onRemoteOpsApplied(() => {
+      const engine = sync.engine;
+      if (!engine || engine !== mountedEngineRef.current) {
+        return; // a SNAPSHOT re-mount (mountIfNewEngine) already covers a brand-new engine
+      }
+      const savedVisIndex = captureCaretVisIndex();
+      sentinel.applyPatches(() => domWriter.mount(root, engine.text()));
+      restoreCaretVisIndex(savedVisIndex);
+    });
+
     const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });
 
     return () => {
       unsubscribe();
+      unsubscribeRemoteOps();
       detachInput();
       sentinel.stop();
       domWriterRef.current = null;

@@ -1,0 +1,88 @@
+{"ts":"2026-08-31T11:31:27.903Z","level":"info","message":"server.listening","port":53399}
+{"ts":"2026-08-31T11:31:47.063Z","level":"info","message":"ws.open","sessionId":"199657dc-f89d-4b21-9ee2-05f06938e02b"}
+{"ts":"2026-08-31T11:31:47.176Z","level":"info","message":"ws.connect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"199657dc-f89d-4b21-9ee2-05f06938e02b","replicaId":1}
+{"ts":"2026-08-31T11:31:47.387Z","level":"info","message":"ws.syncComplete","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"199657dc-f89d-4b21-9ee2-05f06938e02b","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:31:47.976Z","level":"info","message":"ws.open","sessionId":"e870ffbd-a172-495c-9629-c23bfaf4861c"}
+{"ts":"2026-08-31T11:31:48.289Z","level":"info","message":"ws.connect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"e870ffbd-a172-495c-9629-c23bfaf4861c","replicaId":2}
+{"ts":"2026-08-31T11:31:48.693Z","level":"info","message":"ws.syncComplete","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"e870ffbd-a172-495c-9629-c23bfaf4861c","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:31:50.585Z","level":"info","message":"ws.open","sessionId":"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6"}
+{"ts":"2026-08-31T11:31:50.819Z","level":"info","message":"ws.connect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6","replicaId":3}
+{"ts":"2026-08-31T11:31:51.282Z","level":"info","message":"ws.syncComplete","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:32:08.125Z","level":"warn","message":"presence.stale","sessionId":"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6","replicaId":3,"thresholdMs":8000}
+{"ts":"2026-08-31T11:32:12.633Z","level":"info","message":"presence.fresh","sessionId":"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6","replicaId":3}
+{"ts":"2026-08-31T11:32:12.671Z","level":"info","message":"ws.disconnect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"5c8faf3c-719f-4fe8-a2f8-78ad23885cb6","code":1005}
+{"ts":"2026-08-31T11:32:13.485Z","level":"info","message":"ws.open","sessionId":"b396429e-3d74-4275-9473-684727dfbd63"}
+{"ts":"2026-08-31T11:32:13.589Z","level":"info","message":"ws.connect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"b396429e-3d74-4275-9473-684727dfbd63","replicaId":4}
+{"ts":"2026-08-31T11:32:13.773Z","level":"info","message":"ws.syncComplete","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"b396429e-3d74-4275-9473-684727dfbd63","lastServerSeq":223,"resentCount":0}
+[NATIVE routeWebSocket ~150ms] iter 0 duration=60000ms: MISMATCH len=697 pending=[0,0,0] replayOk=true 
+  dom0 "BBAAAAAABBBBBABABBABBABBABBAAABABBBABAAAAABBAABBAABBAAAABABABBACACCABABABBBAAABBCBBBAACBAAAABBBAACBBCBCBAABBBBBBBAAAABCCCACBABBAAAABABAAABAAAACAABABAAAACCBCBBBACBBACAAABAAACCCCBACCAACAAACBAABAABBCBBBABAABCABBCBBCBCBBBAABBBCCBACABAABAABBCABBBBCAABCACBABCCBCBCCAAAABAABCABACAACBAACCBCBAACBCCABACAACBCBCBAAACCBCBBBAAACBACCBBCCBBACABACABCCBBACBCBACABBCCCACACCCBBCAACBAAACCCAABBAABCBABBCABBACCBBABCABAAABCCACBABBCCCBBCABACCBAACBBABACAABACAACCBCAAABBAABCABCCAAAABCAABBAAACCAAACACCAAAAAACAAACCAACAACCCCCAAAAAAAAAACACABBBBCAACCAAAAAAAACCCCCCAAACCCCAACCACBCCAAAABCABBBBBBBACBAABACBBCABBBBCAAABABCBAABCABBAAAABABAACAABBBCCCCAAABAACBBCBAACBBCABBCtABCAABAAABCBhCAABCBBBAeCB qCuBiCAcCkA BBbBBrBBownAAAA ACBfox!"
+  dom1 "BBAAAAAABBBBBABABBABBABBABBAAABABBBABAAAAABBAABBAABBAAAABABABBACACCABABABBBAAABBCBBBAACBAAAABBBAACBBCBCBAABBBBBBBAAAABCCCACBABBAAAABABAAABAAAACAABABAAAACCBCBBBACBBACAAABAAACCCCBACCAACAAACBAABAABBCBBBABAABCABBCBBCBCBBBAABBBCCBACABAABAABBCABBBBCAABCACBABCCBCBCCAAAABAABCABACAACBAACCBCBAACBCCABACAACBCBCBAAACCBCBBBAAACBACCBBCCBBACABACABCCBBACBCBACABBCCCACACCCBBCAACBAAACCCAABBAABCBABBCABBACCBBABCABAAABCCACBABBCCCBBCABACCBAACBBABACAABACAACCBCAAABBAABCABCCAAAABCAABBAAACCAAACACCAAAAAACAAACCAACAACCCCCAAAAAAAAAACACABBBBCAACCAAAAAAAACCCCCCAAACCCCAACCACBCCAAAABCABBBBBBBACBAABACBBCABBBBCAAABABCBAABCABBAAAABABAACAABBBCCCCAAABAACBBCBAACBBCABBCtABCAABAAABCBhCAABCBBBAeCB qCuBiCAcCkA BBbBBrBBownAAAA ACBfox!"
+  dom2 "BBAAAAAABBBBBABABBABBABBABBAAABABBBABAAAAABBAABBAABBAAAABABABBACACCABABABBBAAABBCBBBAACBAAAABBBAACCBCBAABBBBBBBAAAACCCACBABBAAAABABAAABAAAACAABABAAAACCBCBBBACBBACAAABAAACCCCBACCAACAAACBAABAABBCBBBABAABCABBCBBCBCBBBAABBBCCBACABAABAABBCABBBBCAABCACBABCCBCBCCAAAABAABCABACAACBAACCBCBAACBCCABACAACBCBCBAAACCBCBBBAAACBACCBBCCBBACABACABCCBBACBCBACABBCCCACACCCBBCAACBAAACCCAABBAABCBABBCABBACCBBABCABAAABCCACBABBCCCBBCABACCBAACBBABACAABACAACCBCAAABBAABCABCCAAAABCAABBAAACCAAACACCAAAAAACAAACCAACAACCCCCAAAAAAAAAACACABBBBCAACCAAAAAAAACCCCCCAAACCCCAACCACBCCAAAABCABBBBBBBACBAABACBBCABBBBCAAABABCBAABCABBAAAABABAACAABBBCCCCAAABAACBBCBAACBBCABBCtABCAABAAABCBhCAABCBBBAeCB qCuBiCAcCkA BBbBBrBBownAAAA ACBfox!"
+  replay.text "BBAAAAAABBBBBABABBABBABBABBAAABABBBABAAAAABBAABBAABBAAAABABABBACACCABABABBBAAABBCBBBAACBAAAABBBAACBBCBCBAABBBBBBBAAAABCCCACBABBAAAABABAAABAAAACAABABAAAACCBCBBBACBBACAAABAAACCCCBACCAACAAACBAABAABBCBBBABAABCABBCBBCBCBBBAABBBCCBACABAABAABBCABBBBCAABCACBABCCBCBCCAAAABAABCABACAACBAACCBCBAACBCCABACAACBCBCBAAACCBCBBBAAACBACCBBCCBBACABACABCCBBACBCBACABBCCCACACCCBBCAACBAAACCCAABBAABCBABBCABBACCBBABCABAAABCCACBABBCCCBBCABACCBAACBBABACAABACAACCBCAAABBAABCABCCAAAABCAABBAAACCAAACACCAAAAAACAAACCAACAACCCCCAAAAAAAAAACACABBBBCAACCAAAAAAAACCCCCCAAACCCCAACCACBCCAAAABCABBBBBBBACBAABACBBCABBBBCAAABABCBAABCABBAAAABABAACAABBBCCCCAAABAACBBCBAACBBCABBCtABCAABAAABCBhCAABCBBBAeCB qCuBiCAcCkA BBbBBrBBownAAAA ACBfox!"
+{"ts":"2026-08-31T11:32:55.522Z","level":"info","message":"ws.disconnect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"199657dc-f89d-4b21-9ee2-05f06938e02b","code":1001}
+{"ts":"2026-08-31T11:32:55.697Z","level":"info","message":"ws.disconnect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"e870ffbd-a172-495c-9629-c23bfaf4861c","code":1001}
+{"ts":"2026-08-31T11:32:55.821Z","level":"info","message":"ws.disconnect","documentId":"b2632414-1437-413c-9d55-e9de05c1dd1a","sessionId":"b396429e-3d74-4275-9473-684727dfbd63","code":1001}
+{"ts":"2026-08-31T11:32:57.484Z","level":"info","message":"server.listening","port":60118}
+{"ts":"2026-08-31T11:33:08.230Z","level":"info","message":"ws.open","sessionId":"0f99a0fb-d257-4e70-9029-6daa52e87e6a"}
+{"ts":"2026-08-31T11:33:08.315Z","level":"info","message":"ws.open","sessionId":"2b1e6a55-29ad-4215-b38c-215a9b344d85"}
+{"ts":"2026-08-31T11:33:08.337Z","level":"info","message":"ws.connect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"0f99a0fb-d257-4e70-9029-6daa52e87e6a","replicaId":1}
+{"ts":"2026-08-31T11:33:08.501Z","level":"info","message":"ws.connect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"2b1e6a55-29ad-4215-b38c-215a9b344d85","replicaId":2}
+{"ts":"2026-08-31T11:33:08.587Z","level":"info","message":"ws.syncComplete","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"0f99a0fb-d257-4e70-9029-6daa52e87e6a","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:33:08.718Z","level":"info","message":"ws.syncComplete","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"2b1e6a55-29ad-4215-b38c-215a9b344d85","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:33:10.846Z","level":"info","message":"ws.open","sessionId":"d7b4fa45-30b2-4357-a447-1322d4d57cd3"}
+{"ts":"2026-08-31T11:33:10.968Z","level":"info","message":"ws.connect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"d7b4fa45-30b2-4357-a447-1322d4d57cd3","replicaId":3}
+{"ts":"2026-08-31T11:33:11.250Z","level":"info","message":"ws.syncComplete","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"d7b4fa45-30b2-4357-a447-1322d4d57cd3","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:33:25.206Z","level":"warn","message":"presence.stale","sessionId":"d7b4fa45-30b2-4357-a447-1322d4d57cd3","replicaId":3,"thresholdMs":8000}
+{"ts":"2026-08-31T11:33:42.561Z","level":"info","message":"presence.fresh","sessionId":"d7b4fa45-30b2-4357-a447-1322d4d57cd3","replicaId":3}
+{"ts":"2026-08-31T11:33:43.514Z","level":"info","message":"ws.disconnect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"d7b4fa45-30b2-4357-a447-1322d4d57cd3","code":1005}
+{"ts":"2026-08-31T11:33:46.580Z","level":"info","message":"ws.open","sessionId":"900fe876-c2de-444a-b644-d0ea5de78d2e"}
+{"ts":"2026-08-31T11:33:46.737Z","level":"info","message":"ws.connect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"900fe876-c2de-444a-b644-d0ea5de78d2e","replicaId":4}
+{"ts":"2026-08-31T11:33:46.975Z","level":"info","message":"ws.syncComplete","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"900fe876-c2de-444a-b644-d0ea5de78d2e","lastServerSeq":340,"resentCount":0}
+[NATIVE routeWebSocket ~150ms] iter 1 duration=60000ms: OK len=660 pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:34:15.074Z","level":"info","message":"ws.disconnect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"0f99a0fb-d257-4e70-9029-6daa52e87e6a","code":1001}
+{"ts":"2026-08-31T11:34:15.107Z","level":"info","message":"ws.disconnect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"2b1e6a55-29ad-4215-b38c-215a9b344d85","code":1001}
+{"ts":"2026-08-31T11:34:15.284Z","level":"info","message":"ws.disconnect","documentId":"a8946ba7-8979-43b0-ad0a-1c137c1262e0","sessionId":"900fe876-c2de-444a-b644-d0ea5de78d2e","code":1001}
+{"ts":"2026-08-31T11:34:16.574Z","level":"info","message":"server.listening","port":59793}
+{"ts":"2026-08-31T11:34:23.254Z","level":"info","message":"ws.open","sessionId":"e5cbb2bb-de77-4608-a375-2fe57f616b1f"}
+{"ts":"2026-08-31T11:34:23.272Z","level":"info","message":"ws.open","sessionId":"5326433f-ae5d-444b-ab01-72ee76315b29"}
+{"ts":"2026-08-31T11:34:23.372Z","level":"info","message":"ws.connect","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"5326433f-ae5d-444b-ab01-72ee76315b29","replicaId":1}
+{"ts":"2026-08-31T11:34:23.377Z","level":"info","message":"ws.connect","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"e5cbb2bb-de77-4608-a375-2fe57f616b1f","replicaId":2}
+{"ts":"2026-08-31T11:34:23.569Z","level":"info","message":"ws.syncComplete","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"5326433f-ae5d-444b-ab01-72ee76315b29","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:34:23.593Z","level":"info","message":"ws.syncComplete","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"e5cbb2bb-de77-4608-a375-2fe57f616b1f","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:34:24.427Z","level":"info","message":"ws.open","sessionId":"eb228a50-772d-4edf-bdc0-25dbd5915b60"}
+{"ts":"2026-08-31T11:34:24.566Z","level":"info","message":"ws.connect","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"eb228a50-772d-4edf-bdc0-25dbd5915b60","replicaId":3}
+{"ts":"2026-08-31T11:34:24.798Z","level":"info","message":"ws.syncComplete","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"eb228a50-772d-4edf-bdc0-25dbd5915b60","lastServerSeq":0,"resentCount":0}
+[NATIVE routeWebSocket ~150ms] iter 2 duration=60000ms: SERVER-CRASH: Error: integrate(): Case C reached with candidate 293:3 whose destination would have moved past 290:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=777 pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:35:28.715Z","level":"info","message":"ws.disconnect","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"e5cbb2bb-de77-4608-a375-2fe57f616b1f","code":1001}
+{"ts":"2026-08-31T11:35:28.760Z","level":"info","message":"ws.disconnect","documentId":"22a50a50-ee25-438b-8212-b6aa594c13d2","sessionId":"5326433f-ae5d-444b-ab01-72ee76315b29","code":1001}
+{"ts":"2026-08-31T11:35:30.121Z","level":"warn","message":"presence.stale","sessionId":"eb228a50-772d-4edf-bdc0-25dbd5915b60","replicaId":3,"thresholdMs":8000}
+{"ts":"2026-08-31T11:35:30.943Z","level":"info","message":"server.listening","port":59369}
+{"ts":"2026-08-31T11:35:42.824Z","level":"info","message":"ws.open","sessionId":"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c"}
+{"ts":"2026-08-31T11:35:42.931Z","level":"info","message":"ws.connect","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c","replicaId":1}
+{"ts":"2026-08-31T11:35:43.153Z","level":"info","message":"ws.syncComplete","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:35:43.367Z","level":"info","message":"ws.open","sessionId":"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45"}
+{"ts":"2026-08-31T11:35:43.518Z","level":"info","message":"ws.connect","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45","replicaId":2}
+{"ts":"2026-08-31T11:35:43.764Z","level":"info","message":"ws.syncComplete","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:35:45.965Z","level":"info","message":"ws.open","sessionId":"0535154b-5f92-48c1-be30-e2c444775a17"}
+{"ts":"2026-08-31T11:35:46.109Z","level":"info","message":"ws.connect","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"0535154b-5f92-48c1-be30-e2c444775a17","replicaId":3}
+{"ts":"2026-08-31T11:35:46.417Z","level":"info","message":"ws.syncComplete","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"0535154b-5f92-48c1-be30-e2c444775a17","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:36:27.544Z","level":"warn","message":"presence.stale","sessionId":"0535154b-5f92-48c1-be30-e2c444775a17","replicaId":3,"thresholdMs":8000}
+[NATIVE routeWebSocket ~150ms] iter 3 duration=60000ms: SERVER-CRASH: Error: integrate(): Case C reached with candidate 179:3 whose destination would have moved past 175:2 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01). len=697 pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:36:50.105Z","level":"info","message":"ws.disconnect","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"1215b484-6ca7-46fa-8b9f-f737cb6f7f9c","code":1001}
+{"ts":"2026-08-31T11:36:50.167Z","level":"info","message":"ws.disconnect","documentId":"84f124af-735f-4ed3-8773-4c16bdcb0525","sessionId":"ad8fa824-6c1b-4ad4-ad79-b41c70bbde45","code":1001}
+{"ts":"2026-08-31T11:36:51.433Z","level":"info","message":"server.listening","port":63829}
+{"ts":"2026-08-31T11:36:59.947Z","level":"info","message":"ws.open","sessionId":"154b81e3-2c88-4e25-8e73-9af7b944d7c1"}
+{"ts":"2026-08-31T11:37:00.052Z","level":"info","message":"ws.connect","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"154b81e3-2c88-4e25-8e73-9af7b944d7c1","replicaId":1}
+{"ts":"2026-08-31T11:37:00.294Z","level":"info","message":"ws.open","sessionId":"a9e4bcd9-58d4-4cb1-9db7-ed3faea6d4d9"}
+{"ts":"2026-08-31T11:37:00.306Z","level":"info","message":"ws.syncComplete","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"154b81e3-2c88-4e25-8e73-9af7b944d7c1","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:37:00.418Z","level":"info","message":"ws.connect","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"a9e4bcd9-58d4-4cb1-9db7-ed3faea6d4d9","replicaId":2}
+{"ts":"2026-08-31T11:37:00.635Z","level":"info","message":"ws.syncComplete","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"a9e4bcd9-58d4-4cb1-9db7-ed3faea6d4d9","lastServerSeq":0,"resentCount":0}
+{"ts":"2026-08-31T11:37:02.015Z","level":"info","message":"ws.open","sessionId":"7ce232d2-e783-45cb-8996-51a2f063d39a"}
+{"ts":"2026-08-31T11:37:02.161Z","level":"info","message":"ws.connect","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"7ce232d2-e783-45cb-8996-51a2f063d39a","replicaId":3}
+{"ts":"2026-08-31T11:37:02.391Z","level":"info","message":"ws.syncComplete","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"7ce232d2-e783-45cb-8996-51a2f063d39a","lastServerSeq":0,"resentCount":0}
+[NATIVE routeWebSocket ~150ms] iter 4 duration=60000ms: OK len=864 pending=[0,0,0] replayOk=true 
+{"ts":"2026-08-31T11:38:05.875Z","level":"info","message":"ws.disconnect","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"154b81e3-2c88-4e25-8e73-9af7b944d7c1","code":1001}
+{"ts":"2026-08-31T11:38:05.926Z","level":"info","message":"ws.disconnect","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"a9e4bcd9-58d4-4cb1-9db7-ed3faea6d4d9","code":1001}
+{"ts":"2026-08-31T11:38:06.037Z","level":"info","message":"ws.disconnect","documentId":"d8079025-180b-4ea1-8c4b-dcf7282a00c2","sessionId":"7ce232d2-e783-45cb-8996-51a2f063d39a","code":1001}
+
+2/5 passed at duration=60000ms (NATIVE routeWebSocket ~150ms RTT)

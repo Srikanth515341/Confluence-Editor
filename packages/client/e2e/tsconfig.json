@@ -3,7 +3,10 @@
   "compilerOptions": {
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["@playwright/test", "node"],
-    "noEmit": true
+    "noEmit": true,
+    // Phase 14: e2e/support/testAppServer.ts imports scripts/serveApp.mjs (plain JS, no .d.ts) —
+    // allowJs lets tsc resolve it instead of erroring "could not find a declaration file."
+    "allowJs": true
   },
-  "include": ["."]
+  "include": [".", "../scripts/serveApp.mjs"]
 }

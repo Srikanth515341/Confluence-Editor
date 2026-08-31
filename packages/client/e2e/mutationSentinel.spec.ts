@@ -52,7 +52,7 @@ async function setupHarness(page: import("@playwright/test").Page): Promise<void
     const editor = document.getElementById("editor")!;
     const domWriter = new window.InputHarness.DomWriter();
     const sync = new window.InputHarness.SyncClient({ url: "ws://unused", documentId: "doc" });
-    sync.engine = new window.InputHarness.Engine(1);
+    sync.seedForTesting(new window.InputHarness.Engine(1));
     const sentinel = new window.InputHarness.MutationSentinel({
       root: editor,
       domWriter,

@@ -1,4 +1,4 @@
-import { Engine } from "@collab-editor/engine";
+import { Engine, type Operation } from "@collab-editor/engine";
 import { SessionRole, type ParticipantInfo } from "@collab-editor/protocol";
 import type { ConnectionSendQueues } from "./sendQueues.js";
 
@@ -31,6 +31,15 @@ export interface CoordinatorSession {
   presenceStale: boolean;
   /** The pending presence-stale timeout, so a new PING can cancel and restart it. `undefined` before the first PING/join. */
   staleTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Diagnostic-only counter (not part of any phase's Scope-IN): total frames
+   * received from this connection (any channel), incremented in gateway.ts.
+   * Added while root-causing a Firefox-specific silent divergence found
+   * during Phase 14 DoD verification (tests/regression/R0001-R0007) — lets
+   * a client's own reported send-call count be compared directly against
+   * how many of those sends the server actually saw arrive.
+   */
+  receivedFrameCount: number;
 }
 
 /**
@@ -54,6 +63,25 @@ export class DocumentCoordinator {
   opsSinceSnap = 0;
   /** Scaffolding for Phase 17 (snapshotting). Unused this phase. */
   lastSnapAt: Date | null = null;
+
+  /**
+   * Every operation this coordinator has ever ingested, in ingestion order
+   * (gateway.ts's `ingestOperation`, appended AFTER `applyRemote` — see that
+   * call site's own comment for why append order there is safe to replay
+   * later regardless of cross-connection interleaving). NOT persistence
+   * (Phases 15-17 own that) — this is an in-memory-only recording that
+   * exists specifically so `/v1/documents/:id/replay` (httpApp.ts) can
+   * reconstruct the document from scratch in a BRAND NEW `Engine`,
+   * independent of this coordinator's own live-incrementally-applied
+   * `engine` instance. Test Plan §2.7 E2E-CONV-01 assertion 3 needs exactly
+   * this independence: comparing a client's DOM against this coordinator's
+   * own already-running `engine` would only ever catch a bug in ingestion,
+   * never a bug shared between the client's and server's identical `Engine`
+   * code — replaying into a FRESH engine from the raw log is the same
+   * "ground truth" argument, just harder for a subtly-corrupted live
+   * instance to fake.
+   */
+  readonly operationLog: Operation[] = [];
 
   private readonly sessions = new Map<string, CoordinatorSession>();
   private nextReplicaId = 1;
@@ -120,6 +148,15 @@ export class DocumentCoordinator {
       replicaId: s.replicaId,
       userId: s.userId,
       displayName: s.displayName,
+    }));
+  }
+
+  /** Diagnostic-only (see CoordinatorSession.receivedFrameCount's doc comment). */
+  listReceivedFrameCounts(): Array<{ replicaId: number; sessionId: string; receivedFrameCount: number }> {
+    return Array.from(this.sessions.values(), (s) => ({
+      replicaId: s.replicaId,
+      sessionId: s.sessionId,
+      receivedFrameCount: s.receivedFrameCount,
     }));
   }
 }

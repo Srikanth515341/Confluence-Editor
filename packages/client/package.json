@@ -9,9 +9,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p e2e/tsconfig.json",
     "build": "tsc -p tsconfig.json",
+    "dev": "node scripts/serveApp.mjs",
     "test:e2e:build": "node e2e/build-bundle.mjs",
     "test:e2e": "pnpm run test:e2e:build && playwright test",
-    "test:e2e:install": "playwright install chromium firefox webkit"
+    "test:e2e:install": "playwright install chromium firefox webkit",
+    "test:e2e:conv": "playwright test --project=convergence"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*",
@@ -25,9 +27,11 @@
     "@types/node": "^20.16.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.5.12",
     "esbuild": "^0.24.0",
     "fast-check": "^4.9.0",
     "jsdom": "^25.0.1",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "ws": "^8.18.0"
   }
 }
