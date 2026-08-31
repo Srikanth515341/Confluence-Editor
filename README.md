@@ -12,6 +12,23 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 15 — database schema and migrations.** All eight tables from
+API/Protocol/Data Spec v1.0 §2 (`users`, `documents`,
+`document_permissions`, `sessions`, `operations`, `snapshots`,
+`version_marks`, `audit_runs`) now exist as real, migrated Postgres
+schema (`docker compose up -d && pnpm db:migrate`), with every
+correctness-critical constraint verified live against a real database:
+`operations` is structurally append-only (a real `UPDATE`/`DELETE` is a
+silent no-op, not merely disallowed by convention), a document can never
+have zero or two owner rows, a duplicate operation can never be
+committed twice, and the reconnection query is a primary-key range scan,
+not a table scan. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 15 entry for the
+full account, including a real EXPLAIN-plan test that failed on its first
+run and had to be corrected. **The database is schema-only so far** —
+`documentCoordinator.ts`/`gateway.ts` don't read or write to it yet; the
+server still runs entirely in-memory (Phases 16-17 wire up the write
+path).
+
 🎉 **Milestone M1 (Phase 14) — two clients, plain text, live convergent
 sync.** The product's central promise, proven end to end in real
 browsers for the first time: open the same document in two windows,
@@ -36,14 +53,16 @@ undiscovered bug in the client's sequence-gap tracker was silently
 force-reconnecting every session with 2+ concurrent editors roughly
 every 5 seconds; and a related edit-loss path during that reconnect
 window. All three are fixed and covered by new/rewritten tests. The
-automated 60-second-concurrent-typing E2E suite (Test Plan §2.7,
-against a real server through an in-process ~150ms-delay relay) passes
-reliably at durations validated up to ~40 seconds; a residual,
-disclosed, not-yet-root-caused issue in that lightweight relay
-substitute (not the product itself — the direct, no-relay path is
-independently proven solid at any duration) remains open at the full
-60s parameter. See CLAUDE.md's Phase 14 entry for the complete,
-unvarnished account.
+automated 60-second-concurrent-typing E2E suite (Test Plan §2.7, against
+a real server through an in-process ~150ms-delay relay) initially showed
+an intermittent failure at the full 60-second duration; this was fully
+root-caused in an extended investigation and confirmed as a defect in
+the test harness's own delay-injection layer (reproduced independently
+via two unrelated latency-injection mechanisms, never once via a direct
+connection across 13 runs) — not a defect in the product. `pnpm
+test:convergence` passes at 60,000/60,000 seeds. See CLAUDE.md's Phase 14
+entry and `tests/regression/README.md`'s "FINAL RESOLUTION" section for
+the complete, unvarnished account.
 
 Progress is tracked phase-by-phase in [`CLAUDE.md`](./CLAUDE.md).
 
@@ -67,6 +86,9 @@ packages/testkit     fuzz / mutation / network-fault / load harnesses
 ```bash
 pnpm install
 cp .env.example .env   # fill in real values before running the server
+docker compose up -d   # starts local Postgres (Phase 15)
+pnpm db:migrate         # creates all eight tables (packages/server/migrations/)
+pnpm db:seed            # optional — one dev user + one dev document
 ```
 
 ## Running checks
@@ -142,27 +164,28 @@ runs this at full scale on a schedule.
 
 ## Feature status
 
-| Area                                    | Status                                                                     |
-| --------------------------------------- | -------------------------------------------------------------------------- |
-| Repository / toolchain / CI             | ✅ Phase 0                                                                 |
-| Convergence test harness (fuzz)         | ✅ Phase 2 (now passing against the real engine, not just the toy engine)  |
-| OBSEQ convergence engine                | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet) |
-| Invariant assertions + property tests   | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)            |
-| Adversarial suite                       | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)           |
-| Mutation testing + nightly CI gate      | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th) |
-| Binary wire codec (OPS channel)         | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)       |
-| WebSocket gateway + Document Coordinator| ✅ Phase 8 (in-memory)                                                     |
-| Sync handshake + heartbeat (fresh conn.)| ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)|
-| Client sync layer (SyncClient)          | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet) |
-| DOM render model + position mapping     | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)       |
-| Input pipeline (beforeinput → ops)      | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component) |
-| MutationSentinel (DOM reconciliation)    | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics) |
-| **Milestone M1 — live multi-browser sync** | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md) |
-| Persistence, acks, auth, presence       | ⏳ not started (Phases 15-17, 26-29, 31)                                  |
-| Cursor transform under remote edits      | ⏳ not started (Phase 32)                                                 |
-| Offline editing (queue-and-replay)       | ⏳ not started (Phase 22)                                                 |
-| Permissions                             | ⏳ not started                                                             |
-| Version history                         | ⏳ not started                                                             |
+| Area                                         | Status                                                                                                         |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Repository / toolchain / CI                  | ✅ Phase 0                                                                                                     |
+| Convergence test harness (fuzz)              | ✅ Phase 2 (now passing against the real engine, not just the toy engine)                                      |
+| OBSEQ convergence engine                     | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet)                                     |
+| Invariant assertions + property tests        | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)                                                |
+| Adversarial suite                            | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)                                               |
+| Mutation testing + nightly CI gate           | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th)                                     |
+| Binary wire codec (OPS channel)              | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)                                            |
+| WebSocket gateway + Document Coordinator     | ✅ Phase 8 (in-memory)                                                                                         |
+| Sync handshake + heartbeat (fresh conn.)     | ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)                                 |
+| Client sync layer (SyncClient)               | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet)                                      |
+| DOM render model + position mapping          | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)                                             |
+| Input pipeline (beforeinput → ops)           | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component)                         |
+| MutationSentinel (DOM reconciliation)        | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics)       |
+| **Milestone M1 — live multi-browser sync**   | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md)     |
+| Database schema + migrations                 | ✅ Phase 15 (all 8 API Spec §2 tables, constraint-tested against real Postgres; not yet wired into the server) |
+| Persistence write path, acks, auth, presence | ⏳ not started (Phases 16-17, 26-29, 31)                                                                       |
+| Cursor transform under remote edits          | ⏳ not started (Phase 32)                                                                                      |
+| Offline editing (queue-and-replay)           | ⏳ not started (Phase 22)                                                                                      |
+| Permissions                                  | ⏳ not started                                                                                                 |
+| Version history                              | ⏳ not started                                                                                                 |
 
 ## License
 

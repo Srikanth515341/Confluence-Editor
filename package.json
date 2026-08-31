@@ -19,7 +19,12 @@
     "test:properties": "pnpm --filter @collab-editor/testkit run test:properties",
     "test:adversarial": "pnpm --filter @collab-editor/testkit run test:adversarial",
     "test:mutation": "pnpm --filter @collab-editor/testkit run test:mutation",
+    "test:db": "pnpm --filter @collab-editor/server run test:db",
     "check:purity": "node scripts/check-engine-purity.mjs",
+    "db:migrate": "pnpm --filter @collab-editor/server run db:migrate",
+    "db:migrate:down": "pnpm --filter @collab-editor/server run db:migrate:down",
+    "db:reset": "pnpm --filter @collab-editor/server run db:reset",
+    "db:seed": "pnpm --filter @collab-editor/server run db:seed",
     "build": "pnpm -r --if-present run build",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
