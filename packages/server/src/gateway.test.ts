@@ -195,9 +195,12 @@ describe("Sync handshake — fresh connection (API Spec §3.6.1-§3.6.3, §3.6.8
     const { port } = await startServer();
     const documentId = randomUUID();
 
-    // Client A joins first and inserts some content.
-    const { ws: wsA } = await connectAndHandshake(port, documentId);
-    const engineA = new Engine(101);
+    // Client A joins first and inserts some content. Its local Engine MUST use the replica id
+    // the server actually assigned (welcome.replicaId), not an arbitrary fixed one — Phase 16's
+    // write path verifies stamp.r === session.replica_id (API Spec §6.3 step 2) and rejects
+    // anything else.
+    const { ws: wsA, welcome: welcomeA } = await connectAndHandshake(port, documentId);
+    const engineA = new Engine(welcomeA.replicaId);
     for (const value of [0x68, 0x69]) {
       // "hi"
       const op = engineA.localInsert(engineA.text().length, value);
@@ -284,11 +287,17 @@ describe("Two clients, one document — operations reach the other peer and both
     const { port } = await startServer();
     const documentId = randomUUID();
 
-    const { ws: wsA } = await connectAndHandshake(port, documentId);
-    const { ws: wsB, frames: framesB } = await connectAndHandshake(port, documentId);
+    const { ws: wsA, welcome: welcomeA } = await connectAndHandshake(port, documentId);
+    const {
+      ws: wsB,
+      frames: framesB,
+      welcome: welcomeB,
+    } = await connectAndHandshake(port, documentId);
 
-    const engineA = new Engine(101);
-    const engineB = new Engine(202);
+    // Must match the server-assigned replica ids — see the identity-mismatch comment on the
+    // previous test above.
+    const engineA = new Engine(welcomeA.replicaId);
+    const engineB = new Engine(welcomeB.replicaId);
 
     const opA = engineA.localInsert(0, 0x68); // 'h'
     sendInsert(wsA, opA);

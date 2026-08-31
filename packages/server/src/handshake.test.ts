@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SessionRole, SnapshotForm } from "@collab-editor/protocol";
+import { InMemoryOperationStore } from "./db/operationStore.js";
 import { assertSnapshotFormAllowed, buildSnapshotMessage } from "./handshake.js";
 import { DocumentCoordinator } from "./documentCoordinator.js";
 
@@ -33,7 +34,7 @@ describe("assertSnapshotFormAllowed (API Spec §3.6.3)", () => {
 
 describe("buildSnapshotMessage", () => {
   it("always builds form: STRUCTURE this phase, since every session's role is hardcoded to EDITOR", () => {
-    const coordinator = new DocumentCoordinator("doc-1");
+    const coordinator = new DocumentCoordinator("doc-1", new InMemoryOperationStore());
     const snapshot = buildSnapshotMessage(coordinator);
     expect(snapshot.form).toBe(SnapshotForm.STRUCTURE);
   });

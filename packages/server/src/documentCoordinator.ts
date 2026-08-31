@@ -1,5 +1,7 @@
 import { Engine, type Operation } from "@collab-editor/engine";
 import { SessionRole, type ParticipantInfo } from "@collab-editor/protocol";
+import type { AckBatcher } from "./ackBatcher.js";
+import type { OperationStore } from "./db/operationStore.js";
 import type { ConnectionSendQueues } from "./sendQueues.js";
 
 /**
@@ -20,6 +22,8 @@ export interface CoordinatorSession {
   readonly sessionId: string;
   readonly replicaId: number;
   readonly queues: ConnectionSendQueues;
+  /** Phase 16: coalesces this session's own OP_ACK entries (up to 64 entries or 20ms, whichever first) — see ackBatcher.ts. Constructed once at handshake time (gateway.ts), closed on disconnect. */
+  readonly ackBatcher: AckBatcher;
   /** Hardcoded EDITOR for every session this phase — real roles/auth are Phase 26-29 (API Spec §3.6.2). */
   readonly role: SessionRole;
   /** Placeholder UUID this phase — real users don't exist until Phase 26. */
@@ -53,8 +57,16 @@ export interface CoordinatorSession {
 export class DocumentCoordinator {
   readonly documentId: string;
   readonly engine = new Engine(SERVER_REPLICA_ID);
+  readonly operationStore: OperationStore;
 
-  /** API Spec §6.1: `currentSeq: bigint`. Assigned once per ingested OPS frame — see gateway.ts's ingest path for why frame-granularity, not per-underlying-operation. */
+  /**
+   * API Spec §6.1: `currentSeq: bigint`. Assigned PER OPERATION as of
+   * Phase 16, not per ingested frame — see writePath.ts's own doc comment
+   * for why the operations table's schema (one row per operation's
+   * stamp, Phase 15) forced this change from Phase 8's original
+   * per-frame numbering. A run/batch of N operations consumes N
+   * consecutive seq values.
+   */
   currentSeq = 0n;
 
   /** Per-replica last-acknowledged seq, updated on every PING's `lastAppliedSeq` (§3.6.11: "server updates the session's ... last-acked-seq on receipt"). Mirrors `sessions.last_ack_seq` — real persistence is Phase 16. */
@@ -83,11 +95,55 @@ export class DocumentCoordinator {
    */
   readonly operationLog: Operation[] = [];
 
+  /**
+   * Resolves once warm start (API Spec §6.2) has replayed the persisted
+   * log into `engine` and restored `currentSeq` from `documents.
+current_seq`. gateway.ts's handshake handler awaits this before
+   * completing HELLO, so no client can ever observe a coordinator's
+   * WELCOME/SNAPSHOT before its own warm start has finished — including
+   * the very first connection to a brand-new document, whose warm start
+   * still runs (and legitimately returns an empty log) so the
+   * documents/users provisioning in `operationStore.warmStart` always
+   * happens before any operation from that connection could be
+   * persisted.
+   */
+  readonly ready: Promise<void>;
+
   private readonly sessions = new Map<string, CoordinatorSession>();
   private nextReplicaId = 1;
 
-  constructor(documentId: string) {
+  constructor(documentId: string, operationStore: OperationStore) {
     this.documentId = documentId;
+    this.operationStore = operationStore;
+    this.ready = this.warmStart();
+  }
+
+  /**
+   * API Spec §6.2. Replays the persisted operation log (in seq order,
+   * which is causally valid order — see writePath.ts: an operation is
+   * only ever assigned a seq after `engine.applyRemote` already accepted
+   * it live, so replaying in that same order reproduces the same
+   * causal-readiness path) into a brand-new `engine`, then asserts the
+   * DoD's own requirement: `pendingCount() === 0`. A nonempty `pending`
+   * here means some persisted operation's causal dependency is MISSING
+   * from the log entirely (e.g. a row deleted directly from the table,
+   * bypassing this code path, or genuine corruption) — silently starting
+   * this coordinator with a partially-applied document would be worse
+   * than failing loudly before any client ever sees it, so this throws
+   * rather than continuing.
+   */
+  private async warmStart(): Promise<void> {
+    const { ops, currentSeq } = await this.operationStore.warmStart(this.documentId);
+    for (const op of ops) {
+      this.engine.applyRemote(op);
+      this.operationLog.push(op);
+    }
+    if (this.engine.pending.length !== 0) {
+      throw new Error(
+        `DocumentCoordinator.warmStart: ${this.engine.pending.length} operation(s) never became ready after replaying ${ops.length} persisted operations for document ${this.documentId} — the log is missing a causal dependency`,
+      );
+    }
+    this.currentSeq = currentSeq;
   }
 
   get sessionCount(): number {
@@ -152,7 +208,11 @@ export class DocumentCoordinator {
   }
 
   /** Diagnostic-only (see CoordinatorSession.receivedFrameCount's doc comment). */
-  listReceivedFrameCounts(): Array<{ replicaId: number; sessionId: string; receivedFrameCount: number }> {
+  listReceivedFrameCounts(): Array<{
+    replicaId: number;
+    sessionId: string;
+    receivedFrameCount: number;
+  }> {
     return Array.from(this.sessions.values(), (s) => ({
       replicaId: s.replicaId,
       sessionId: s.sessionId,
