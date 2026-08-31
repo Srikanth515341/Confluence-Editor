@@ -7,6 +7,7 @@ import {
   PRESENCE_STALE_MS,
 } from "./heartbeat.js";
 import type { CoordinatorSession } from "./documentCoordinator.js";
+import { AckBatcher } from "./ackBatcher.js";
 import { ConnectionSendQueues } from "./sendQueues.js";
 import { logger } from "./logger.js";
 import { SessionRole } from "@collab-editor/protocol";
@@ -19,6 +20,9 @@ function fakeSession(replicaId = 1): CoordinatorSession {
       () => Promise.resolve(),
       () => false,
     ),
+    // Phase 16's per-session ack batcher — this fixture never exercises acking, so a batcher
+    // whose flush callback is never invoked is a correct fixed value here.
+    ackBatcher: new AckBatcher(() => {}),
     role: SessionRole.EDITOR,
     userId: `user-${replicaId}`,
     displayName: `Guest ${replicaId}`,

@@ -12,22 +12,37 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 16 — operation log and acknowledgement-implies-durability.**
+Every operation is now durably committed to Postgres BEFORE its client
+is acknowledged (API/Protocol/Data Spec §6.3), while broadcasting to
+peers stays entirely off the database critical path — proven, not just
+asserted, by DUR-04: the same production write-path module run in a
+deliberately mutated ordering (ack fires before the commit) genuinely
+loses an acked operation under an injected crash, while the real
+ordering, under the identical crash injection, never does. A coordinator
+now warm-starts from the persisted operation log on (re)creation, with a
+live "every replayed operation became ready" assertion; a real server
+restart against the same database now genuinely preserves document
+content (verified through the actual server construction path, not just
+by reading the schema). Resolving this phase required navigating three
+real structural conflicts between already-committed designs — most
+notably, Postgres flatly refuses `INSERT ... ON CONFLICT` on the
+`operations` table because it carries the append-only RULEs Phase 15
+required verbatim, discovered only by actually running the write path
+against a real database. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 16 entry
+for the full account of all three.
+
 **Phase 15 — database schema and migrations.** All eight tables from
 API/Protocol/Data Spec v1.0 §2 (`users`, `documents`,
 `document_permissions`, `sessions`, `operations`, `snapshots`,
-`version_marks`, `audit_runs`) now exist as real, migrated Postgres
-schema (`docker compose up -d && pnpm db:migrate`), with every
+`version_marks`, `audit_runs`) exist as real, migrated Postgres schema
+(`docker compose up -d && pnpm db:migrate`), with every
 correctness-critical constraint verified live against a real database:
 `operations` is structurally append-only (a real `UPDATE`/`DELETE` is a
 silent no-op, not merely disallowed by convention), a document can never
 have zero or two owner rows, a duplicate operation can never be
 committed twice, and the reconnection query is a primary-key range scan,
-not a table scan. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 15 entry for the
-full account, including a real EXPLAIN-plan test that failed on its first
-run and had to be corrected. **The database is schema-only so far** —
-`documentCoordinator.ts`/`gateway.ts` don't read or write to it yet; the
-server still runs entirely in-memory (Phases 16-17 wire up the write
-path).
+not a table scan.
 
 🎉 **Milestone M1 (Phase 14) — two clients, plain text, live convergent
 sync.** The product's central promise, proven end to end in real
@@ -76,7 +91,7 @@ Playwright · Docker · GitHub Actions.
 ```
 packages/engine      OBSEQ convergence engine — pure, no I/O, no DOM
 packages/protocol    binary wire codec + message types (shared client/server)
-packages/server      Express + WebSocket gateway + coordinator + persistence
+packages/server      Express + WebSocket gateway + coordinator + real Postgres persistence
 packages/client      React app + editor binding (DomWriter, cursors, presence)
 packages/testkit     fuzz / mutation / network-fault / load harnesses
 ```
@@ -164,28 +179,29 @@ runs this at full scale on a schedule.
 
 ## Feature status
 
-| Area                                         | Status                                                                                                         |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Repository / toolchain / CI                  | ✅ Phase 0                                                                                                     |
-| Convergence test harness (fuzz)              | ✅ Phase 2 (now passing against the real engine, not just the toy engine)                                      |
-| OBSEQ convergence engine                     | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet)                                     |
-| Invariant assertions + property tests        | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)                                                |
-| Adversarial suite                            | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)                                               |
-| Mutation testing + nightly CI gate           | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th)                                     |
-| Binary wire codec (OPS channel)              | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)                                            |
-| WebSocket gateway + Document Coordinator     | ✅ Phase 8 (in-memory)                                                                                         |
-| Sync handshake + heartbeat (fresh conn.)     | ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)                                 |
-| Client sync layer (SyncClient)               | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet)                                      |
-| DOM render model + position mapping          | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)                                             |
-| Input pipeline (beforeinput → ops)           | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component)                         |
-| MutationSentinel (DOM reconciliation)        | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics)       |
-| **Milestone M1 — live multi-browser sync**   | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md)     |
-| Database schema + migrations                 | ✅ Phase 15 (all 8 API Spec §2 tables, constraint-tested against real Postgres; not yet wired into the server) |
-| Persistence write path, acks, auth, presence | ⏳ not started (Phases 16-17, 26-29, 31)                                                                       |
-| Cursor transform under remote edits          | ⏳ not started (Phase 32)                                                                                      |
-| Offline editing (queue-and-replay)           | ⏳ not started (Phase 22)                                                                                      |
-| Permissions                                  | ⏳ not started                                                                                                 |
-| Version history                              | ⏳ not started                                                                                                 |
+| Area                                       | Status                                                                                                     |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Repository / toolchain / CI                | ✅ Phase 0                                                                                                 |
+| Convergence test harness (fuzz)            | ✅ Phase 2 (now passing against the real engine, not just the toy engine)                                  |
+| OBSEQ convergence engine                   | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet)                                 |
+| Invariant assertions + property tests      | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)                                            |
+| Adversarial suite                          | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)                                           |
+| Mutation testing + nightly CI gate         | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th)                                 |
+| Binary wire codec (OPS channel)            | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)                                        |
+| WebSocket gateway + Document Coordinator   | ✅ Phase 8 (in-memory)                                                                                     |
+| Sync handshake + heartbeat (fresh conn.)   | ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)                             |
+| Client sync layer (SyncClient)             | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet)                                  |
+| DOM render model + position mapping        | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)                                         |
+| Input pipeline (beforeinput → ops)         | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component)                     |
+| MutationSentinel (DOM reconciliation)      | ✅ Phase 13 (MutationObserver-based revert of any non-DomWriter mutation, reconciliation/desync metrics)   |
+| **Milestone M1 — live multi-browser sync** | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md) |
+| Database schema + migrations               | ✅ Phase 15 (all 8 API Spec §2 tables, constraint-tested against real Postgres)                            |
+| Operation log + durable acknowledgement    | ✅ **Phase 16** (broadcast before commit, ack after — DUR-04-tested; warm start from the persisted log)    |
+| Snapshotting, auth, presence               | ⏳ not started (Phase 17, 26-29, 31)                                                                       |
+| Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
+| Offline editing (queue-and-replay)         | ⏳ not started (Phase 22)                                                                                  |
+| Permissions                                | ⏳ not started                                                                                             |
+| Version history                            | ⏳ not started                                                                                             |
 
 ## License
 

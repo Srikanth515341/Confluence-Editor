@@ -1,7 +1,7 @@
-// Express + WebSocket gateway, Document Coordinator (in-memory, Phase 8).
-// Persistence (Phases 15-17) and auth (Phases 26-29) are not built yet —
-// state lives only in memory and is lost on restart, which is correct for
-// this phase (Scope-IN: "In-memory only").
+// Express + WebSocket gateway, Document Coordinator. Persistence is real
+// as of Phase 16 (operations are durably committed before being
+// acknowledged — API Spec §6.3) when run directly, below, via a real
+// `PostgresOperationStore`; auth (Phases 26-29) is still not built.
 
 export const SERVER_PACKAGE_NAME = "@collab-editor/server";
 
@@ -30,9 +30,23 @@ export {
   buildSnapshotMessage,
   buildWelcomeMessage,
 } from "./handshake.js";
+export {
+  InMemoryOperationStore,
+  PostgresOperationStore,
+  type OperationStore,
+} from "./db/operationStore.js";
+export { createPool, type DbPool } from "./db/pool.js";
+export { AckBatcher } from "./ackBatcher.js";
+export {
+  isAckBeforeCommitMutationActive,
+  processIncomingOperation,
+  type WritePathTestHooks,
+} from "./writePath.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
+import { createPool } from "./db/pool.js";
+import { PostgresOperationStore } from "./db/operationStore.js";
 import { createCollabServer } from "./server.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
@@ -49,6 +63,10 @@ import { createCollabServer } from "./server.js";
 // `createCollabServer()` directly and never exercise this branch at all).
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const config = loadConfig();
-  const server = createCollabServer();
+  // Real persistence (Phase 16) — every server test still defaults to
+  // InMemoryOperationStore (server.ts's own default); only an actually-run
+  // server ever talks to a real database.
+  const operationStore = new PostgresOperationStore(createPool(config.databaseUrl));
+  const server = createCollabServer({ operationStore });
   void server.listen(config.port);
 }

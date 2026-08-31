@@ -171,7 +171,47 @@ packages/server      @collab-editor/server    — Express + WebSocket gateway, D
                                                  (new script, using `tsx`, new devDependency)
                                                  for the milestone's manual demo. Fixed via
                                                  `pathToFileURL(process.argv[1])`, the portable
-                                                 comparison. Depends on engine + protocol.
+                                                 comparison. Phase 15 added the database schema
+                                                 (API Spec §2, all eight tables) via
+                                                 node-pg-migrate migrations (`migrations/`), a
+                                                 `pg.Pool` wrapper (`src/db/pool.ts`), a seed
+                                                 script (`scripts/seed.ts`), and a DoD test suite
+                                                 run against a real Postgres instance
+                                                 (`src/db/schema.db.test.ts`, `pnpm test:db`) —
+                                                 not yet wired into `documentCoordinator.ts`/
+                                                 `gateway.ts` at that point. Phase 16 wired it in
+                                                 for real: `src/writePath.ts`
+                                                 (`processIncomingOperation` — API Spec §6.3's
+                                                 nine-step write path, broadcast before the
+                                                 transaction, ack from inside its success
+                                                 continuation, the `MUTATE_ACK_BEFORE_COMMIT`
+                                                 DUR-04 mutation switch); `src/ackBatcher.ts`
+                                                 (`AckBatcher`, 64 entries or 20ms); `src/db/
+operationStore.ts` (`OperationStore` interface,
+                                                 `PostgresOperationStore` for production,
+                                                 `InMemoryOperationStore` — the new default for
+                                                 every pre-Phase-16 test, keeping `pnpm test`
+                                                 infra-free — plus the SAVEPOINT-based duplicate
+                                                 suppression `commitOperations` needed once
+                                                 `ON CONFLICT` turned out to be illegal on a
+                                                 ruled table, and the users/documents/sessions
+                                                 auto-provisioning warm start and every commit
+                                                 depend on). `documentCoordinator.ts` gained a
+                                                 `ready: Promise<void>` (warm start, replaying
+                                                 the persisted log with a live `pendingCount()
+=== 0` assertion) and `currentSeq` became
+                                                 per-OPERATION, not per-frame (see that phase's
+                                                 own entry for why the schema forced this).
+                                                 `gateway.ts`'s handshake is now `async`,
+                                                 awaiting a coordinator's warm start before
+                                                 admitting any client. New DB-gated tests:
+                                                 `src/db/durability.db.test.ts` (DUR-04, ack
+                                                 batching, ON-CONFLICT-equivalent dedup, the
+                                                 broadcast-latency-unaffected-by-a-slow-database
+                                                 check) and `src/db/serverRestart.db.test.ts`
+                                                 (a real `createCollabServer()` restart, proving
+                                                 the DoD's headline claim end to end). Depends on
+                                                 engine + protocol.
 packages/client       @collab-editor/client   — React app + editor binding
                                                  (DomWriter, input pipeline, presence).
                                                  The only package with DOM lib types. Phase
@@ -364,19 +404,19 @@ packages/client       @collab-editor/client   — React app + editor binding
                                                  Test Plan §2.7 E2E-CONV-01..04, manually
                                                  launching all three browser ENGINES together
                                                  in one test (not per-project), its own
-                                                 `convergence` Playwright project. Phase 15 added
-                                                 the database schema (API Spec §2, all eight
-                                                 tables) via node-pg-migrate migrations
-                                                 (`migrations/`), a `pg.Pool` wrapper
-                                                 (`src/db/pool.ts`), a seed script
-                                                 (`scripts/seed.ts`), and a DoD test suite run
-                                                 against a real Postgres instance
-                                                 (`src/db/schema.db.test.ts`, `pnpm test:db`) —
-                                                 see that phase's own entry for the full
-                                                 breakdown. NOT wired into
-                                                 `documentCoordinator.ts`/`gateway.ts` yet; the
-                                                 coordinator remains in-memory only until the
-                                                 write path lands (Phases 16-17).
+                                                 `convergence` Playwright project. Phase 16
+                                                 updated `src/sync/syncClient.ts`'s `handleOps`:
+                                                 `seq` is now the STARTING seq of a frame's
+                                                 range (a run/batch of N operations spans
+                                                 `seq..seq+N-1`, server-side `currentSeq` no
+                                                 longer being per-frame — see
+                                                 documentCoordinator.ts's own comment), so both
+                                                 `highestAppliedSeq` and `gapTracker.observe()`
+                                                 now use the range's END
+                                                 (`seq + ops.length - 1`), not `seq` itself.
+                                                 `gapTracker.ts` needed no changes — its own
+                                                 Phase 14 redesign already tolerates a jump of
+                                                 more than 1.
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -2179,20 +2219,293 @@ format:check`/`pnpm typecheck` were re-run afterward to confirm nothing
 typecheck` now passes cleanly across all six workspace packages; `pnpm
 test` still passes all 301 tests afterward.
 
+- **Phase 16 — Operation log and acknowledgement-implies-durability**
+  (API Spec §6.3's write path, §3.5.7 OP_ACK, §11.2; PRD FR-PS-2, FR-PS-3,
+  M2; Test Plan DUR-04). The phase brief's own framing was accurate: "the
+  single most consequential ordering decision in the system" — and,
+  distinctively for this project, it also surfaced THREE separate
+  structural conflicts between already-committed designs (Phase 15's
+  verbatim schema, Phase 7-14's wire protocol, and Postgres's own rule
+  system) that had to be resolved with the user before writing any
+  production code, not discovered and patched afterward. All three are
+  documented below because each one changes how a future phase should
+  reason about this system, not just how Phase 16 was implemented.
+
+  **Decision 1 — persistence had to become injectable, not hard-wired.**
+  `createCollabServer()` previously took no arguments. Making the write
+  path's new Postgres dependency unconditional would have forced
+  `gateway.test.ts`, `httpApp.test.ts`, and — critically —
+  `packages/client/src/sync/headlessHarness.test.ts` (part of the
+  DEFAULT `pnpm test`, no Postgres required today) to all require a real
+  database just to run. Resolved (user-approved) as: an `OperationStore`
+  interface with two implementations — `PostgresOperationStore`
+  (production, real durability) and `InMemoryOperationStore` (the new
+  default for every test that doesn't construct one explicitly, no real
+  durability, exactly reproducing pre-Phase-16 behavior). `pnpm test`
+  stays infra-free; Phase 16's OWN new persistence tests
+  (`packages/server/src/db/*.db.test.ts`) are gated behind `pnpm test:db`,
+  the same pattern Phase 15 established.
+
+  **Decision 2 — `operations.seq` had to become per-OPERATION, not
+  per-frame.** Since Phase 7, `seq` was assigned once per ingested WIRE
+  FRAME — an `OP_INSERT_RUN`/`OP_DELETE_BATCH` frame (Phase 7's "2,000
+  characters → one frame" optimization) represents N operations under
+  ONE seq. But Phase 15's `operations` table (built verbatim from the
+  real spec DDL) has `PRIMARY KEY (document_id, seq)` — one row per seq
+  — and `operations_stamp_uq`'s unique index is on singular
+  `stamp_r`/`stamp_c` columns, meaning one row can only ever represent
+  ONE operation's identity. Storing a run as one row would either violate
+  the PK (multiple operations sharing one seq) or lose per-character
+  duplicate-stamp protection for every character but the run's first.
+  Resolved (user-approved) as: `coordinator.currentSeq` now advances by
+  `ops.length` per message, not by 1 — a run of N operations consumes N
+  consecutive seq values, and the relayed/acked `seq` is the range's
+  STARTING value. The wire format itself is UNCHANGED (a run still
+  relays as one compact `OP_INSERT_RUN` frame — Phase 7's optimization
+  is intact on the broadcast path); only the numbering underneath it
+  changed. `packages/client/src/sync/syncClient.ts`'s `handleOps` was
+  updated to compute `endSeq = seq + ops.length - 1` for both
+  `highestAppliedSeq` and `gapTracker.observe()` — `gapTracker.ts` itself
+  needed NO changes, since its Phase 14 redesign ("advance to any newly
+  seen greater seq, regardless of contiguity") already tolerates a
+  frame that jumps the counter by more than 1.
+
+  **Decision 3 — a `documents`/`users` row had to exist before ANY
+  operation could be persisted, and reaching that row required going
+  one FK hop further than first planned.** `operations.document_id`
+  references `documents(id)`, and `documents.owner_id` references
+  `users(id)` — neither existed anywhere; coordinators were still purely
+  in-memory constructs created lazily on first WebSocket connection
+  (Phase 8's "any client can join any document by guessing its id, no
+  auth yet" design). Resolved (user-approved) as: coordinator warm start
+  auto-provisions a `documents` row (owned by a single fixed
+  `SYSTEM_USER_ID` placeholder) via `ON CONFLICT (id) DO NOTHING`,
+  mirroring the existing no-auth stance rather than inventing new
+  semantics. **This decision's own scope turned out to be incomplete,
+  discovered only by actually running the write path against a real
+  database**: `operations.author_session REFERENCES sessions(id)`, and
+  `sessions.user_id REFERENCES users(id)` for a PER-SESSION user — a
+  DIFFERENT table Decision 3's original users/documents provisioning
+  never touched. Every real commit failed on
+  `operations_author_session_fkey` until `commitOperations` ALSO
+  auto-provisions a per-session `users` row (keyed by the session's own
+  placeholder `userId`, not collapsed onto `SYSTEM_USER_ID` — that would
+  have thrown away even the thin per-connection identity signal Phase 8
+  already established) and a `sessions` row, both `ON CONFLICT DO
+NOTHING`, in the SAME transaction as the operations themselves. This
+  extended the already-approved auto-provisioning principle one FK hop
+  further rather than reopening the question with the user, since it was
+  the same decision applied consistently, not a new fork.
+
+  **⚠️ KNOWN INTERIM BEHAVIOR, flagged explicitly rather than left
+  implicit: this auto-provisioning is NOT self-gating and creates REAL,
+  PERMANENT rows with no authentication and no rate limiting.** Concretely,
+  as of Phase 16: (1) `getOrCreateCoordinator` (gateway.ts) constructs a
+  `DocumentCoordinator` for ANY `documentId` a client names in HELLO, no
+  validation — its warm start immediately `INSERT`s a real `documents`
+  row for it (owned by the placeholder `SYSTEM_USER_ID`). (2)
+  `gateway.ts`'s handshake mints a fresh `randomUUID()` as `userId` on
+  EVERY connection (never client-supplied) — the first operation that
+  session commits creates a real, permanent `users` row and `sessions`
+  row for that random id, unconditionally, never reused. This is a
+  materially different risk than every EARLIER phase's placeholder
+  identity: before Phase 16, a bogus join produced only in-memory state,
+  gone on restart; now it produces rows that persist in Postgres forever,
+  with no cap — and step 3 of this same phase's write path (rate check)
+  is explicitly stubbed to always-allow, so nothing bounds how many.
+  This is consistent with this project's standing no-auth stance (Phase
+  8: "any client can join any document by guessing its id... not yet a
+  security concern since nothing is exposed publicly") — it is not a
+  NEW authorization hole — but the unbounded, PERSISTENT row growth is a
+  genuinely new operational concern (disk/table growth from anyone who
+  can reach the WebSocket endpoint) that prior phases' in-memory-only
+  placeholders never had. **It will not be superseded automatically when
+  real auth (Phases 26-29) lands** — nothing here is behind a flag or a
+  TODO that fails loudly; a future phase must deliberately find and
+  replace both auto-provisioning call sites (`PostgresOperationStore.
+warmStart`'s documents/system-user insert, and its `commitOperations`'s
+  per-session users/sessions insert) with real authenticated-identity
+  lookups, or this interim behavior will simply keep running unnoticed.
+  Do not point this server at a shared or production-like database
+  before that happens.
+
+  **A fourth, unplanned discovery — found only by actually running the
+  write path, not by reading the schema — was more fundamental than a
+  missing row: Postgres REFUSES `INSERT ... ON CONFLICT` on any table
+  that has a `CREATE RULE` defined on it.** `operations` has two
+  (`operations_no_update`/`operations_no_delete`, Phase 15, verbatim
+  from the spec, not something Phase 16 may change) — so the obvious
+  `INSERT ... ON CONFLICT (document_id, stamp_r, stamp_c) DO NOTHING`
+  for duplicate-stamp suppression (the DoD's own literal requirement)
+  fails outright: `ERROR: INSERT with ON CONFLICT clause cannot be used
+with table that has INSERT or UPDATE rules`. This is a genuine,
+  load-bearing conflict between two already-committed, unmodifiable
+  designs — not a wiring bug — and required a different mechanism
+  entirely, not a workaround at the call site. Fixed by wrapping each
+  operation's plain `INSERT` (no `ON CONFLICT`) in its own `SAVEPOINT`,
+  catching a unique-violation (SQLSTATE `23505`, `operations_stamp_uq`
+  firing) and issuing `ROLLBACK TO SAVEPOINT` for just that one row —
+  the rest of the transaction (other rows in the same batch, the
+  `documents.current_seq` UPDATE, the COMMIT) is unaffected, exactly
+  reproducing what `ON CONFLICT DO NOTHING` would have done if Postgres
+  allowed it here. See `operationStore.ts`'s `commitOperations` for the
+  implementation and its own extensive comment.
+
+  **The write path itself** (`packages/server/src/writePath.ts`,
+  `processIncomingOperation`) implements API Spec §6.3's nine steps
+  literally, including the two the phase brief explicitly asked to be
+  stubbed (`authorize` until Phase 28, rate-check until Phase 30 — both
+  always-allow functions with a citing comment, not silently omitted),
+  and carries the exact required comment verbatim above the
+  broadcast/commit/ack sequence. Step 2 ("verify stamp.r ===
+  session.replica_id") is a REAL new check, not decorative — an
+  operation whose claimed replica doesn't match the sending session's
+  own is rejected with `OP_REJECT`/`IDENTITY_MISMATCH`, sent to the
+  sender only, never broadcast or persisted. This broke two PRE-EXISTING
+  `gateway.test.ts` tests that hardcoded an arbitrary local `Engine`
+  replica id (`101`, `202`) instead of the id the server actually
+  assigned via WELCOME — a real, if narrow, gap in those tests' own
+  fidelity that this phase's own new correctness check exposed; both
+  were fixed to use `welcome.replicaId`, the only reasonable value for a
+  client to have used even before this phase.
+
+  **Ack batching** (`packages/server/src/ackBatcher.ts`, `AckBatcher`):
+  up to 64 entries or 20ms, whichever first — one per `CoordinatorSession`
+  (constructed at handshake time in `gateway.ts`, closed on disconnect).
+  A single `add()` call exceeding 64 entries (a large paste) flushes in
+  64-entry chunks immediately rather than producing one oversized frame.
+
+  **A real regression, found only by running the FULL existing test
+  suite after wiring the write path in — not anticipated in advance**:
+  `AckBatcher`'s 20ms timer can fire DURING the gap between
+  `Gateway.close()`'s synchronous `ws.terminate()` (Phase 8/9) and the
+  socket's asynchronous `'close'` event (which is what calls
+  `ackBatcher.close()`) — producing a send-after-close inside
+  `sendQueues.ts`'s fire-and-forget `pump()`, which had no error handling
+  around its `sendRaw` call and turned that into an unhandled promise
+  rejection, observed as two `httpApp.test.ts`-adjacent failures the
+  first time the full suite ran post-wiring. This was a genuine gap
+  `sendQueues.ts` always had (any late `enqueue()` after termination
+  could have hit it), just never previously reachable, since every
+  pre-Phase-16 caller only ever enqueued synchronously within the same
+  message-handling turn. Fixed in `sendQueues.ts`'s `pump()`: a failed
+  send is now caught, marks the queue `closed`, and stops draining —
+  the same end state an explicit `close()` call leaves it in — rather
+  than propagating.
+
+  **Coordinator warm start** (`DocumentCoordinator`'s `ready: Promise<void>`,
+  kicked off in the constructor): replays the persisted log (in seq order
+  — causally valid, since a row's own `seq` was only ever assigned after
+  a LIVE `applyRemote()` already accepted it, so replaying in that order
+  reproduces the same causal-readiness path) into a fresh `engine`, then
+  asserts `engine.pending.length === 0` — the DoD's own `pendingCount()
+=== 0` requirement — throwing loudly (not continuing silently) if a
+  persisted operation's causal dependency is missing. `gateway.ts`'s
+  `handleHandshake` (now `async`) awaits `coordinator.ready` before
+  admitting ANY client, including the very first connection to a
+  brand-new document — so the documents/users/sessions auto-provisioning
+  above always happens before that connection's own operations could be
+  persisted, and no client can ever be handed a SNAPSHOT of an empty
+  engine while that same document's real history is still loading in the
+  background. A warm-start failure closes the socket with 1011 (a
+  server-side fault, not `closeMalformed`'s 1008).
+
+  **`currentSeq` restoration on warm start reads `documents.current_seq`,
+  never `MAX(operations.seq)` or `ops.length`.** A resent duplicate
+  operation is still assigned a NEW seq by step 6 before the write path
+  ever checks whether its stamp already exists (that check happens only
+  at the `INSERT`, via the SAVEPOINT mechanism above) — so a seq value
+  can be "spent" (advancing `documents.current_seq`) with NO row of its
+  own if the retry's `INSERT` hit a duplicate. Restoring from `ops.length`
+  or `MAX(seq)` instead would eventually reissue an already-spent seq
+  after a restart and crash on the operations table's own PRIMARY KEY
+  the moment a genuinely new operation collided with it — a subtle
+  correctness trap avoided by design, documented in
+  `operationStore.ts`'s `WarmStartResult` rather than discovered later.
+
+  **DUR-04** (`packages/server/src/db/durability.db.test.ts`): the SAME
+  production `writePath.ts` module is exercised in both orderings via
+  `MUTATE_ACK_BEFORE_COMMIT=1` (an env flag, per the Test Plan's own
+  wording — never set outside this one test, not in `.env.example`, not
+  read by any startup path) plus an injected `simulateCrashAtCommitPoint`
+  hook (a function parameter, not env-based — precise single-shot
+  triggering doesn't fit an env flag) that throws to simulate a crash at
+  exactly "the commit point." Under the MUTATED ordering, the throw lands
+  BEFORE the transaction starts — the operation is confirmed absent from
+  the database afterward (queried directly via a fresh `pool.query`, not
+  through the coordinator's own in-memory state, the same "ground truth
+  from the database itself" discipline as Phase 15's constraint tests and
+  Phase 14's replay endpoint). Under the REAL ordering, the identical
+  throw lands AFTER the commit — the operation is confirmed PRESENT.
+  This test is permanent (not a one-off verification), runs on every
+  future `pnpm test:db`, and is the reason `writePath.ts` reads an env
+  var at all rather than taking a constructor-injected ordering flag —
+  the phase brief's own point was that the shipped module itself must be
+  what gets toggled, not a parallel copy that could drift.
+
+  **Other DoD verification, all against a real, Docker-Composed Postgres
+  instance**: a NEW test file,
+  `packages/server/src/db/serverRestart.db.test.ts`, builds a REAL
+  `createCollabServer()` with a real `PostgresOperationStore`, commits
+  "hi" through a real WebSocket client, closes that server AND its pool
+  entirely, builds a SECOND real server (fresh port, fresh in-memory
+  coordinator map, fresh pool, same database), and confirms a fresh
+  client's SNAPSHOT already contains "hi" — the DoD's literal headline
+  claim ("server restart replays the log and restores state"), proven
+  through the actual `createCollabServer`/`createGateway` construction
+  path, not just by constructing a `DocumentCoordinator` directly.
+  `durability.db.test.ts` additionally verifies: ON CONFLICT-equivalent
+  dedup (the same operation sent through the write path twice produces
+  exactly one row); ack batching (a 10-character run produces 10
+  `AckEntry` objects, all still individually addressable for the
+  client's `UnackedQueue`, batched under the hood); and the latency
+  claim (a `commitOperations` wrapped with an artificial 500ms delay —
+  test-only, not exported from production code — still lets a peer
+  receive the broadcast relay within ~50ms, proving the fanout path
+  never waits on the database). All three new `*.db.test.ts` files
+  passed together (17 tests) across multiple repeated runs, including
+  runs that accumulate data across a shared database without an
+  intervening `pnpm db:reset`, to rule out one-off flakiness.
+
+  **DoD verification against the pre-existing suite**: `pnpm test` (301
+  tests, unchanged in count) passes with ZERO unhandled rejections after
+  the `sendQueues.ts` fix above; `pnpm typecheck`/`pnpm lint`/`pnpm
+format:check` all pass across every package. Two pre-existing
+  `gateway.test.ts` tests needed the `welcome.replicaId` fix described
+  under "the write path itself" above — both are real fixes this
+  phase's own new correctness check required, not scope creep into
+  unrelated Phase 8/9 territory. `handshake.test.ts` and
+  `heartbeat.test.ts`'s fixtures were updated for the new required
+  `DocumentCoordinator`/`CoordinatorSession` fields
+  (`operationStore`/`ackBatcher`) — mechanical updates, not behavior
+  changes.
+
 ## Current phase in progress
 
-None — Phase 15 (database schema and migrations) complete. All eight API
-Spec §2 tables exist, migrated and verified against a real Postgres
-instance, with every named constraint live and tested (append-only rules,
-single-owner partial unique index, duplicate-stamp suppression, and the
-primary-key range scan the reconnection query depends on). The database
-is not yet wired into the server's write path — `documentCoordinator.ts`
-and `gateway.ts` remain exactly as Phase 14 left them, in-memory only —
-that's Phases 16-17. A pre-existing, unrelated typecheck failure
-(`heartbeat.test.ts` missing Phase 14's `receivedFrameCount` field,
-predating Phase 15 entirely) was found during this phase's own
-verification, confirmed to block CI, and fixed as a separate one-line
-change once flagged — see the Phase 15 entry above. `pnpm typecheck`
+None — Phase 16 (operation log and acknowledgement-implies-durability)
+complete. Every operation is now durably committed before its client is
+acknowledged, broadcast to peers never waits on the database, a
+coordinator warm-starts from the persisted log with a live
+`pendingCount() === 0` assertion, and DUR-04 — the ordering test this
+phase exists to protect — runs permanently and passes against the real
+write path while failing (as designed) against its own mutated variant.
+Three structural conflicts between already-committed designs (Phase 15's
+schema, the Phase 7-14 wire protocol, and Postgres's own rule system)
+were found and resolved, two of them only by actually running the write
+path against a real database rather than by reading the schema — see the
+Phase 16 entry above for the full account of each. `documentCoordinator.ts`
+and `gateway.ts` are wired to a real `PostgresOperationStore` in
+production (`index.ts`); every server test predating this phase still
+runs with no Postgres required (`InMemoryOperationStore`, `server.ts`'s
+own default). Not yet built: `packages/server/src/config.ts` had already
+gained `databaseUrl` in Phase 15, unchanged here; snapshotting
+(`opsSinceSnap`/`lastSnapAt`, still unused scaffolding) is Phase 17;
+`sessions`/`document_permissions` are now durably provisioned as a SIDE
+EFFECT of the write path's own FK requirements (placeholder identities,
+no real auth), not because session/permission persistence was itself in
+scope — a future phase should not assume the placeholder
+`sessions`/`users` rows this phase creates carry any real meaning beyond
+satisfying `operations`'s foreign keys. `pnpm typecheck`
 passes cleanly at the repo root; no known product-side or tooling gap
 remains open from this phase.
 
@@ -2214,19 +2527,29 @@ built server-side — only fresh handshakes work, so every reconnect (Phase
 a brand-new replica id and a full fresh SNAPSHOT, never a delta. Session-
 inactivity eviction (10 minutes with no PING) is scaffolded (constant
 defined, cited to §11.4) but not wired to anything — Phase 21's concern.
-No persistence WIRED INTO THE SERVER YET (no snapshotting, no acks —
-`DocumentCoordinator`'s `opsSinceSnap`/`lastSnapAt` fields exist but are
-still unused no-ops, Phases 16-17; `watermarks` is live as of Phase 9 but
-only in memory, nothing durable; `SyncClient`'s unacked-operation queue is
-in-memory only too, IndexedDB is Phase 22) — this means a real coordinator
-restart still loses ALL document content, not just the connection, exactly
-as Phase 10's own kill-and-restart test accounts for. **The database
-SCHEMA itself now exists** (Phase 15: all eight API Spec §2 tables,
-migrated and constraint-tested against a real Postgres instance via
-`pnpm db:migrate`) — what's still missing is the server code that
-actually reads from and writes to it; `documentCoordinator.ts`/
-`gateway.ts` are untouched by Phase 15 and remain exactly as in-memory as
-Phase 14 left them. No auth (Phases 26-29) — any WebSocket client can join
+**Operations are durably persisted as of Phase 16** — every operation is
+committed to Postgres before its client is acknowledged (API Spec §6.3),
+and a coordinator warm-starts from the persisted log on (re)creation. What
+remains NOT built: snapshotting (`DocumentCoordinator`'s `opsSinceSnap`/
+`lastSnapAt` fields exist but are still unused no-ops, Phase 17 — a warm
+start today always replays the FULL operation log from genesis, which is
+correct but will not scale indefinitely without Phase 17's snapshots);
+`SyncClient`'s unacked-operation queue is still in-memory only client-side
+(IndexedDB is Phase 22 — a client that closes its tab mid-edit still loses
+whatever hadn't been acked yet, even though the SERVER now durably has
+everything it did receive); `documents.next_replica_id`/`sessions`/
+`document_permissions` are durably provisioned only as a SIDE EFFECT of
+Phase 16's own foreign-key requirements (placeholder identities, `ON
+CONFLICT DO NOTHING`), not because session/replica-id persistence was
+itself in scope — a reconnecting client still gets a brand-new in-memory
+replica id (`DocumentCoordinator.allocateReplicaId()`'s counter, still
+purely in-memory, unaffected by Phase 16) and the placeholder `sessions`
+rows Phase 16 creates carry no real meaning beyond satisfying `operations`'s
+foreign keys — **and are REAL, PERMANENT database rows, unbounded by any
+rate limit, created for literally any documentId/connection with no
+authentication at all; see the Phase 16 entry's "⚠️ KNOWN INTERIM
+BEHAVIOR" callout above for the full risk and what must change when
+auth lands.** No auth (Phases 26-29) — any WebSocket client can join
 any document by guessing its id and is unconditionally granted the
 EDITOR role, which is
 correct for this phase and not yet a security concern since nothing is
@@ -2612,7 +2935,7 @@ pnpm check:purity
 pnpm test
 ```
 
-## How to run Postgres locally (Phase 15)
+## How to run Postgres locally (Phase 15, wired into the server as of Phase 16)
 
 ```bash
 docker compose up -d   # starts postgres:16-alpine, credentials matching .env.example
@@ -2623,15 +2946,30 @@ pnpm db:seed            # optional — inserts one dev user + one dev document (
 Other commands: `pnpm db:migrate:down` (rolls back the most recent
 migration), `pnpm db:reset` (rolls back to zero, then migrates back up —
 this is how migration reversibility is actually tested, not merely
-asserted). `pnpm test:db` runs the schema/constraint DoD suite
-(`packages/server/src/db/schema.db.test.ts`) against whatever database
+asserted). `pnpm test:db` runs every `packages/server/src/db/*.db.test.ts`
+file (schema/constraint checks, Phase 16's DUR-04/warm-start/ack-batching/
+latency suite, and a real server-restart test) against whatever database
 `DATABASE_URL` points at — requires `docker compose up -d` and `pnpm
 db:migrate` to have been run first; see "How to run the test suite"
-below for why it's gated out of the default `pnpm test`. The database is
-**not** wired into the server's own read/write path yet — `pnpm run
-dev`'s server still runs entirely in-memory, exactly as in Phase 14; the
-schema exists and is fully tested, but nothing in `documentCoordinator.ts`
-or `gateway.ts` talks to it (Phases 16-17).
+below for why it's gated out of the default `pnpm test`.
+
+**As of Phase 16, `pnpm run dev`'s server IS wired to this database for
+real** (`index.ts`'s direct-run block constructs a real
+`PostgresOperationStore` — the exact same construction
+`serverRestart.db.test.ts` exercises automatically, described below;
+this was NOT separately re-verified by hand through the M1 demo's
+browser UI this phase, only through that automated test) — every
+operation sent through the write path is now durably committed to
+Postgres before the client's own save indicator would consider it safe
+(there is no visible save indicator yet — PRD US-PE-3's actual UI is a
+later phase — but the underlying guarantee, "acknowledged implies
+durable," is real and DUR-04-tested). `pnpm test`'s own server tests
+(`gateway.test.ts`, `httpApp.test.ts`, and client's
+`headlessHarness.test.ts`) still run against `InMemoryOperationStore`
+(`server.ts`'s own default when no `operationStore` is passed) and
+require no Postgres — only `index.ts`'s actual direct-run path
+(`pnpm run dev`) and Phase 16's own `*.db.test.ts` files ever construct
+a real `PostgresOperationStore`.
 
 **As of Phase 14, both halves of the app can actually be run standalone —
 see "How to run the M1 demo" below.** `packages/server` now has `pnpm run
@@ -2690,7 +3028,7 @@ pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each
 pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
-pnpm test:db           # schema/constraint DoD suite (Phase 15) — requires a real, migrated Postgres
+pnpm test:db           # schema (Phase 15) + write-path/durability (Phase 16) suites — requires a real, migrated Postgres
 ```
 
 ### The Playwright suite (real browsers, Phase 11-12)
@@ -2867,23 +3205,48 @@ reduced sanity budget this command uses); the authoritative full
 what the nightly workflow sets) — see the Phase 6 completed-phase entry
 above for its result.
 
-`pnpm test:db` currently PASSES: all 7 tests in
-`packages/server/src/db/schema.db.test.ts`, run against a real,
-Docker-Composed Postgres instance — table/index existence (all eight API
-Spec §2 tables plus every named constraint from Phase 15's scope table),
-the `operations` append-only rules (a real `UPDATE` and a real `DELETE`
-both verified as silent no-ops, not merely non-erroring), the
-`docperm_single_owner_idx` and `operations_stamp_uq` rejections (verified
-as real thrown Postgres errors, not application-level checks), and the
-reconnection-query `EXPLAIN` check (`Index Scan using operations_pkey`,
-no `Seq Scan`, against a 120,000-row table shaped like the query's real
-production selectivity profile — see the Phase 15 completed-phase entry
-for why the first, smaller version of this specific test was wrong).
+`pnpm test:db` currently PASSES: 17 tests across three files, run
+against a real, Docker-Composed Postgres instance — repeated across
+multiple runs (including runs that accumulate data across a shared
+database with no intervening `pnpm db:reset`) to rule out one-off
+flakiness, not just observed once.
+- `packages/server/src/db/schema.db.test.ts` (7, Phase 15) — table/index
+  existence (all eight API Spec §2 tables plus every named constraint),
+  the `operations` append-only rules (a real `UPDATE` and a real
+  `DELETE` both verified as silent no-ops), the `docperm_single_owner_idx`
+  and `operations_stamp_uq` rejections (real thrown Postgres errors, not
+  application-level checks), and the reconnection-query `EXPLAIN` check
+  (`Index Scan using operations_pkey`, no `Seq Scan`, against a
+  120,000-row table shaped like the query's real production selectivity
+  profile).
+- `packages/server/src/db/durability.db.test.ts` (9, Phase 16) — DUR-04's
+  two halves (the MUTATED ordering genuinely loses an acked operation;
+  the REAL ordering, under the identical crash injection, never does);
+  ON-CONFLICT-equivalent dedup (a resent operation commits exactly once,
+  via the SAVEPOINT mechanism `operations`'s rules forced — see the
+  Phase 16 completed-phase entry); coordinator warm start (`pendingCount()
+=== 0` both on a clean replay and confirmed to FIRE — a real thrown
+  error — when the persisted log has a genuinely unmet dependency,
+  constructed via a direct row insert rather than `DELETE`, which
+  `operations_no_delete` correctly blocks); ack batching (64-entries flush
+  immediately, fewer flush after 20ms, a real 10-character run through
+  the write path produces 10 individually-addressable `AckEntry`
+  objects); and the latency claim (a `commitOperations` wrapped with an
+  artificial 500ms delay still lets a peer receive the broadcast relay
+  within ~50ms).
+- `packages/server/src/db/serverRestart.db.test.ts` (1, Phase 16) — a
+  REAL `createCollabServer()` with a real `PostgresOperationStore`
+  commits "hi" via a real WebSocket client, is closed entirely (server
+  and pool), and a SECOND real server (fresh port, fresh in-memory
+  coordinator map, fresh pool, same database) hands a fresh client a
+  SNAPSHOT that already contains "hi" — the DoD's literal headline claim,
+  proven through the actual server construction path.
+
 Excluded from the default `pnpm test` (requires `docker compose up -d` +
 `pnpm db:migrate` first; most dev/CI environments don't have a Postgres
 instance running by default) — same reasoning as
 convergence/properties/mutation. Not yet wired into CI as its own job;
 that requires a Postgres service container in the GitHub Actions
-workflow, which Phase 15's own scope didn't ask for and wasn't added
-here to avoid scope creep — worth flagging for whichever future phase
-next touches `.github/workflows/ci.yml`.
+workflow, which neither Phase 15 nor Phase 16's own scope asked for and
+wasn't added here to avoid scope creep — worth flagging for whichever
+future phase next touches `.github/workflows/ci.yml`.

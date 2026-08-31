@@ -114,7 +114,21 @@ export class ConnectionSendQueues {
         if (frame === undefined) {
           return;
         }
-        await this.sendRaw(frame);
+        try {
+          await this.sendRaw(frame);
+        } catch {
+          // A send failing strongly implies the underlying connection is already gone (e.g. a
+          // caller that terminates a socket without first calling `close()` — Phase 16's
+          // gateway.ts does exactly this on shutdown: `ws.terminate()` is synchronous, but the
+          // 'close' event that calls `close()` on this queue fires asynchronously afterward,
+          // leaving a real window where an already-armed timer (AckBatcher's 20ms flush window)
+          // can still call `enqueue()` mid-teardown). `enqueue()` is fire-and-forget
+          // (`void this.pump()`), so a rejection propagating out of this loop would become an
+          // unhandled promise rejection rather than a caught error — swallow it here and stop
+          // draining, the same end state an explicit `close()` would leave this queue in.
+          this.closed = true;
+          return;
+        }
       }
     } finally {
       this.draining = false;

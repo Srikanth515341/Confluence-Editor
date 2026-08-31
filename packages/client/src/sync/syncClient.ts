@@ -388,8 +388,15 @@ export class SyncClient {
     for (const op of ops) {
       engine.applyRemote(op);
     }
-    this.highestAppliedSeq = Math.max(this.highestAppliedSeq, seq);
-    this.gapTracker.observe(seq);
+    // As of Phase 16, `seq` is the STARTING seq of the range this frame occupies — a run/batch
+    // of N operations consumes seq..seq+N-1 (documentCoordinator.ts's own doc comment explains
+    // why operations.seq had to become per-operation, not per-frame). The highest seq this
+    // frame actually covers is therefore the END of that range, not `seq` itself — using `seq`
+    // alone here would make the gap tracker see every multi-operation frame as leaving a
+    // "gap" of its own operations, which are not actually missing.
+    const endSeq = ops.length > 0 ? seq + ops.length - 1 : seq;
+    this.highestAppliedSeq = Math.max(this.highestAppliedSeq, endSeq);
+    this.gapTracker.observe(endSeq);
     // Reconnection off a stalled `gapTracker` is checked on the ping cadence (`startPingTimer`),
     // not armed here — see gapTracker.ts's own doc comment for why a per-call timer keyed off
     // "any single missing seq number" was the actual bug this phase found and fixed.
