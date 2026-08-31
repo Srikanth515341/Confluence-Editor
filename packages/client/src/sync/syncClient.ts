@@ -15,13 +15,13 @@ import {
   encodeControlFrame,
   encodeFrame,
   peekChannel,
+  seedEngineFromSnapshot,
   type ControlMessage,
   type OpsMessage,
 } from "@collab-editor/protocol";
 import { Backoff, BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { ObservableValue, type ConnectionState, type Observable } from "./connectionState.js";
 import { SequenceGapTracker } from "./gapTracker.js";
-import { seedEngineFromSnapshot } from "./snapshotSeed.js";
 import { UnackedQueue } from "./unackedQueue.js";
 import { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
 

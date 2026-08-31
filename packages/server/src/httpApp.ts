@@ -16,11 +16,19 @@ export interface HttpAppDeps {
 }
 
 /**
- * Express app. `/healthz` plus, new this phase, a diagnostic replay
- * endpoint (Test Plan §2.7 E2E-CONV-01 assertion 3 — see
- * documentCoordinator.ts's `operationLog` doc comment for why an
- * independent replay, not just reading the coordinator's own live engine,
- * is the point). No auth on this route — consistent with this project's
+ * Express app. `/healthz` plus a diagnostic replay endpoint (Test Plan
+ * §2.7 E2E-CONV-01 assertion 3 — independent ground truth, not just
+ * reading the coordinator's own live engine). As of Phase 17, this
+ * replays the FULL persisted operation log from genesis, on demand, via
+ * `operationStore.loadFullOperationLog()` — deliberately NOT the
+ * coordinator's own `engine` (which, since Phase 17, only reflects the
+ * latest snapshot plus its suffix, not necessarily a genesis replay) and
+ * no longer backed by an in-memory `operationLog` array at all (removed
+ * this phase — it was written but never read once these two endpoints
+ * became the only consumer of "full genesis history" and now query the
+ * database directly, on demand, instead of keeping every operation a
+ * coordinator has ever seen resident in memory for the life of the
+ * process). No auth on this route — consistent with this project's
  * existing "no security concern yet, nothing is exposed publicly" stance
  * (Phases 8-13 apply the same reasoning to the WS gateway itself).
  */
@@ -29,21 +37,22 @@ export function createHttpApp(deps: HttpAppDeps): Express {
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ status: "ok" });
   });
-  app.get("/v1/documents/:documentId/replay", (req, res) => {
+  app.get("/v1/documents/:documentId/replay", async (req, res) => {
     const coordinator = deps.getCoordinators().get(req.params.documentId);
     if (!coordinator) {
       res.status(404).json({ error: "document not found" });
       return;
     }
+    const ops = await coordinator.operationStore.loadFullOperationLog(req.params.documentId);
     // Replica id here is arbitrary — this Engine only ever calls `applyRemote`, never mints a
     // local identifier, so its own replicaId never appears in any produced Identifier.
     const replay = new Engine(0);
-    for (const op of coordinator.operationLog) {
+    for (const op of ops) {
       replay.applyRemote(op);
     }
     res.status(200).json({
       text: replay.text(),
-      opCount: coordinator.operationLog.length,
+      opCount: ops.length,
       pendingCount: replay.pending.length,
     });
   });
@@ -52,14 +61,15 @@ export function createHttpApp(deps: HttpAppDeps): Express {
   // materialized text, so a cross-client divergence can be root-caused at the node level.
   // Added while investigating a real divergence found during Phase 14 DoD verification — see
   // CLAUDE.md's Phase 14 entry.
-  app.get("/v1/documents/:documentId/replay-nodes", (req, res) => {
+  app.get("/v1/documents/:documentId/replay-nodes", async (req, res) => {
     const coordinator = deps.getCoordinators().get(req.params.documentId);
     if (!coordinator) {
       res.status(404).json({ error: "document not found" });
       return;
     }
+    const ops = await coordinator.operationStore.loadFullOperationLog(req.params.documentId);
     const replay = new Engine(0);
-    for (const op of coordinator.operationLog) {
+    for (const op of ops) {
       replay.applyRemote(op);
     }
     res.status(200).json({
@@ -72,7 +82,7 @@ export function createHttpApp(deps: HttpAppDeps): Express {
         deletedBy: n.deletedBy,
         value: n.value,
       })),
-      opCount: coordinator.operationLog.length,
+      opCount: ops.length,
       pendingCount: replay.pending.length,
     });
   });

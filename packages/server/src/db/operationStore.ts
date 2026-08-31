@@ -29,9 +29,10 @@
 // same thin per-connection signal Phase 8's random-UUID-per-session
 // already established.
 
-import type { Operation } from "@collab-editor/engine";
+import type { Node, Operation } from "@collab-editor/engine";
 import {
   decodeFrame,
+  decodeStructureSnapshotBody,
   encodeFrame,
   operationToOpDelete,
   operationToOpInsert,
@@ -80,20 +81,61 @@ author_session REFERENCES sessions(id)`, and `sessions.user_id
 }
 
 export interface WarmStartResult {
-  /** The full persisted operation log for this document, in seq order. */
-  readonly ops: readonly Operation[];
+  /**
+   * The latest snapshot's decoded node structure (Phase 17, API Spec
+   * §2.7/§6.4), or `null` if this document has never been snapshotted
+   * yet — a coordinator's `engine` must be seeded from these nodes
+   * BEFORE replaying `suffixOps`, since `suffixOps` only covers what
+   * happened AFTER this snapshot was taken, not the document's full
+   * history from genesis. This is the entire point of Phase 17: warm
+   * start no longer needs to replay every operation a document has ever
+   * had — only the snapshot (one row) plus whatever's happened since.
+   */
+  readonly snapshotNodes: readonly Node[] | null;
+  /** The snapshot's own `seq` (0n if `snapshotNodes` is null — genesis) — `suffixOps` is exactly the operations with `seq > snapshotSeq`. */
+  readonly snapshotSeq: bigint;
+  /** Operations with `seq > snapshotSeq`, in seq order — replay these (and ONLY these) on top of `snapshotNodes` to reach the document's current state. */
+  readonly suffixOps: readonly Operation[];
   /** `documents.current_seq` AFTER provisioning — the highest seq ever assigned for this document, including seq values "spent" on a resent duplicate that hit ON CONFLICT DO NOTHING (see commitOperations's own doc comment) and therefore left no row of their own. This, not `MAX(operations.seq)` or `ops.length`, is what a coordinator must resume numbering from — using either of those instead would eventually reissue an already-spent seq and crash on the operations table's own PRIMARY KEY the moment a genuinely new operation collided with it. */
   readonly currentSeq: bigint;
+}
+
+export interface WriteSnapshotInput {
+  readonly documentId: string;
+  /** State AFTER applying operations up to and including this seq (API Spec §2.7's own column comment) — always `coordinator.currentSeq` AT THE MOMENT the snapshot is actually taken, which may be later (and higher) than whatever seq was current when the snapshot was first SCHEDULED, since writing runs off the hot path (snapshotter.ts). */
+  readonly seq: bigint;
+  /** `engine.text()` — the materialized visible text at `seq`. What the integrity audit compares a log replay against (never structure, RFC §13.2 — see this file's own note on snapshot non-determinism). */
+  readonly content: string;
+  /** `encodeStructureSnapshotBody(engine.nodes)` — full node structure, tombstones included. */
+  readonly structure: Uint8Array;
+  /** Operations committed since the PREVIOUS snapshot — the DoD's own "~500" observable. */
+  readonly opCount: number;
 }
 
 export interface OperationStore {
   /**
    * Ensures a `documents` row (and its placeholder `users` owner row)
    * exists for `documentId`, then loads everything a coordinator needs to
-   * warm-start (API Spec §6.2): the persisted operation log in seq order,
-   * plus the current seq watermark to resume numbering from.
+   * warm-start (API Spec §6.2, extended by Phase 17's §6.4): the latest
+   * snapshot (if any) plus only the operation-log SUFFIX after it, and
+   * the current seq watermark to resume numbering from.
    */
   warmStart(documentId: string): Promise<WarmStartResult>;
+
+  /**
+   * The FULL persisted operation log for a document, genesis to present,
+   * ignoring any snapshot entirely — Phase 17 deliberately keeps this
+   * separate from `warmStart`'s snapshot-optimized path. Used only by
+   * httpApp.ts's diagnostic `/replay`/`/replay-nodes` endpoints (Test
+   * Plan §2.7 E2E-CONV-01 assertion 3's independent ground truth) and by
+   * this phase's own DoD test proving warm start's snapshot+suffix
+   * result is byte-identical to a full genesis replay — both genuinely
+   * want genesis, on purpose, not the fast path.
+   */
+  loadFullOperationLog(documentId: string): Promise<Operation[]>;
+
+  /** Persists one snapshot row (API Spec §2.7, Phase 17 §6.4) — see snapshotter.ts for when this is called and why it's never awaited from the write path itself. */
+  writeSnapshot(input: WriteSnapshotInput): Promise<void>;
 
   /**
    * API Spec §6.3 step 8, ONE transaction for the WHOLE incoming message
@@ -169,18 +211,56 @@ export class PostgresOperationStore implements OperationStore {
       [documentId, SYSTEM_USER_ID],
     );
 
-    const { rows: opRows } = await this.pool.query<{ payload: Buffer }>(
-      `SELECT payload FROM operations WHERE document_id = $1 ORDER BY seq ASC`,
+    // Phase 17: the latest snapshot (served directly by snapshots_latest_idx, Phase 15) plus
+    // only the operations AFTER it — this is the whole point of snapshotting, replacing what
+    // used to be an unconditional full-genesis SELECT (kept, unchanged, as loadFullOperationLog
+    // below for the diagnostic/audit callers that genuinely want genesis).
+    const { rows: snapRows } = await this.pool.query<{ seq: string; structure: Buffer }>(
+      `SELECT seq, structure FROM snapshots WHERE document_id = $1 ORDER BY seq DESC LIMIT 1`,
       [documentId],
+    );
+    const snapshotRow = snapRows[0];
+    const snapshotSeq = snapshotRow ? BigInt(snapshotRow.seq) : 0n;
+    const snapshotNodes = snapshotRow
+      ? decodeStructureSnapshotBody(new Uint8Array(snapshotRow.structure))
+      : null;
+
+    const { rows: opRows } = await this.pool.query<{ payload: Buffer }>(
+      `SELECT payload FROM operations WHERE document_id = $1 AND seq > $2 ORDER BY seq ASC`,
+      [documentId, snapshotSeq.toString()],
     );
     const { rows: docRows } = await this.pool.query<{ current_seq: string }>(
       `SELECT current_seq FROM documents WHERE id = $1`,
       [documentId],
     );
     return {
-      ops: opRows.map((r) => decodeOperationPayload(r.payload)),
+      snapshotNodes,
+      snapshotSeq,
+      suffixOps: opRows.map((r) => decodeOperationPayload(r.payload)),
       currentSeq: docRows[0] ? BigInt(docRows[0].current_seq) : 0n,
     };
+  }
+
+  async loadFullOperationLog(documentId: string): Promise<Operation[]> {
+    const { rows } = await this.pool.query<{ payload: Buffer }>(
+      `SELECT payload FROM operations WHERE document_id = $1 ORDER BY seq ASC`,
+      [documentId],
+    );
+    return rows.map((r) => decodeOperationPayload(r.payload));
+  }
+
+  async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO snapshots (document_id, seq, content, structure, op_count)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        input.documentId,
+        input.seq.toString(),
+        input.content,
+        Buffer.from(input.structure),
+        input.opCount,
+      ],
+    );
   }
 
   async commitOperations(
@@ -291,17 +371,45 @@ export class PostgresOperationStore implements OperationStore {
  * `PostgresOperationStore` when actually running the server.
  */
 export class InMemoryOperationStore implements OperationStore {
+  /**
+   * Purely so `loadFullOperationLog` (and therefore httpApp.ts's
+   * `/replay`/`/replay-nodes` diagnostic endpoints) has something real
+   * to return for the common no-Postgres case — this used to be exactly
+   * what `DocumentCoordinator.operationLog` provided before Phase 17
+   * removed it in favor of always querying the store. NOT "real
+   * durability" in the persist-across-restart sense (this class's whole
+   * point): a fresh `InMemoryOperationStore` instance — as opposed to a
+   * fresh coordinator sharing the SAME instance — still starts empty,
+   * same as before.
+   */
+  private readonly opsByDocument = new Map<string, Operation[]>();
+
   // `async` (rather than a sync function returning an already-resolved value) is deliberate:
   // it satisfies the OperationStore interface's Promise-returning shape exactly like the real
   // store, so a caller can never accidentally rely on this resolving synchronously just
   // because the test double happens to.
   async warmStart(_documentId: string): Promise<WarmStartResult> {
-    return { ops: [], currentSeq: 0n };
+    return { snapshotNodes: null, snapshotSeq: 0n, suffixOps: [], currentSeq: 0n };
   }
 
   async commitOperations(
     input: CommitOperationsInput,
   ): Promise<{ readonly insertedCount: number }> {
+    let ops = this.opsByDocument.get(input.documentId);
+    if (!ops) {
+      ops = [];
+      this.opsByDocument.set(input.documentId, ops);
+    }
+    ops.push(...input.ops);
     return { insertedCount: input.ops.length };
+  }
+
+  async loadFullOperationLog(documentId: string): Promise<Operation[]> {
+    return [...(this.opsByDocument.get(documentId) ?? [])];
+  }
+
+  async writeSnapshot(_input: WriteSnapshotInput): Promise<void> {
+    // No real durability (the entire point of this store) — snapshotting a document that isn't
+    // actually persisted has nothing to snapshot INTO, so this is a no-op rather than an error.
   }
 }

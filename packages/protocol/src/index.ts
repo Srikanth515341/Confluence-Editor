@@ -80,3 +80,4 @@ export {
   encodeStructureSnapshotBody,
   encodeTextSnapshotBody,
 } from "./snapshotBody.js";
+export { replaySnapshotNodesInto, seedEngineFromSnapshot } from "./snapshotSeed.js";

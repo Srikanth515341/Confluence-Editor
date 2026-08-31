@@ -6,8 +6,21 @@ import {
 } from "@collab-editor/engine";
 
 /**
- * Reconstructs a fresh `Engine`'s full state from a decoded structure-form
- * SNAPSHOT (API Spec §3.6.3, `packages/protocol/src/snapshotBody.ts`).
+ * Replays a decoded structure-form SNAPSHOT's nodes (`snapshotBody.ts`)
+ * into an EXISTING engine as the synthetic remote operation(s) that would
+ * have produced them. Shared by two consumers as of Phase 17 — the
+ * client (`SyncClient.handleSnapshot`, Phase 10, seeding a brand-new
+ * `Engine` on every live SNAPSHOT) and the server
+ * (`DocumentCoordinator.warmStart`, Phase 17, seeding its own
+ * already-constructed `engine` from the latest persisted snapshot before
+ * replaying the operation-log suffix on top) — moved here from
+ * `packages/client/src/sync/snapshotSeed.ts` once a second consumer
+ * needed the identical logic, rather than duplicating it the way
+ * `wireHelpers.ts` deliberately duplicates server conversion helpers
+ * client-side (that duplication exists specifically because a client
+ * must never depend on `@collab-editor/server`; both client and server
+ * already depend on `@collab-editor/protocol`, so there is no such
+ * constraint here).
  *
  * There is no separate "load state directly" mutation path on `Engine` —
  * deliberately: the only way `nodes`/`byKey`/`deleted`/`deletedBy` are
@@ -37,9 +50,7 @@ import {
  * — every non-final insert is buffered on first attempt and resolved once
  * its `originRight` is replayed later in the same pass.
  */
-export function seedEngineFromSnapshot(replicaId: number, nodes: readonly Node[]): Engine {
-  const engine = new Engine(replicaId);
-
+export function replaySnapshotNodesInto(engine: Engine, nodes: readonly Node[]): void {
   for (const node of nodes) {
     const insertOp: InsertOperation = {
       kind: "insert",
@@ -62,6 +73,11 @@ export function seedEngineFromSnapshot(replicaId: number, nodes: readonly Node[]
       engine.applyRemote(deleteOp);
     }
   }
+}
 
+/** Constructs a BRAND NEW `Engine` and seeds it via {@link replaySnapshotNodesInto} — the client's own use case (Phase 10), which always builds a fresh `Engine` per SNAPSHOT rather than mutating an existing one. */
+export function seedEngineFromSnapshot(replicaId: number, nodes: readonly Node[]): Engine {
+  const engine = new Engine(replicaId);
+  replaySnapshotNodesInto(engine, nodes);
   return engine;
 }

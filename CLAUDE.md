@@ -100,8 +100,24 @@ packages/protocol    @collab-editor/protocol  — binary wire codec + message ty
                                                  reworked once Phase 20's block run-length
                                                  encoding lands, not merely unverified). PRESENCE
                                                  message types are still not built (Phase 31).
-                                                 Depends on engine (for Identifier/Operation/Node
-                                                 types and, in tests only, Engine itself).
+                                                 Phase 17 added src/snapshotSeed.ts
+                                                 (`replaySnapshotNodesInto`/`seedEngineFromSnapshot`
+                                                 — the decoded-snapshot-to-Engine replay logic,
+                                                 MOVED here from packages/client/src/sync/
+                                                 snapshotSeed.ts once the server's own coordinator
+                                                 warm start needed the identical algorithm; unlike
+                                                 wireHelpers.ts's deliberate client-side
+                                                 duplication of server logic — required because a
+                                                 client must never depend on @collab-editor/server
+                                                 — both client and server already depend on this
+                                                 package, so a genuine move was the right call, not
+                                                 a second duplication). Depends on engine (already
+                                                 a real, non-test dependency since Phase 7, but
+                                                 only ever for Identifier/Operation/Node TYPES —
+                                                 Phase 17's snapshotSeed.ts is the first place in
+                                                 this package's own source that imports and calls
+                                                 the actual `Engine` class at runtime, not just its
+                                                 types).
 packages/server      @collab-editor/server    — Express + WebSocket gateway, Document
                                                  Coordinator. Phase 8 built the in-memory OPS
                                                  path (config.ts, logger.ts, sendQueues.ts's
@@ -210,8 +226,28 @@ operationStore.ts` (`OperationStore` interface,
                                                  broadcast-latency-unaffected-by-a-slow-database
                                                  check) and `src/db/serverRestart.db.test.ts`
                                                  (a real `createCollabServer()` restart, proving
-                                                 the DoD's headline claim end to end). Depends on
-                                                 engine + protocol.
+                                                 the DoD's headline claim end to end). Phase 17
+                                                 added `src/snapshotter.ts` (`maybeScheduleSnapshot`
+                                                 — RFC §13.2's MAYBE-SNAPSHOT, 500 ops/30s, called
+                                                 as writePath.ts's own last step and never
+                                                 awaited; the real work defers via `setImmediate`
+                                                 so it never sits between a keystroke and its
+                                                 broadcast) and redirected coordinator warm start
+                                                 from an unconditional full-genesis replay to
+                                                 loading the latest snapshot (`snapshots_latest_idx`)
+                                                 plus only the operation-log suffix after it —
+                                                 `operationStore.ts`'s `WarmStartResult` gained
+                                                 `snapshotNodes`/`snapshotSeq`/`suffixOps`, and a
+                                                 new `loadFullOperationLog`/`writeSnapshot` pair
+                                                 rounds out the `OperationStore` interface.
+                                                 `DocumentCoordinator.operationLog` was REMOVED
+                                                 (no longer needed once warm start stopped loading
+                                                 genesis unconditionally; `httpApp.ts`'s two
+                                                 diagnostic replay endpoints now call
+                                                 `loadFullOperationLog` directly, on demand,
+                                                 instead of reading an in-memory array — genuinely
+                                                 MORE independent of the coordinator's own live
+                                                 state, not less). Depends on engine + protocol.
 packages/client       @collab-editor/client   — React app + editor binding
                                                  (DomWriter, input pipeline, presence).
                                                  The only package with DOM lib types. Phase
@@ -416,7 +452,14 @@ packages/client       @collab-editor/client   — React app + editor binding
                                                  (`seq + ops.length - 1`), not `seq` itself.
                                                  `gapTracker.ts` needed no changes — its own
                                                  Phase 14 redesign already tolerates a jump of
-                                                 more than 1.
+                                                 more than 1. Phase 17 removed src/sync/
+                                                 snapshotSeed.ts entirely — its logic moved to
+                                                 `@collab-editor/protocol`'s own snapshotSeed.ts
+                                                 (a second consumer, the server's warm start,
+                                                 needed the identical algorithm); syncClient.ts
+                                                 and sync/index.ts now import
+                                                 `seedEngineFromSnapshot` from protocol directly,
+                                                 with no behavior change.
 packages/testkit     @collab-editor/testkit   — fuzz harness, mutation-testing
                                                  harness, network-fault proxy, load
                                                  harness. Phase 2 built the
@@ -2480,34 +2523,178 @@ format:check` all pass across every package. Two pre-existing
   (`operationStore`/`ackBatcher`) — mechanical updates, not behavior
   changes.
 
+- **Phase 17 — Snapshots and coordinator warm start** (API Spec §6.4's
+  cadence, §2.7's schema; RFC §13.2; PRD FR-PS-4). Implements RFC §13.2's
+  MAYBE-SNAPSHOT() — 500 operations or 30 seconds since the last
+  snapshot, whichever comes first, checked reactively after every
+  committed operation batch — and redirects coordinator warm start
+  (Phase 16) from "always replay the full operation log from genesis" to
+  "load the latest snapshot, then replay only the suffix after it."
+
+  **A load-bearing note, recorded here per this phase's own explicit
+  instruction: snapshots are server-side only and are NOT required to be
+  deterministic across replicas (RFC §13.2).** Block splitting (a later
+  phase, Engine Spec §7.5) means two replicas can reach the same document
+  through different block histories — CONTENT is deterministic (every
+  correct replica converges to the same visible text, OBSEQ's whole
+  guarantee), but STRUCTURE is not (the exact sequence of tombstones/
+  blocks a given replica's engine happens to hold can differ from
+  another's, even though both render identical text). This is why
+  `snapshots.content` (materialized text) is what the integrity audit
+  compares a log replay against — never `snapshots.structure` — and why
+  Phase 17's own warm-start correctness test (below) asserts text
+  equality against a full genesis replay, not structural equality.
+
+  **`packages/server/src/snapshotter.ts`** (new): `maybeScheduleSnapshot`
+  — called as `processIncomingOperation`'s (writePath.ts) own last step,
+  after the commit (and ack) have already happened, never awaited. Adds
+  `opsJustCommitted` to `coordinator.opsSinceSnap`, checks it against
+  `coordinator.snapshotOpThreshold`/`snapshotTimeThresholdMs` (500 /
+  30,000ms by default — `SNAPSHOT_OP_THRESHOLD`/
+  `SNAPSHOT_TIME_THRESHOLD_MS`), and — if due, and no snapshot write is
+  already in flight for this coordinator (`snapshotInFlight`) — defers
+  the actual work via `setImmediate`. Scope-IN's own warning
+  ("materialize() is O(N) and must never sit between a keystroke and its
+  broadcast") is satisfied structurally: scheduling itself is two field
+  reads and a comparison, and by the time `setImmediate`'s callback
+  fires, this operation's broadcast AND ack have already been sent —
+  `writeSnapshotNow` reads `coordinator.engine`/`currentSeq`/
+  `opsSinceSnap` AT EXECUTION TIME (not at scheduling time), so a
+  snapshot always reflects whatever the latest state actually is by the
+  time it runs, never a stale capture, regardless of how many more
+  operations landed in the deferral window. A failed write is logged and
+  swallowed, deliberately leaving `opsSinceSnap`/`lastSnapAt` unreset —
+  the very next committed operation's own `maybeScheduleSnapshot` call
+  naturally re-triggers, a retry-via-next-op with no dedicated retry
+  logic needed.
+
+  **`DocumentCoordinator` gained a THIRD constructor parameter,
+  test-only**: `snapshotThresholds?: { opThreshold?, timeThresholdMs? }`,
+  defaulting to the RFC values everywhere in production (`gateway.ts`
+  only ever uses the two-argument form). This exists specifically so
+  Phase 17's own DoD tests can prove "does not measurably affect
+  operation latency" via genuine A/B comparison (a coordinator whose
+  threshold can never be reached vs. one at the real RFC value) and
+  exercise the 30-second time-based trigger in milliseconds rather than
+  actually waiting 30 real seconds — the SAME reactive-check code path,
+  just measured against a reachable number.
+
+  **Warm start redesign** (`operationStore.ts`'s `WarmStartResult`,
+  `documentCoordinator.ts`'s `warmStart()`): `PostgresOperationStore.
+warmStart` now queries `snapshots_latest_idx` for the latest snapshot
+  (`ORDER BY seq DESC LIMIT 1` — Phase 15's own index, built for exactly
+  this), decodes its `structure` via `decodeStructureSnapshotBody`
+  (`@collab-editor/protocol`, Phase 9's placeholder format — used as-is,
+  per this phase's own explicit instruction not to touch it), and loads
+  only `operations WHERE seq > snapshotSeq` as the suffix (falling back
+  to `snapshotSeq = 0` — the full log — when no snapshot exists yet, the
+  same behavior every document had before this phase). The coordinator
+  seeds its already-constructed `engine` from the snapshot's nodes via
+  `replaySnapshotNodesInto` (see below), then replays the suffix via the
+  normal `applyRemote` loop, then asserts `pending.length === 0` exactly
+  as Phase 16 did — the assertion's meaning is unchanged; only how much
+  gets replayed to reach that point is new.
+
+  **`seedEngineFromSnapshot`/its replay logic MOVED from `packages/
+client/src/sync/snapshotSeed.ts` to `packages/protocol/src/
+snapshotSeed.ts`**, exporting a new `replaySnapshotNodesInto(engine,
+  nodes)` (replays into an EXISTING engine — the server's use case, since
+  `DocumentCoordinator.engine` is already constructed as a class field)
+  alongside the original `seedEngineFromSnapshot(replicaId, nodes)`
+  (constructs a fresh one — the client's existing use case, unchanged
+  behaviorally). This is a genuine move, not a duplication, unlike
+  `wireHelpers.ts`'s deliberate server-logic duplication client-side
+  (Phase 10) — that duplication exists specifically because a client must
+  never depend on `@collab-editor/server`, a constraint that doesn't
+  apply here: both client and server already depend on
+  `@collab-editor/protocol`, so there was no reason to maintain two
+  copies of the identical two-pass insert-then-delete replay algorithm
+  once a second consumer needed it.
+
+  **`DocumentCoordinator.operationLog` was REMOVED entirely, not just
+  changed** — a direct, necessary consequence of warm start no longer
+  loading the full genesis history into memory. It existed solely to
+  back `httpApp.ts`'s two diagnostic endpoints (`/replay`, `/replay-nodes`,
+  Test Plan §2.7 E2E-CONV-01 assertion 3's independent ground truth); a
+  new `OperationStore.loadFullOperationLog(documentId)` method (real
+  implementation: an unfiltered genesis `SELECT`, unchanged from what
+  `warmStart` used to run unconditionally; in-memory implementation:
+  reads a `Map<documentId, Operation[]>` populated by `commitOperations`,
+  needed because this endpoint's own existing test — part of the default
+  `pnpm test`, no Postgres — relied on that in-memory tracking, which
+  `operationLog`'s removal would otherwise have silently broken) now
+  serves both endpoints directly, on demand, deliberately ignoring
+  whatever the coordinator's own live `engine` reflects — genuinely MORE
+  independent ground truth than before, not less, since it no longer
+  touches the coordinator's in-memory state at all.
+
+  **DoD verification, all against a real, Docker-Composed Postgres
+  instance** (`packages/server/src/db/snapshots.db.test.ts`, new — 5
+  tests): the 500-operation threshold writes a snapshot with `op_count`
+  between 500 and 520 (the operation that CROSSES the threshold is always
+  included in what triggers the write, never dropped, hence the small
+  slack above exactly 500); the 30-second threshold, exercised via the
+  test-only constructor override (100ms, not 30,000ms) with the op
+  threshold set unreachably high, fires with `op_count = 4` — proving the
+  TIME trigger independently of the count trigger; a 5,000-operation
+  document (one snapshot at 4,000) warm-starts to text BYTE-IDENTICAL to
+  an independent full genesis replay (`loadFullOperationLog` + a fresh
+  `Engine`); a 50,000-operation document (one snapshot at 49,000)
+  warm-starts in well under the DoD's 2-second budget; and a genuine A/B
+  latency comparison (600 real operations through the real write path,
+  p95 measured per-call) shows snapshotting-active latency within 2x of
+  snapshotting-effectively-disabled latency (a generous margin,
+  documented as such — this is real database I/O with natural jitter,
+  not a tight statistical claim; the point is ruling out the specific bug
+  class of "a snapshot write blocks the hot path," which would blow WAY
+  past 2x, not sit within it).
+
+  **Fixture construction for the 5,000/50,000-operation tests
+  deliberately avoids the real `Engine`/write path for SETUP** (though
+  the actual warm-start/comparison logic under test always goes through
+  the real `Engine`): a hand-built left-to-right append chain
+  (`buildAppendChain` — each operation's `originLeft` is the immediately
+  preceding operation's own id, `originRight` always `null`, independently
+  verified against `Engine.localInsert`'s own source to be the identical
+  shape real sequential typing produces) is bulk-inserted directly via
+  `unnest(...)` (Phase 15's own EXPLAIN-test technique), bypassing the
+  real write path's per-row SAVEPOINT transaction machinery entirely.
+  This is fixture SETUP speed, not a shortcut on what's being verified —
+  warm start itself, and the genesis-replay comparison, always run the
+  real `engine.applyRemote()` path Phase 3 built and 60,000 fuzz trials
+  have exercised.
+
+  **DoD verification against the pre-existing suite**: `pnpm test` (301
+  tests, unchanged in count) and `pnpm test:db` (22 tests: the 17 from
+  Phases 15-16 plus these 5) both pass, the latter repeated across
+  multiple runs including without an intervening `pnpm db:reset`, to rule
+  out one-off flakiness. `pnpm typecheck`/`pnpm lint`/`pnpm format:check`
+  all pass across every package. `httpApp.test.ts`'s existing replay-
+  endpoint test (default `pnpm test`, `InMemoryOperationStore`) initially
+  broke when `operationLog` was removed — a real regression this phase's
+  own verification caught, fixed by adding the in-memory tracking
+  described above, not by reverting the removal.
+
 ## Current phase in progress
 
-None — Phase 16 (operation log and acknowledgement-implies-durability)
-complete. Every operation is now durably committed before its client is
-acknowledged, broadcast to peers never waits on the database, a
-coordinator warm-starts from the persisted log with a live
-`pendingCount() === 0` assertion, and DUR-04 — the ordering test this
-phase exists to protect — runs permanently and passes against the real
-write path while failing (as designed) against its own mutated variant.
-Three structural conflicts between already-committed designs (Phase 15's
-schema, the Phase 7-14 wire protocol, and Postgres's own rule system)
-were found and resolved, two of them only by actually running the write
-path against a real database rather than by reading the schema — see the
-Phase 16 entry above for the full account of each. `documentCoordinator.ts`
-and `gateway.ts` are wired to a real `PostgresOperationStore` in
-production (`index.ts`); every server test predating this phase still
-runs with no Postgres required (`InMemoryOperationStore`, `server.ts`'s
-own default). Not yet built: `packages/server/src/config.ts` had already
-gained `databaseUrl` in Phase 15, unchanged here; snapshotting
-(`opsSinceSnap`/`lastSnapAt`, still unused scaffolding) is Phase 17;
-`sessions`/`document_permissions` are now durably provisioned as a SIDE
-EFFECT of the write path's own FK requirements (placeholder identities,
-no real auth), not because session/permission persistence was itself in
-scope — a future phase should not assume the placeholder
-`sessions`/`users` rows this phase creates carry any real meaning beyond
-satisfying `operations`'s foreign keys. `pnpm typecheck`
-passes cleanly at the repo root; no known product-side or tooling gap
-remains open from this phase.
+None — Phase 17 (snapshots and coordinator warm start) complete. RFC
+§13.2's MAYBE-SNAPSHOT() runs off the write path's hot path via
+`setImmediate`, at the correct 500-operation/30-second cadence; a
+coordinator's warm start now loads the latest snapshot plus only the
+operation-log suffix after it, verified byte-identical to a full genesis
+replay on a 5,000-operation document and under the 2-second budget on a
+50,000-operation one. Snapshots are explicitly documented as
+server-side-only and non-deterministic in structure across replicas
+(content only) — see the Phase 17 entry above. Not yet built: block
+run-length encoding (Engine Spec §7.5, Phase 20 — `snapshotBody.ts`'s
+placeholder serialization is unchanged this phase, per its own explicit
+instruction); garbage collection (Phase 21, which will presumably use
+`sessions_frontier_idx`/snapshots together to know what's safe to
+reclaim); the `snapshots` table's own retention policy (nothing prunes
+OLD snapshots yet — every MAYBE-SNAPSHOT() trigger adds a new row,
+forever; this wasn't in Phase 17's own scope and isn't yet a problem at
+any realistic document lifetime, but a future phase should know no
+cleanup exists).
 
 ## What is explicitly NOT yet built
 
@@ -2527,13 +2714,17 @@ built server-side — only fresh handshakes work, so every reconnect (Phase
 a brand-new replica id and a full fresh SNAPSHOT, never a delta. Session-
 inactivity eviction (10 minutes with no PING) is scaffolded (constant
 defined, cited to §11.4) but not wired to anything — Phase 21's concern.
-**Operations are durably persisted as of Phase 16** — every operation is
-committed to Postgres before its client is acknowledged (API Spec §6.3),
-and a coordinator warm-starts from the persisted log on (re)creation. What
-remains NOT built: snapshotting (`DocumentCoordinator`'s `opsSinceSnap`/
-`lastSnapAt` fields exist but are still unused no-ops, Phase 17 — a warm
-start today always replays the FULL operation log from genesis, which is
-correct but will not scale indefinitely without Phase 17's snapshots);
+**Operations are durably persisted as of Phase 16, and snapshotted as of
+Phase 17** — every operation is committed to Postgres before its client
+is acknowledged (API Spec §6.3), and a coordinator warm-starts from the
+latest snapshot plus only the operation-log suffix after it (RFC §13.2's
+MAYBE-SNAPSHOT, 500 ops/30s), not a full genesis replay. What remains NOT
+built: block run-length encoding (Engine Spec §7.5, Phase 20 —
+`snapshotBody.ts`'s structure serialization is still the same Phase 9
+placeholder, used as-is per Phase 17's own explicit instruction not to
+touch it); garbage collection (Phase 21); any retention/pruning policy
+for the `snapshots` table itself (every MAYBE-SNAPSHOT trigger adds a new
+row forever — not a problem yet, but nothing prunes old ones);
 `SyncClient`'s unacked-operation queue is still in-memory only client-side
 (IndexedDB is Phase 22 — a client that closes its tab mid-edit still loses
 whatever hadn't been acked yet, even though the SERVER now durably has
@@ -3205,7 +3396,7 @@ reduced sanity budget this command uses); the authoritative full
 what the nightly workflow sets) — see the Phase 6 completed-phase entry
 above for its result.
 
-`pnpm test:db` currently PASSES: 17 tests across three files, run
+`pnpm test:db` currently PASSES: 22 tests across four files, run
 against a real, Docker-Composed Postgres instance — repeated across
 multiple runs (including runs that accumulate data across a shared
 database with no intervening `pnpm db:reset`) to rule out one-off
@@ -3241,6 +3432,18 @@ flakiness, not just observed once.
   coordinator map, fresh pool, same database) hands a fresh client a
   SNAPSHOT that already contains "hi" — the DoD's literal headline claim,
   proven through the actual server construction path.
+- `packages/server/src/db/snapshots.db.test.ts` (5, Phase 17) — the
+  500-operation trigger (real `op_count` between 500 and 520 in the
+  table); the 30-second trigger, exercised via `DocumentCoordinator`'s
+  test-only threshold override rather than a real 30-second wait (a
+  100ms threshold, op threshold set unreachably high), firing with
+  `op_count = 4`; a 5,000-operation document (one snapshot at 4,000)
+  warm-starting to text BYTE-IDENTICAL to an independent full genesis
+  replay; a 50,000-operation document (one snapshot at 49,000)
+  warm-starting in well under 2 seconds; and a genuine A/B p95-latency
+  comparison (600 real operations through the real write path,
+  snapshotting active vs. effectively disabled via the same threshold
+  override) staying within a documented 2x margin.
 
 Excluded from the default `pnpm test` (requires `docker compose up -d` +
 `pnpm db:migrate` first; most dev/CI environments don't have a Postgres
