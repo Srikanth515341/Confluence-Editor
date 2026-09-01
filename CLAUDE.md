@@ -247,7 +247,24 @@ operationStore.ts` (`OperationStore` interface,
                                                  `loadFullOperationLog` directly, on demand,
                                                  instead of reading an in-memory array — genuinely
                                                  MORE independent of the coordinator's own live
-                                                 state, not less). Depends on engine + protocol.
+                                                 state, not less). Phase 18 added `src/audit.ts`
+                                                 (`auditDocument` — API Spec §6.6's six steps, a
+                                                 real BISECT via binary search over a document's
+                                                 own snapshot history), `src/auditScheduler.ts`
+                                                 (`startAuditScheduler` — the in-process,
+                                                 continuously-running production control, 5-minute
+                                                 default interval, full 5-step audits since it has
+                                                 live coordinator access), and
+                                                 `scripts/admin.ts` (the standalone `./admin audit
+                                                 --doc=<id> --verbose` CLI — a separate process,
+                                                 DB-only, steps 1-4). `operationStore.ts` gained
+                                                 six new methods (`loadFullOperationLogWithSeq`,
+                                                 `getLatestSnapshot`/`listSnapshots`,
+                                                 `writeAuditRun`/`listAuditRuns`/
+                                                 `getLastSuccessfulAuditRunAt`); `httpApp.ts` gained
+                                                 `GET /v1/documents/:id/audit-runs` (read-only —
+                                                 queryable runs + the "last successful run" metric).
+                                                 Depends on engine + protocol.
 packages/client       @collab-editor/client   — React app + editor binding
                                                  (DomWriter, input pipeline, presence).
                                                  The only package with DOM lib types. Phase
@@ -2675,26 +2692,197 @@ snapshotSeed.ts`**, exporting a new `replaySnapshotNodesInto(engine,
   own verification caught, fixed by adding the in-memory tracking
   described above, not by reverting the removal.
 
+- **Phase 18 — Integrity audit and bisect** (API Spec §6.6; Test Plan
+  §3.2's DUR-01; PRD FR-PS-6). The phase brief's own framing, worth
+  repeating verbatim because it explains why this component exists at
+  all: "Every other check compares replicas to each other and would
+  report health if they were all wrong in the same way. This one
+  compares the live server against an independent replay of durable
+  storage." Every prior phase's tests — convergence fuzzing, the
+  adversarial suite, E2E-CONV, DUR-04 — all compare two things this
+  project itself built against each other. AUDIT() is the first check
+  whose failure mode is genuinely different: it can catch a bug shared
+  by every replica, because its reference point (a fresh `Engine`
+  replaying ONLY what Postgres durably has) shares no code path, no
+  memory, and no assumptions with anything else currently running.
+
+  **`packages/server/src/audit.ts`** (`auditDocument`): implements API
+  Spec §6.6's six steps. Step 3 (`pendingCount() === 0`, Engine Spec I9)
+  is checked and reported BEFORE any text comparison — DUR-01's own
+  reasoning, restated in the code: a replay whose buffer is non-empty can
+  still MATERIALIZE correctly if the stranded operations were duplicates
+  or later deletes, so a text match alone would be a false pass for a
+  permanently orphaned operation. Step 4 compares an independent genesis
+  replay **through the snapshot's own seq** (not the full/latest replay)
+  against `snapshot.content` — a snapshot legitimately represents a
+  PREFIX of history once more operations have landed since it was taken,
+  which is the normal case for a continuously-running audit; comparing
+  against the FULL replay instead (DUR-01's own literal wording, which
+  only works because its own test scenario explicitly quiesces first)
+  would make a healthy, actively-edited document fail every single audit
+  tick. Step 5 (compare against the live coordinator) is genuinely
+  OPTIONAL — `AuditOptions.liveText`, a plain string, not a
+  `DocumentCoordinator` reference, keeping this module decoupled from
+  gateway/server internals — because the standalone CLI (below) has no
+  way to read a running server's memory and must still produce a
+  meaningful, correct steps-1-4 audit without it.
+
+  **BISECT** (Scope-IN: "must be built, not skipped"). The search space
+  is the document's OWN persisted snapshots, ascending by seq — not an
+  arbitrary seq range — because a snapshot's `content` is the only thing
+  independently checkable AT a specific, known seq without an external
+  reference; there is no correct text known in advance at an arbitrary
+  seq that isn't a snapshot boundary. Binary search assumes
+  `matches(i)` — "does genesis replay through `snapshots[i].seq` equal
+  `snapshots[i].content`" — is MONOTONIC across the sorted list (true for
+  a prefix, false from some point on), the SAME assumption every real
+  bisection tool makes, `git bisect` included, and with the SAME
+  documented limitation: a single, isolated, non-contiguous corruption
+  (one hand-tampered row, nothing before or after it touched) isn't
+  guaranteed to be found correctly by binary search, only by a linear
+  scan. Accepted deliberately — the realistic failure mode this audit
+  exists to catch is a PERSISTENCE-LAYER bug, which plausibly corrupts a
+  contiguous suffix of history once it starts (genuinely monotonic), not
+  a surgical single-row edit. With exactly one snapshot (the common case
+  for a document that hasn't been running long), bisect correctly
+  degenerates to checking that one snapshot — no search machinery
+  needed, same code path, matching the DoD's own corruption scenario
+  exactly. A live-coordinator mismatch (step 5) with NO corresponding
+  snapshot disagreement is reported as its OWN distinct diagnosis —
+  "durable storage is internally consistent; the live coordinator itself
+  has diverged" — rather than silently reusing the snapshot-bisect
+  result, which would misleadingly report "nothing found" for what is
+  actually a live/in-memory bug, not a persistence one.
+
+  **`packages/server/src/auditScheduler.ts`** (`startAuditScheduler`):
+  the "continuously running production control" half of Phase 18's own
+  framing — a `setInterval` (default 5 minutes, `DEFAULT_AUDIT_
+INTERVAL_MS`, not a spec-mandated value — RFC §13.2 names 500 ops/30s
+  for SNAPSHOTTING specifically, not for how often an unattended audit
+  should run; configurable via this function's own parameter precisely
+  because it's a judgment call, not a spec number) that audits every
+  document with a currently-open `DocumentCoordinator`
+  (`gateway.coordinators`), supplying `liveText: coordinator.engine.
+text()` for the full 5-step audit. `timer.unref()` so this never keeps
+  a Node process alive on its own — every test constructs its own server
+  directly (never through `index.ts`'s direct-run block, the only place
+  this scheduler is ever started), so no test needs to remember to stop
+  it. One document's audit (or even its own coordinator's warm start)
+  failing is caught and logged per-document, never aborting the rest of
+  that tick's sweep.
+
+  **`packages/server/scripts/admin.ts`** (`pnpm --filter
+@collab-editor/server run admin -- audit --doc=<id> [--verbose]`, or
+  `pnpm admin audit --doc=<id> [--verbose]` at the repo root) — the
+  Scope-IN CLI. `./admin` in the phase brief names the CONCEPT, not a
+  literal filename: this project's other admin-style tooling
+  (`scripts/seed.ts`, `pnpm db:seed`) is invoked via a pnpm script, not a
+  bare shell executable, for the same reason `db:migrate`/`db:seed` are
+  — no assumption that a bash script is directly runnable on Windows,
+  this project's actual dev environment. A SEPARATE process from any
+  running server — connects to Postgres directly via `DATABASE_URL`
+  (same pattern as `seed.ts`), never to a live server's memory — so a
+  CLI-invoked audit can only ever run steps 1-4 (no `liveText`),
+  documented explicitly in the script's own header rather than silently
+  producing a partial audit with no explanation. Exits 0 on `result:
+'ok'`, 1 on `'mismatch'`/`'error'` (so a cron/script wrapper can alert on
+  a nonzero exit code), 2 on a usage error. A real, if minor, wiring bug
+  was found and fixed while manually smoke-testing this against a real
+  seeded document: the ROOT-level `pnpm admin` wrapper script originally
+  ended in a trailing `--` (`"pnpm --filter @collab-editor/server run
+admin --"`), which — combined with pnpm's OWN forwarding of a script
+  invocation's extra CLI args — produced a literal double `--`, making
+  `scripts/admin.ts`'s own arg parser see `"--"` as the `command`
+  instead of `"audit"`. Fixed by removing the wrapper's own trailing
+  `--`; confirmed via an actual `pnpm admin audit --doc=<seeded-doc-id>
+--verbose` run against a real Postgres instance, both from the repo
+  root and from `packages/server` directly.
+
+  **`packages/server/src/db/operationStore.ts` gained six new
+  `OperationStore` methods**, all implemented for both stores
+  (`PostgresOperationStore` for real; `InMemoryOperationStore` with its
+  own small in-memory maps, keeping every pre-Phase-18 test infra-free
+  exactly as before): `loadFullOperationLogWithSeq` (same query as Phase
+  17's `loadFullOperationLog`, but keeping each operation's own `seq` —
+  bisect and the `pendingCount()`-error path both need to NAME a
+  specific seq, which the seq-stripped version can't provide;
+  `loadFullOperationLog` now calls this and drops the seq, rather than
+  duplicating the query); `getLatestSnapshot`/`listSnapshots` (content
+  only — bisect never needs a snapshot's `structure`, only its stored
+  text, for the byte comparison); `writeAuditRun`/`listAuditRuns`/
+  `getLastSuccessfulAuditRunAt` (API Spec §2.8's `audit_runs` table,
+  written to on EVERY run including a healthy one — a `result: 'ok'`
+  row is what "last successful run," the DoD's own metric, is computed
+  from).
+
+  **`packages/server/src/httpApp.ts` gained `GET /v1/documents/:id/
+audit-runs`** — the DoD's "audit_runs rows are queryable and the 'last
+  successful run' timestamp is exposed as a metric" requirement,
+  read-only observability (nothing here TRIGGERS an audit — that's the
+  scheduler or the CLI). `?limit=` defaults to 20, capped at 200.
+
+  **DoD verification, all against a real, Docker-Composed Postgres
+  instance**: DUR-01 passes on a genuine 5,000-operation, 3-client
+  session — "3 clients" built via the phase brief's own explicitly
+  sanctioned lightest-weight option ("treating headless client sessions
+  ... as sufficient," not a real WebSocket/SyncClient/Playwright setup):
+  three independent `Engine` instances, each minting its own local
+  operations through the REAL write path (`processIncomingOperation`)
+  and each receiving every OTHER simulated client's relayed OPS frames
+  through a captured `ConnectionSendQueues` callback that decodes and
+  applies them — reproducing exactly what three real `SyncClient`s
+  would end up with, with no real network involved. DUR-01's own line 7
+  ("every client's DOM textContent") is satisfied by comparing all
+  three simulated clients' own `engine.text()` against an independent
+  genesis replay — there is no real DOM in this test, so this is
+  literally the state a DOM would just be rendering. A deliberately
+  corrupted snapshot (`UPDATE snapshots SET content = 'CORRUPTED'`) is
+  detected, BISECT correctly reports the exact (only) snapshot's own
+  seq, an `audit_runs` row records it, and restoring the original
+  content makes the audit pass again. An orphaned operation
+  (`operations_no_delete` makes literally deleting a middle row
+  impossible, so — the SAME substitution Phase 16's own
+  `durability.db.test.ts` already established for the identical
+  constraint — a second row is inserted directly whose `originLeft`
+  references an identifier no other row ever provides) fires the
+  `pendingCount()` assertion with `result: 'error'`, distinct from a
+  `'mismatch'`. A 100,000-operation document (fixture built via the
+  same fast synthetic-append-chain bulk-insert technique Phase 17
+  established, since fixture SETUP speed must not be confused with what
+  the DoD is actually timing) audits in ~13 seconds, well under the
+  30-second budget. `audit_runs` rows are confirmed queryable and
+  `getLastSuccessfulAuditRunAt` confirmed to return `null` before any
+  run and a real, correctly-ordered timestamp after one. All 5 new
+  tests (`packages/server/src/db/audit.db.test.ts`) pass together and
+  alongside the full pre-existing `test:db` suite (27 tests across 5
+  files total).
+
+  **DoD verification against the pre-existing suite**: `pnpm test` (301
+  tests, unchanged) and `pnpm typecheck`/`pnpm lint`/`pnpm format:check`
+  all pass across every package. `durability.db.test.ts`'s own
+  `delayedStore` test double needed the same six new interface methods
+  added as trivial pass-throughs to its wrapped real store — a
+  mechanical update, not a behavior change, and the SAME kind of update
+  this exact object literal already needed once before, in Phase 17.
+
 ## Current phase in progress
 
-None — Phase 17 (snapshots and coordinator warm start) complete. RFC
-§13.2's MAYBE-SNAPSHOT() runs off the write path's hot path via
-`setImmediate`, at the correct 500-operation/30-second cadence; a
-coordinator's warm start now loads the latest snapshot plus only the
-operation-log suffix after it, verified byte-identical to a full genesis
-replay on a 5,000-operation document and under the 2-second budget on a
-50,000-operation one. Snapshots are explicitly documented as
-server-side-only and non-deterministic in structure across replicas
-(content only) — see the Phase 17 entry above. Not yet built: block
-run-length encoding (Engine Spec §7.5, Phase 20 — `snapshotBody.ts`'s
-placeholder serialization is unchanged this phase, per its own explicit
-instruction); garbage collection (Phase 21, which will presumably use
-`sessions_frontier_idx`/snapshots together to know what's safe to
-reclaim); the `snapshots` table's own retention policy (nothing prunes
-OLD snapshots yet — every MAYBE-SNAPSHOT() trigger adds a new row,
-forever; this wasn't in Phase 17's own scope and isn't yet a problem at
-any realistic document lifetime, but a future phase should know no
-cleanup exists).
+None — Phase 18 (integrity audit and bisect) complete. `auditDocument()`
+implements API Spec §6.6's six steps exactly, including the
+pendingCount()-before-text-comparison ordering DUR-01 specifically calls
+out as catching what a text comparison alone would miss; BISECT is a
+real binary search over a document's own snapshot history, not a
+placeholder; both the in-process scheduler (full 5-step audits, live
+comparison included) and the standalone CLI (DB-only, steps 1-4) are
+built and manually smoke-tested against a real seeded document. Not yet
+built: any alerting beyond a log line + a nonzero CLI exit code (no
+paging/webhook integration exists — this project has none yet for
+anything, not just audits); the scheduler currently only ever audits
+documents with a CURRENTLY-OPEN coordinator, never sweeping the full set
+of documents that have ever existed — a real design question left open,
+not decided here (flagged in auditScheduler.ts's own doc comment);
+`audit_runs` retention (nothing prunes old rows, same as `snapshots`'
+own unaddressed retention gap from Phase 17).
 
 ## What is explicitly NOT yet built
 
@@ -3139,10 +3327,20 @@ migration), `pnpm db:reset` (rolls back to zero, then migrates back up —
 this is how migration reversibility is actually tested, not merely
 asserted). `pnpm test:db` runs every `packages/server/src/db/*.db.test.ts`
 file (schema/constraint checks, Phase 16's DUR-04/warm-start/ack-batching/
-latency suite, and a real server-restart test) against whatever database
-`DATABASE_URL` points at — requires `docker compose up -d` and `pnpm
-db:migrate` to have been run first; see "How to run the test suite"
-below for why it's gated out of the default `pnpm test`.
+latency suite, Phase 17's snapshot/warm-start suite, and Phase 18's
+integrity-audit suite) against whatever database `DATABASE_URL` points
+at — requires `docker compose up -d` and `pnpm db:migrate` to have been
+run first; see "How to run the test suite" below for why it's gated out
+of the default `pnpm test`.
+
+**Phase 18's admin CLI**: `pnpm admin audit --doc=<documentId> [--verbose]`
+(repo root) or `pnpm --filter @collab-editor/server run admin -- audit
+--doc=<documentId> [--verbose]` — runs a real, standalone AUDIT() against
+whatever `DATABASE_URL` points at, exits 0 on `ok`, 1 on `mismatch`/
+`error`, 2 on a usage error. Requires `docker compose up -d` + `pnpm
+db:migrate` (same as everything else on this page) but NOT a running
+server — it connects to Postgres directly, the same way `pnpm db:seed`
+does.
 
 **As of Phase 16, `pnpm run dev`'s server IS wired to this database for
 real** (`index.ts`'s direct-run block constructs a real
@@ -3396,7 +3594,7 @@ reduced sanity budget this command uses); the authoritative full
 what the nightly workflow sets) — see the Phase 6 completed-phase entry
 above for its result.
 
-`pnpm test:db` currently PASSES: 22 tests across four files, run
+`pnpm test:db` currently PASSES: 27 tests across five files, run
 against a real, Docker-Composed Postgres instance — repeated across
 multiple runs (including runs that accumulate data across a shared
 database with no intervening `pnpm db:reset`) to rule out one-off
@@ -3443,7 +3641,24 @@ flakiness, not just observed once.
   warm-starting in well under 2 seconds; and a genuine A/B p95-latency
   comparison (600 real operations through the real write path,
   snapshotting active vs. effectively disabled via the same threshold
-  override) staying within a documented 2x margin.
+  override) staying within a documented 2x margin — actual measured
+  numbers (not just the ratio) are logged on every run via `console.log`,
+  since a passing ratio alone can't distinguish "1ms vs 2ms, irrelevant"
+  from "50ms vs 100ms, a real regression."
+- `packages/server/src/db/audit.db.test.ts` (5, Phase 18) — DUR-01 on a
+  real 5,000-operation, 3-client session (three independent `Engine`s,
+  each minting through the real write path and receiving every other
+  simulated client's relayed frames — no real network — converging to,
+  and matching, an independent genesis replay); a deliberately corrupted
+  snapshot detected, BISECT correctly identifying the exact (only)
+  snapshot's own seq, an `audit_runs` row recording it, and a clean
+  restore afterward; an orphaned operation (the same DELETE-is-blocked
+  substitution `durability.db.test.ts` established in Phase 16) firing
+  `pendingCount()`'s `result: 'error'`, distinct from a `'mismatch'`; a
+  100,000-operation document (fixture built via Phase 17's own fast
+  bulk-insert technique) auditing in ~13 seconds against the 30-second
+  budget; and `audit_runs` confirmed queryable with a correctly-ordered
+  "last successful run" timestamp.
 
 Excluded from the default `pnpm test` (requires `docker compose up -d` +
 `pnpm db:migrate` first; most dev/CI environments don't have a Postgres

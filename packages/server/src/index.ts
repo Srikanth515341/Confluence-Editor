@@ -42,12 +42,19 @@ export {
   processIncomingOperation,
   type WritePathTestHooks,
 } from "./writePath.js";
+export { auditDocument, replayThrough, type AuditOptions, type AuditResult } from "./audit.js";
+export {
+  DEFAULT_AUDIT_INTERVAL_MS,
+  startAuditScheduler,
+  type AuditScheduler,
+} from "./auditScheduler.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
 import { createPool } from "./db/pool.js";
 import { PostgresOperationStore } from "./db/operationStore.js";
 import { createCollabServer } from "./server.js";
+import { startAuditScheduler } from "./auditScheduler.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
 // or `tsx src/index.ts`, Phase 14's `pnpm --filter @collab-editor/server run
@@ -69,4 +76,9 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const operationStore = new PostgresOperationStore(createPool(config.databaseUrl));
   const server = createCollabServer({ operationStore });
   void server.listen(config.port);
+  // Phase 18: the continuously-running production control — audits every currently-open
+  // document on a fixed interval. Never started for `createCollabServer()` calls elsewhere
+  // (every test constructs its own server directly, not through this direct-run block), so no
+  // test needs to remember to stop it.
+  startAuditScheduler(server.gateway);
 }

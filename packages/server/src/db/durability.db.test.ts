@@ -327,8 +327,15 @@ describe("Phase 16 DoD — broadcast latency is unaffected by a slow database", 
         return realStore.commitOperations(input);
       },
       loadFullOperationLog: (id: string) => realStore.loadFullOperationLog(id),
+      loadFullOperationLogWithSeq: (id: string) => realStore.loadFullOperationLogWithSeq(id),
       writeSnapshot: (input: Parameters<typeof realStore.writeSnapshot>[0]) =>
         realStore.writeSnapshot(input),
+      getLatestSnapshot: (id: string) => realStore.getLatestSnapshot(id),
+      listSnapshots: (id: string) => realStore.listSnapshots(id),
+      writeAuditRun: (input: Parameters<typeof realStore.writeAuditRun>[0]) =>
+        realStore.writeAuditRun(input),
+      listAuditRuns: (id: string, limit: number) => realStore.listAuditRuns(id, limit),
+      getLastSuccessfulAuditRunAt: (id: string) => realStore.getLastSuccessfulAuditRunAt(id),
     };
     const coordinator = new DocumentCoordinator(documentId, delayedStore);
     await coordinator.ready;
