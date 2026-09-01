@@ -8,6 +8,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test:index": "vitest run --config vitest.crosscheck.config.ts"
   }
 }

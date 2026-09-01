@@ -12,7 +12,8 @@
     "test:convergence": "vitest run --config vitest.convergence.config.ts",
     "test:properties": "vitest run --config vitest.properties.config.ts",
     "test:adversarial": "vitest run --config vitest.adversarial.config.ts",
-    "test:mutation": "vitest run --config vitest.mutation.config.ts"
+    "test:mutation": "vitest run --config vitest.mutation.config.ts",
+    "test:benchmark": "vitest run --config vitest.benchmark.config.ts"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*"

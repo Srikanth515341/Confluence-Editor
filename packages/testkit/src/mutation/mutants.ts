@@ -41,10 +41,12 @@ export const MUTANTS: readonly MutantDefinition[] = [
       "Integration scan ignores originRight — reverts to the pre-fix prototype behavior " +
       "where the scan window is always [originLeft, end-of-document).",
     violatedInvariant: "I4 (origin presence at integration time) / I6 (scan-window determinism)",
+    // Phase 19: `this.nodes.length` (an O(N) flat-array read) became `this.index.size`
+    // (the PositionIndex's O(1) augmented count) — same target, new text.
     find:
       "    const rightIndex =\n" +
-      "      node.originRight === null ? this.nodes.length : this.indexOfOrigin(node.originRight);",
-    replace: "    const rightIndex = this.nodes.length;",
+      "      node.originRight === null ? this.index.size : this.indexOfOrigin(node.originRight);",
+    replace: "    const rightIndex = this.index.size;",
   },
   {
     id: "M3_no_case_c",
@@ -55,10 +57,12 @@ export const MUTANTS: readonly MutantDefinition[] = [
     // Anchored on just the closing lines rather than the whole Case C
     // comment block, so this patch survives comment-only edits to the
     // (fairly long) canary explanation above the `break` — only the
-    // control-flow shape here is what M3 actually needs to change.
-    find: "          }\n          break;\n        }\n      }\n    }\n\n    this.nodes.splice(destIndex, 0, node);",
+    // control-flow shape here is what M3 actually needs to change. Phase 19:
+    // the final placement call became `this.index.insertAt(...)` (was
+    // `this.nodes.splice(...)`) — same anchor, new trailing text.
+    find: "          }\n          break;\n        }\n      }\n    }\n\n    this.index.insertAt(destIndex, node);",
     replace:
-      "          }\n          // MUTANT M3_no_case_c: break removed — scan continues past the outer region.\n        }\n      }\n    }\n\n    this.nodes.splice(destIndex, 0, node);",
+      "          }\n          // MUTANT M3_no_case_c: break removed — scan continues past the outer region.\n        }\n      }\n    }\n\n    this.index.insertAt(destIndex, node);",
   },
   {
     id: "M4_no_binding",
@@ -92,8 +96,14 @@ export const MUTANTS: readonly MutantDefinition[] = [
     file: "engine.ts",
     description: "Delete removes the node from S instead of tombstoning it.",
     violatedInvariant: "I5 (tombstone retention)",
+    // Phase 19: `node.deleted = true` (a direct field write) became `this.index.setDeleted(node,
+    // true)` (the sole place that field is now written — see engine.ts's own comment there); the
+    // physical-removal mutation itself now targets `this.index` too — `this.nodes` is a
+    // GETTER as of Phase 19 (a fresh in-order traversal each call), so splicing IT would splice a
+    // throwaway array and silently become a no-op, which would falsify this mutant's whole intent
+    // (it must ACTUALLY remove the node from the live structure to violate I5).
     find:
-      "    node.deleted = true;\n" +
+      "    this.index.setDeleted(node, true);\n" +
       "    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {\n" +
       "      node.deletedBy = op.id;\n" +
       "    }\n" +
@@ -102,8 +112,8 @@ export const MUTANTS: readonly MutantDefinition[] = [
       "  /**\n" +
       "   * Structural inverse of applyDelete",
     replace:
-      "    node.deleted = true;\n" +
-      "    this.nodes.splice(this.nodes.indexOf(node), 1); // MUTANT M6_physical_delete\n" +
+      "    this.index.setDeleted(node, true);\n" +
+      "    this.index.splice(this.index.indexOf(node), 1); // MUTANT M6_physical_delete\n" +
       "    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {\n" +
       "      node.deletedBy = op.id;\n" +
       "    }\n" +
@@ -144,8 +154,14 @@ export const MUTANTS: readonly MutantDefinition[] = [
     file: "engine.ts",
     description: "deletedBy keeps the FIRST deletion instead of the causally latest.",
     violatedInvariant: "I7 (deletion attribution monotonicity) — Engine Spec §4.5 line 3",
+    // Phase 19: same underlying source change as M6 above (`node.deleted = true` became
+    // `this.index.setDeleted(node, true)`) — this mutant's OWN semantic is unchanged
+    // (attribution logic, not tombstone visibility), so the replace text still calls
+    // `this.index.setDeleted(node, true)` UNCHANGED (keeping the index's augmented
+    // visibleCount bookkeeping correct — a stale count would be an unrelated confound, not
+    // what I7's check is meant to catch) and only mutates the `deletedBy` attribution rule.
     find:
-      "    node.deleted = true;\n" +
+      "    this.index.setDeleted(node, true);\n" +
       "    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {\n" +
       "      node.deletedBy = op.id;\n" +
       "    }\n" +
@@ -155,7 +171,7 @@ export const MUTANTS: readonly MutantDefinition[] = [
       "   * Structural inverse of applyDelete",
     replace:
       "    const alreadyDeleted = node.deleted; // MUTANT M9_delete_first_wins\n" +
-      "    node.deleted = true;\n" +
+      "    this.index.setDeleted(node, true);\n" +
       "    if (!alreadyDeleted) {\n" +
       "      node.deletedBy = op.id;\n" +
       "    }\n" +

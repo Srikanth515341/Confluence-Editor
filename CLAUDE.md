@@ -52,9 +52,15 @@ packages/engine      @collab-editor/engine    — OBSEQ. Phase 1 built the data 
                                                  ClockEvent log on Engine (mint()/
                                                  observe() each push one event) that
                                                  exists solely so I0's assertion can
-                                                 independently replay the clock. No
-                                                 index (§8.5) yet — position lookup
-                                                 during integrate() is a linear scan.
+                                                 independently replay the clock. Phase 19
+                                                 added positionIndex.ts (PositionIndex, an
+                                                 implicit-key treap with O(log N) expected
+                                                 indexOf/nodeAtVisible/visibleIndexOf/
+                                                 splice/setDeleted, Engine Spec §8.5) —
+                                                 engine.ts's node storage now lives there
+                                                 instead of a flat array; `nodes` is a
+                                                 getter (in-order traversal) for backward
+                                                 compatibility with every existing caller.
                                                  Pure: no DOM, no network, no storage,
                                                  no clock. Only package whose tsconfig
                                                  excludes "DOM" from lib.
@@ -2865,32 +2871,276 @@ audit-runs`** — the DoD's "audit_runs rows are queryable and the 'last
   mechanical update, not a behavior change, and the SAME kind of update
   this exact object literal already needed once before, in Phase 17.
 
+- **Phase 19 — Indexed position structure** (Engine Spec §8.5 index
+  contract, §8.2-§8.4; RFC §7.8, §10.4; Test Plan §2.6 I6). Replaces
+  `packages/engine`'s flat-array, O(N) linear-scan node storage — a
+  deliberate Phase 3 placeholder ("no index (§8.5) yet — position lookup
+  during integrate() is a linear scan") — with `PositionIndex`
+  (`packages/engine/src/positionIndex.ts`), an implicit-key TREAP
+  (randomized balanced BST, no rotation bookkeeping) augmented with
+  subtree `size` (total node count) and `visibleCount` (non-tombstoned
+  count), plus parent pointers for O(log N) upward position walks.
+  Explicitly NOT a performance-only change per the phase brief's own
+  framing: two acceptance criteria — RC-27 (RFC §10.4) and M3-c/M8-a
+  (Engine Spec §8.3) — fail outright without it.
+
+  **What moved to the index, and what deliberately did not.** Engine
+  Spec §8.2 measured `integrate()`'s Case A/B/C scan WINDOW as already
+  effectively constant (p50=0, p95=4, p99=9 nodes on a 20,000-node
+  structure) — the phase brief's own "index what actually costs"
+  instruction, so that scan loop's internal logic is UNCHANGED, still
+  reading one node at a time via a direct positional accessor
+  (`this.index.nodeAt(i)`, replacing `this.nodes[i]`). What WAS O(N) and
+  needed to move: `indexOfOrigin` (identifier → position, called twice
+  per `integrate()` call, via `PositionIndex.indexOf`), the final
+  placement (`this.nodes.splice(...)` → `this.index.insertAt(...)`), and
+  `localInsert`/`localDelete`'s visible-position lookups (previously
+  `this.visible()` — a full O(N) materialize-then-index on EVERY
+  keystroke — now `this.index.nodeAtVisible(k)` directly, O(log N)).
+  `stats()` also moved from an O(N) traversal to reading
+  `index.size`/`index.visibleSize` directly (O(1) — the augmented counts
+  the tree already maintains for every other operation).
+
+  **The six-item Engine Spec §8.5 list is five real operations plus one
+  correctness property, not six operations** (the phase brief's own
+  wording: "the six operations... and property 6: iteration order
+  identical to S at all times" — property 6 is itself the sixth list
+  item, not an operation). `PositionIndex` implements all five —
+  `indexOf(node)`, `nodeAtVisible(k)`, `visibleIndexOf(node)`,
+  `splice(position, deleteCount, ...insert)`, `setDeleted(node,
+  deleted)` — plus `toArray()` (an in-order traversal, satisfying
+  property 6 by construction: a treap's own ordering invariant IS
+  position order, regardless of shape). One additional method,
+  `nodeAt(position)` (total-position → node), is NOT one of the five
+  named operations but is required internally by `integrate()`'s own
+  scan loop (the direct successor to the flat array's `this.nodes[i]`) —
+  documented in its own doc comment as exactly that: engine-internal
+  plumbing beyond the public contract, the same category as Phase 3's
+  own (still-private) `indexOfOrigin`. `splice`'s removal path (`deleteCount
+  > 0`) is implemented fully per the spec's own general contract even
+  though the engine itself only ever calls it with `deleteCount === 0`
+  (physical removal doesn't happen pre-GC, Invariant I5) — a
+  half-implemented contract operation would be a worse trap for Phase 21
+  (GC) to inherit than a fully correct, currently-unexercised one.
+
+  **`engine.nodes` became a GETTER, not a stored field** — `get nodes():
+  readonly Node[] { return this.index.toArray(); }` — preserving the
+  exact external shape (`readonly Node[]`) every existing consumer across
+  the whole workspace already relies on, confirmed via an exhaustive
+  workspace-wide grep before writing a line of engine.ts: server's two
+  replay endpoints and its snapshot/audit/handshake code
+  (`coordinator.engine.nodes`), `invariants.ts` (reads it ONCE per call
+  into a local `const nodes = engine.nodes`, then reuses that reference —
+  safe with a getter, no repeated-traversal cost), testkit's
+  adversarial/property/mutation suites (`seed.nodes`, all read-only:
+  `for...of`, `.map`, indexed reads — never `.push`/`.splice`/reassignment
+  outside `engine.ts` itself). This getter is O(N), same as the flat
+  array it replaces would cost for the same "materialize the whole
+  sequence" operation — the fix is that NOTHING on the hot path calls it
+  anymore, not that whole-document reads got any cheaper (they were
+  never the problem `Engine Spec §8.2` identified).
+
+  **Priorities are a small deterministic generator (SplitMix32-shaped,
+  per-`PositionIndex`-instance seed and counter), not `Math.random()`** —
+  a deliberate choice, not an oversight. A treap's SHAPE is a pure
+  implementation detail invisible to every external observer (property
+  6 above holds regardless of shape), so nothing about convergence
+  requires reproducibility here — but this project's engine has been
+  kept 100% deterministic given identical inputs since Phase 0 (two
+  independent purity-enforcement mechanisms exist for exactly this), and
+  `Math.random()` would have been the ONLY source of true
+  non-determinism the engine has ever had, for a detail nothing outside
+  `positionIndex.ts` can even observe. Priorities are independent of
+  node content/position by construction, which is what gives a treap its
+  O(log N) EXPECTED height guarantee regardless of insertion PATTERN —
+  verified directly, not just asserted: a dedicated unit test inserts
+  200 nodes always at position 0 (the exact pattern that degenerates a
+  naive unbalanced BST into a linear chain) and confirms `toArray()`
+  still returns them in correct order, which by itself doesn't prove
+  balance, but the same shape is what the logarithmic scaling benchmark
+  below empirically confirms at 100,000 nodes.
+
+  **`applyDelete`/`applyUndelete` now route their tombstone mutation
+  through `PositionIndex.setDeleted(node, deleted)`, never `node.deleted
+  = true/false` directly** — the SOLE place that field is written as of
+  this phase, so the augmented `visibleCount` along a node's ancestor
+  path can never drift out of sync with the field it's summarizing. The
+  causally-latest `deletedBy` attribution logic itself (Engine Spec §4.5
+  line 3, unchanged since Phase 3) is untouched — only the LINE that
+  flips `node.deleted` moved.
+
+  **`localDelete`'s snapshot-free rewrite required a real (if small)
+  correctness argument, not just a mechanical substitution** — documented
+  inline in engine.ts, restated here because it's easy to get wrong by
+  intuition: the pre-Phase-19 version snapshotted `this.visible()` ONCE
+  and indexed `vis[visibleIndex + k]` for k=0..count-1 into that static
+  array. The rewrite instead re-queries the SAME `visibleIndex` against
+  the LIVE, mutating index on every iteration. These are equivalent
+  because each successful delete removes exactly one unit from vis(S) AT
+  `visibleIndex` itself — removing position P shifts everything after P
+  left by one, so whatever now occupies that same visible position P is
+  exactly what would have been at P+1 in the original snapshot. Verified
+  both by direct reasoning and by the fact that every pre-existing
+  engine/adversarial/property/convergence test exercising delete ranges
+  still passes unchanged.
+
+  **The reference cross-check (Test Plan §2.6 I6)**: a plain flat-array
+  linear-scan oracle (`packages/engine/src/positionIndex.crosscheck.test.ts`),
+  sharing the SAME `Node` object references as the `PositionIndex` under
+  test, driven through an identical random operation sequence per seed.
+  Every operation's immediate structural consequence (the resulting
+  order, via `toArray()`) is checked after EVERY step; the full
+  positional-query contract (`indexOf`/`visibleIndexOf` for every node,
+  `nodeAt`/`nodeAtVisible` for every position) is checked exhaustively
+  once per seed, against that seed's own accumulated (randomly shaped)
+  structure. **10,000/10,000 seeds, zero disagreements.** Split into its
+  own file/vitest config (`pnpm test:index`,
+  `packages/engine/vitest.crosscheck.config.ts`) rather than living in
+  the fast, direct contract-test file (`positionIndex.test.ts`, which
+  stays in the default `pnpm test`) — the 10,000-seed run takes ~20s,
+  fuzz-suite scale, not inner-loop scale, the same reasoning behind this
+  project's existing convergence/properties/mutation split (root
+  `vitest.config.ts`'s own `exclude`).
+
+  **A genuine, pre-existing bug found and fixed while re-running the
+  mandatory mutation-matrix regression check — NOT a Phase 19 regression,
+  but surfaced by this phase's own work.** Re-running `pnpm test:mutation`
+  against the rewritten engine initially crashed outright (not a changed
+  kill/survive result — a hard failure) with `mutant M2_no_right_bound:
+  expected exactly 1 occurrence of its find-text in engine.ts, found 0`.
+  Root cause: `packages/testkit/src/mutation/loadMutantEngine.ts` reads
+  each source file via plain `readFileSync(..., "utf8")` and matches a
+  mutant's `find` string (written with literal `\n`) against it — this
+  breaks the instant the target file is checked out with CRLF line
+  endings, which `engine.ts` (along with 163 other files, confirmed by
+  scanning `packages/**`) already was on this Windows checkout, via
+  git's `core.autocrlf=true` — a REPO-WIDE, pre-existing condition
+  (`pnpm format:check` already failed on 164 files before this phase
+  touched anything) unrelated to any of this phase's own edits. Every
+  mutant with a MULTI-LINE `find` string (M2, M3, M5, M6, M7, M8, M9,
+  M10 — only single-line M1/M4 survived by accident) was equally broken
+  by this, confirmed directly (M5, untouched by this phase's edits,
+  failed the identical way). **Fixed at the harness level**, not by
+  reformatting the checked-out files: `loadEngine()` now normalizes
+  `source.replace(/\r\n/g, "\n")` immediately after reading each file,
+  before both the find/replace matching AND the transpile step (TypeScript
+  is line-ending-agnostic, so this is always safe) — a durable fix that
+  makes the harness robust to line-ending style regardless of how any
+  future checkout happens to be configured, rather than a one-time
+  workaround. Re-run after the fix: **identical to the documented Phase 6
+  baseline** — 9 of 10 mutants killed, `M3_no_case_c` survives every
+  suite, same per-mutant kill/survive breakdown column for column. No
+  regression, no change in results — the mandatory gate this phase's own
+  brief required ("if the mutation matrix's results change at all... stop
+  and report that explicitly") is satisfied by their NOT changing.
+
+  **Of the ten mutants, four needed their `find`/`replace` text updated
+  to match engine.ts's new source** (not three, as initially scoped
+  before implementation — `M9_delete_first_wins` targets the exact same
+  `applyDelete` body text as `M6_physical_delete`, which was missed in
+  the initial per-mutant scan and only caught by actually re-deriving
+  each mutant's anchor text against the rewritten file): `M2_no_right_bound`
+  (`this.nodes.length` → `this.index.size`), `M3_no_case_c`
+  (`this.nodes.splice(destIndex, 0, node)` → `this.index.insertAt(destIndex,
+  node)`), `M6_physical_delete` (`node.deleted = true` → `this.index.setDeleted(node,
+  true)` for its FIND anchor — and its REPLACE text's own mutation logic
+  also had to change, from `this.nodes.splice(this.nodes.indexOf(node),
+  1)` to `this.index.splice(this.index.indexOf(node), 1)`, since
+  `this.nodes` is now a getter returning a FRESH throwaway array every
+  call — splicing it would silently no-op and falsify the mutant's whole
+  point), `M9_delete_first_wins` (same FIND-anchor change as M6; its
+  REPLACE text keeps calling `this.index.setDeleted(node, true)`
+  unconditionally, changing ONLY the `deletedBy` attribution rule — so
+  the index's own `visibleCount` bookkeeping stays correct and isn't an
+  unrelated confound for a mutant whose whole point is attribution logic,
+  not tombstone visibility). Each mutant's ORIGINAL semantic intent (which
+  invariant it violates) is unchanged — only the literal anchor text moved.
+  `loadMutantEngine.ts`'s `SOURCE_FILES` list also gained `"positionIndex.ts"`
+  (engine.ts now imports it at runtime, not just for types — the mutant
+  scratch-directory build would fail to resolve the import otherwise).
+
+  **Full regression suite, re-run in full per the phase brief's own
+  CRITICAL instruction, all passing**: default `pnpm test` — 308 tests
+  (up from 301; +7 new direct `PositionIndex` contract tests), all
+  passing, ~25s (down from an initial ~68s before the reference
+  cross-check was split into its own gated file — see below); `pnpm
+  test:adversarial` — 22/22 ADV cases; `pnpm test:properties` — 6/6
+  suites (PROP-1..5, 10,000 generated cases each); `pnpm test:convergence`
+  — **60,000/60,000 seeds converge, zero divergences, zero stuck-pending,
+  across all 6 required configs** (C1-baseline 10,000/10,000, C2-collision
+  10,000/10,000, C3-delete-heavy 10,000/10,000, C4-deep 10,000/10,000,
+  C5-wide 10,000/10,000, C6-skew 10,000/10,000 — every one of the ten
+  Engine Spec §5 invariants I0-I9 actively checked via `assertInvariants()`
+  after every mutating call, exactly as Phase 4 established); `pnpm
+  test:mutation` — 9/10 killed, identical to the Phase 6 baseline (see
+  above); `pnpm test:index` — the new 10,000-seed reference cross-check,
+  zero disagreements. `pnpm typecheck`/`pnpm lint`/`pnpm check:purity` all
+  pass across every package (`check-engine-purity.mjs` now scans 13 files,
+  up from 11, `0 violations`). The convergence run took considerably
+  longer wall-clock than prior phases' documented runs (~27 minutes) —
+  flagged honestly rather than rounded away: part of this is genuine
+  per-operation treap overhead (object allocation, recursive split/merge,
+  a `Map` lookup per `PositionIndex` operation, versus a flat array's
+  native, highly-optimized `splice`/`indexOf` at the SMALL-to-medium
+  document sizes a single fuzz trial actually reaches) and part is CPU
+  contention from running the mutation-matrix re-run concurrently in a
+  separate background process during the same measurement — the two were
+  NOT deliberately isolated for a clean timing signal, since correctness
+  (zero divergences), not wall-clock speed, is what this particular gate
+  exists to verify; the scaling benchmark below is the dedicated,
+  isolated timing measurement.
+
+  **Scaling benchmark** (`packages/testkit/src/benchmark/scaling.ts` +
+  `scaling.bench.test.ts`, run via `pnpm test:benchmark`; full numbers in
+  `docs/benchmarks.md`). Lives in `packages/testkit` (the project's own
+  "load harness" package), not `packages/engine` — timing measurement
+  needs `performance.now()`, which engine-purity rules forbid everywhere
+  in `packages/engine/src`, including test files (`scripts/
+  check-engine-purity.mjs`'s own comment: "Test files are scanned too,
+  deliberately"). Methodology: build a document of N characters via N
+  sequential end-appends, then time 500 FURTHER `localInsert()` calls at
+  uniformly random VISIBLE positions (deliberately not more appends — an
+  append-only workload never exercises `indexOfOrigin`'s worst case,
+  which is what actually distinguishes O(log N) from a linear scan).
+  **Measured, at N = 1,000 / 32,000 / 100,000 nodes**: p95 = 0.021ms /
+  0.014ms / 0.017ms — **0.80x growth over a 100x size increase** (the
+  theoretical O(log N) expectation is ~1.67x; a pre-Phase-19 O(N) scan is
+  cited in this phase's own brief as having measured ~61x). **M3-c**
+  (Engine Spec §8.3: 100,000-char document, local insert p99 ≤ 16ms):
+  measured p99 at 100,000 nodes is **0.030ms**, ~533x under budget.
+  **RC-27** (RFC §10.4: previously missed M6 by 3.6x, 12.3s vs. a 1.1s
+  target under the old O(N) implementation): with per-operation costs now
+  in the tens-of-microseconds range even at 100,000 nodes, the bottleneck
+  RC-27 was measuring no longer exists on this path. Two real assertions
+  back these numbers, not just a printed report: `p95GrowthRatio <
+  10` (generous headroom above the ~1.67x theoretical value, while
+  remaining utterly incompatible with ~100x linear growth) and `p99 at
+  100,000 nodes ≤ 16` (M3-c's literal number).
+
 ## Current phase in progress
 
-None — Phase 18 (integrity audit and bisect) complete. `auditDocument()`
-implements API Spec §6.6's six steps exactly, including the
-pendingCount()-before-text-comparison ordering DUR-01 specifically calls
-out as catching what a text comparison alone would miss; BISECT is a
-real binary search over a document's own snapshot history, not a
-placeholder; both the in-process scheduler (full 5-step audits, live
-comparison included) and the standalone CLI (DB-only, steps 1-4) are
-built and manually smoke-tested against a real seeded document. Not yet
-built: any alerting beyond a log line + a nonzero CLI exit code (no
-paging/webhook integration exists — this project has none yet for
-anything, not just audits); the scheduler currently only ever audits
-documents with a CURRENTLY-OPEN coordinator, never sweeping the full set
-of documents that have ever existed — a real design question left open,
-not decided here (flagged in auditScheduler.ts's own doc comment);
-`audit_runs` retention (nothing prunes old rows, same as `snapshots`'
-own unaddressed retention gap from Phase 17).
+None — Phase 19 (indexed position structure) complete. `packages/engine`'s
+node storage moved from a flat array (linear-scan position lookup, a
+deliberate Phase 3 placeholder) to `PositionIndex`, an implicit-key treap
+with O(log N) expected `indexOf`/`nodeAtVisible`/`visibleIndexOf`/`splice`/
+`setDeleted`. All required regression gates re-run and passing: default
+`pnpm test` (308), `pnpm test:adversarial` (22/22), `pnpm test:properties`
+(6/6, 10,000 cases each), `pnpm test:convergence` (60,000/60,000 seeds,
+0 divergences), `pnpm test:mutation` (9/10 killed, identical to the Phase
+6 baseline — no regression), and the new `pnpm test:index` (10,000-seed
+reference cross-check against a linear-scan oracle, zero disagreements).
+Scaling benchmark confirms logarithmic growth (p95 0.80x over a 100x size
+increase, 1,000 → 100,000 nodes) and M3-c's p99 ≤ 16ms target (measured
+0.030ms) — see `docs/benchmarks.md`. A genuine, pre-existing (not
+Phase-19-caused) CRLF-sensitivity bug in the mutation-testing harness was
+found and fixed along the way — see the Phase 19 completed-phase entry.
 
 ## What is explicitly NOT yet built
 
 Undo/redo's real resurrection semantics beyond Undelete's structural
-inverse (Phase 36); the indexed position structure (Phase 19) — integrate()
-currently locates origins via a linear `indexOf` scan, not an index; garbage
-collection (Phase 21); block run-length encoding (later, alongside GC) — and
-because of that, SNAPSHOT's structure-form body serialization
+inverse (Phase 36); garbage collection (Phase 21); block run-length
+encoding (later, alongside GC) — and because of that, SNAPSHOT's
+structure-form body serialization
 (`packages/protocol/src/snapshotBody.ts`) is a deliberate Phase 9 placeholder
 EXPECTED to be reworked in Phase 20, not a finished format. The OPS and
 CONTROL channels both now flow end to end (Phases 7-9); PRESENCE message
@@ -3417,6 +3667,8 @@ pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each
 pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
+pnpm test:index        # PositionIndex reference cross-check ONLY — 10,000 seeds vs. a linear-scan oracle (Phase 19, Test Plan §2.6 I6)
+pnpm test:benchmark    # PositionIndex scaling benchmark ONLY — p95/p99 at 1,000/32,000/100,000 nodes (Phase 19); real numbers in docs/benchmarks.md
 pnpm test:db           # schema (Phase 15) + write-path/durability (Phase 16) suites — requires a real, migrated Postgres
 ```
 
@@ -3479,8 +3731,14 @@ validation runs actually used for most of its repeated-run confidence
 many times, and the honest DoD status this phase is actually shipping
 with).
 
-`pnpm test` currently passes: 301 tests across 36 files (up from 283/33
-— Phase 14 added `packages/client/src/app/{urlParams,App}.test.ts(x)`
+`pnpm test` currently passes: 308 tests across 37 files (up from 301/36 —
+Phase 19 added `packages/engine/src/positionIndex.test.ts`, 7 direct
+`PositionIndex` contract tests; the 10,000-seed reference cross-check
+lives separately in `positionIndex.crosscheck.test.ts`, run via `pnpm
+test:index`, not part of the default suite — see the Phase 19 entry
+above). Historical counts below (301/36 etc.) predate Phase 19 and are
+kept for their own narrative context; the paragraph immediately below was
+written as of Phase 14 — Phase 14 added `packages/client/src/app/{urlParams,App}.test.ts(x)`
 and rewrote `gapTracker.test.ts`/part of `syncClient.test.ts` for the
 corrected stall semantics; `packages/server/src/httpApp.test.ts` is also
 new, covering the `/v1/documents/:id/replay` endpoint), including
@@ -3567,6 +3825,9 @@ inert invariant module. It is wired into CI as its own job
 `ci` job, so GitHub reports it as its own named check — but actually
 marking that check as a branch-protection-required status is still a
 manual, one-time GitHub Settings action that hasn't been done yet.
+Re-confirmed clean against the Phase 19 `PositionIndex`-backed engine
+(all six configs, 60,000/60,000 seeds, zero divergences) — see the Phase
+19 completed-phase entry.
 
 `pnpm test:properties` currently PASSES: 5 properties (PROP-1…5, Test
 Plan §2.5) at 10,000 fast-check-generated cases each, plus a sixth,
@@ -3592,7 +3853,18 @@ fuzzing ten engine variants isn't inner-loop material, even at the
 reduced sanity budget this command uses); the authoritative full
 10^6-trial MUT-KILL-01 run is separate (`MUT_KILL_01_BUDGET=1000000`,
 what the nightly workflow sets) — see the Phase 6 completed-phase entry
-above for its result.
+above for its result. Re-run against the Phase 19 `PositionIndex`-backed
+engine: IDENTICAL result (9/10 killed, `M3_no_case_c` survives every
+suite, same per-mutant breakdown) — no regression. Four of the ten
+mutants' `find`/`replace` text needed updating to match engine.ts's new
+source (M2, M3, M6, M9 — see the Phase 19 entry for the full account,
+including a genuine pre-existing CRLF-sensitivity bug in
+`loadMutantEngine.ts` found and fixed while re-running this).
+
+`pnpm test:index` (Phase 19) currently PASSES: 10,000/10,000 seeds, zero
+disagreements between `PositionIndex` and a linear-scan reference oracle
+(Test Plan §2.6 I6) — see the Phase 19 completed-phase entry and
+`docs/benchmarks.md`.
 
 `pnpm test:db` currently PASSES: 27 tests across five files, run
 against a real, Docker-Composed Postgres instance — repeated across

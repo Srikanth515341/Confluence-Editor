@@ -31,6 +31,16 @@ export default defineConfig({
       // (packages/server/vitest.db.config.ts), same reasoning as the
       // three suites above.
       "**/db/**/*.db.test.ts",
+      // Phase 19's PositionIndex reference cross-check (Test Plan §2.6 I6):
+      // 10,000 seeds against a linear-scan oracle, ~50s — fuzz-suite scale,
+      // gated the same way via `pnpm test:index`
+      // (packages/engine/vitest.crosscheck.config.ts). The FAST, direct
+      // contract tests (positionIndex.test.ts) stay in the default run.
+      "**/positionIndex.crosscheck.test.ts",
+      // Phase 19's scaling benchmark (Engine Spec §8.2-§8.3, RFC §10.4) —
+      // timing-sensitive, gated the same way via `pnpm test:benchmark`
+      // (packages/testkit/vitest.benchmark.config.ts).
+      "**/benchmark/**/*.bench.test.ts",
     ],
     environment: "node",
     globals: false,

@@ -8,6 +8,7 @@ import type {
   UndeleteOperation,
 } from "./operation.js";
 import { isClusterContinuing } from "./grapheme.js";
+import { PositionIndex } from "./positionIndex.js";
 
 /** Structural metrics feeding PRD M8 / RFC §7.8's tombstone-ratio observability. */
 export interface EngineStats {
@@ -62,10 +63,10 @@ function sameOrigin(a: Identifier | null, b: Identifier | null): boolean {
  *
  * This phase implements only the data structures and identifier generation
  * (Engine Spec §2, §3). integrate() / applyRemote() / applyDelete() /
- * applyUndelete() (Engine Spec §4.3–§4.6) are Phase 3; the index (§8.5) is
- * Phase 19; garbage collection (§7) is Phase 21; undo (§9) is Phase 36. The
- * shape below exists now so later phases extend one class rather than
- * re-deriving its fields.
+ * applyUndelete() (Engine Spec §4.3–§4.6) are Phase 3; the index (§8.5,
+ * {@link PositionIndex}) was added Phase 19; garbage collection (§7) is
+ * Phase 21; undo (§9) is Phase 36. The shape below exists now so later
+ * phases extend one class rather than re-deriving its fields.
  *
  * Purity: this class touches nothing but its own in-memory fields. No DOM,
  * no network, no storage, no wall clock — enforced independently by
@@ -80,8 +81,24 @@ export class Engine {
    */
   private clock = 0;
 
-  /** Ordered node sequence S (Engine Spec Definition 2.2). Populated starting Phase 3. */
-  readonly nodes: Node[] = [];
+  /**
+   * Ordered node sequence S (Engine Spec Definition 2.2), backed as of
+   * Phase 19 by {@link PositionIndex} — a balanced tree, not a flat array
+   * (Engine Spec §8.5). `nodes` itself stays a public GETTER returning a
+   * fresh in-order traversal, preserving the exact same external shape
+   * (`readonly Node[]`) every existing caller across the workspace already
+   * relies on (server's replay endpoints, snapshotting, the audit module,
+   * every invariant check) — none of them needed to change. This getter is
+   * O(N), same as the flat array it replaces would cost for the same
+   * "materialize the whole sequence" operation; the actual fix is that nothing
+   * on the hot path (integrate()'s origin lookups, localInsert/localDelete's
+   * visible-position lookups) calls this getter anymore — see `index` below.
+   */
+  private readonly index = new PositionIndex();
+
+  get nodes(): readonly Node[] {
+    return this.index.toArray();
+  }
 
   /** Identifier → Node lookup K (Engine Spec Definition 2.2), keyed by a serialized identifier. */
   private readonly byKey = new Map<string, Node>();
@@ -151,7 +168,12 @@ export class Engine {
     return this.clock;
   }
 
-  /** Visible sequence vis(S): non-tombstoned nodes, in structure order (Definition 2.3). */
+  /**
+   * Visible sequence vis(S): non-tombstoned nodes, in structure order
+   * (Definition 2.3). O(N) — used only for whole-document reads (`text()`,
+   * `stats()`); the per-character hot paths (`localInsert`/`localDelete`)
+   * no longer call this (Phase 19) and go straight through `index`.
+   */
   visible(): readonly Node[] {
     return this.nodes.filter((n) => !n.deleted);
   }
@@ -163,18 +185,19 @@ export class Engine {
       .join("");
   }
 
-  /** Structural metrics: total nodes, tombstone count, visible length. */
+  /**
+   * Structural metrics: total nodes, tombstone count, visible length. Reads
+   * `index.size`/`index.visibleSize` directly (O(1), Phase 19) rather than
+   * traversing `this.nodes` — the augmented counts the tree already
+   * maintains for every other operation are exactly what this needs too.
+   */
   stats(): EngineStats {
-    let tombstones = 0;
-    for (const n of this.nodes) {
-      if (n.deleted) {
-        tombstones += 1;
-      }
-    }
+    const totalElements = this.index.size;
+    const visibleLength = this.index.visibleSize;
     return {
-      totalElements: this.nodes.length,
-      tombstones,
-      visibleLength: this.nodes.length - tombstones,
+      totalElements,
+      tombstones: totalElements - visibleLength,
+      visibleLength,
     };
   }
 
@@ -190,10 +213,11 @@ export class Engine {
   }
 
   /**
-   * Index of the node identified by `id` within `this.nodes`. Only ever
-   * called on an origin that `ready()` has already confirmed present —
-   * the thrown error documents that precondition rather than being a
-   * reachable runtime case.
+   * Total-order position of the node identified by `id`, via the O(log N)
+   * {@link PositionIndex.indexOf} (Phase 19 — an O(N) `this.nodes.indexOf`
+   * scan pre-Phase-19). Only ever called on an origin that `ready()` has
+   * already confirmed present — the thrown error documents that
+   * precondition rather than being a reachable runtime case.
    */
   private indexOfOrigin(id: Identifier): number {
     const node = this.byKey.get(serializeId(id));
@@ -202,7 +226,7 @@ export class Engine {
         `integrate(): origin ${serializeId(id)} is not present — ready() must be checked before integrating`,
       );
     }
-    return this.nodes.indexOf(node);
+    return this.index.indexOf(node);
   }
 
   /** Causal readiness (Engine Spec Definition 4.1). */
@@ -224,11 +248,11 @@ export class Engine {
   private integrate(node: Node): void {
     const leftIndex = node.originLeft === null ? -1 : this.indexOfOrigin(node.originLeft);
     const rightIndex =
-      node.originRight === null ? this.nodes.length : this.indexOfOrigin(node.originRight);
+      node.originRight === null ? this.index.size : this.indexOfOrigin(node.originRight);
 
     if (leftIndex + 1 === rightIndex) {
       // Nothing currently sits between our origins — no conflict to resolve.
-      this.nodes.splice(leftIndex + 1, 0, node);
+      this.index.insertAt(leftIndex + 1, node);
       return;
     }
 
@@ -236,8 +260,12 @@ export class Engine {
     const scanned = new Set<Node>();
     const conflicting = new Set<Node>();
 
+    // Engine Spec §8.2: this window is already effectively constant (p50=0, p95=4, p99=9 on a
+    // 20,000-node structure) — direct positional reads here, one per scanned node, are the
+    // right call; only the boundary lookups above (leftIndex/rightIndex) and the final
+    // placement below needed to move to the O(log N) index (Phase 19).
     for (let i = leftIndex + 1; i < rightIndex; i++) {
-      const other = this.nodes[i];
+      const other = this.index.nodeAt(i);
       if (!other) {
         break;
       }
@@ -294,7 +322,7 @@ export class Engine {
       }
     }
 
-    this.nodes.splice(destIndex, 0, node);
+    this.index.insertAt(destIndex, node);
   }
 
   private applyInsert(op: InsertOperation): void {
@@ -323,7 +351,10 @@ export class Engine {
     if (node === null) {
       throw new Error(`applyDelete(): target ${serializeId(op.target)} is not present`);
     }
-    node.deleted = true;
+    // Routed through the index (Phase 19), not `node.deleted = true` directly, so the
+    // augmented visibleCount along its ancestor path is recomputed in the same call —
+    // PositionIndex.setDeleted is the SOLE place `node.deleted` is ever written.
+    this.index.setDeleted(node, true);
     if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
       node.deletedBy = op.id;
     }
@@ -341,7 +372,7 @@ export class Engine {
       throw new Error(`applyUndelete(): target ${serializeId(op.target)} is not present`);
     }
     if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
-      node.deleted = false;
+      this.index.setDeleted(node, false);
       node.deletedBy = null;
     }
   }
@@ -410,15 +441,19 @@ export class Engine {
     return { buffered: true };
   }
 
-  /** Mints and applies a local insert, returning the operation to broadcast (API Spec §1.4). */
+  /**
+   * Mints and applies a local insert, returning the operation to broadcast
+   * (API Spec §1.4). O(log N) as of Phase 19 — origin lookups go straight
+   * through `index.nodeAtVisible()` rather than materializing the whole
+   * visible sequence via `visible()` first (the pre-Phase-19 O(N) approach).
+   */
   localInsert(
     visibleIndex: number,
     value: number,
     bind: boolean = isClusterContinuing(value),
   ): InsertOperation {
-    const vis = this.visible();
-    const leftNode = visibleIndex > 0 ? vis[visibleIndex - 1] : undefined;
-    const rightNode = visibleIndex < vis.length ? vis[visibleIndex] : undefined;
+    const leftNode = visibleIndex > 0 ? this.index.nodeAtVisible(visibleIndex - 1) : undefined;
+    const rightNode = this.index.nodeAtVisible(visibleIndex);
     const op: InsertOperation = {
       kind: "insert",
       id: this.mint(),
@@ -437,12 +472,23 @@ export class Engine {
    * `visibleIndex` (against the visible sequence as it stood when this
    * call began), returning one operation per removed unit with
    * consecutive counters in return order (API Spec §1.4).
+   *
+   * O(log N) per removed unit as of Phase 19 (no more `visible()`
+   * snapshot). Re-querying the SAME `visibleIndex` against the live,
+   * mutating index on every iteration is equivalent to indexing a static
+   * snapshot at `visibleIndex, visibleIndex+1, ..., visibleIndex+count-1`:
+   * each successful delete removes exactly one unit from vis(S) AT
+   * `visibleIndex` itself, so whatever now occupies that same visible
+   * position is exactly what would have been next in the original
+   * snapshot (removing position P shifts everything after P left by one —
+   * what's now at P is what was previously at P+1). This is what the
+   * doc comment above means by "as it stood when this call began": the
+   * TARGET SET is fixed at call time, even though each lookup is live.
    */
   localDelete(visibleIndex: number, count: number): readonly DeleteOperation[] {
-    const vis = this.visible();
     const ops: DeleteOperation[] = [];
     for (let k = 0; k < count; k++) {
-      const target = vis[visibleIndex + k];
+      const target = this.index.nodeAtVisible(visibleIndex);
       if (!target) {
         break;
       }
