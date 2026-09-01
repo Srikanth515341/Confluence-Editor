@@ -14,6 +14,7 @@
     "db:migrate:down": "dotenv -e ../../.env -- node-pg-migrate down -m migrations",
     "db:reset": "dotenv -e ../../.env -- node-pg-migrate down -m migrations 0 && dotenv -e ../../.env -- node-pg-migrate up -m migrations",
     "db:seed": "dotenv -e ../../.env -- tsx scripts/seed.ts",
+    "admin": "dotenv -e ../../.env -- tsx scripts/admin.ts",
     "test:db": "dotenv -e ../../.env -- vitest run --config vitest.db.config.ts"
   },
   "dependencies": {

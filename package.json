@@ -25,6 +25,7 @@
     "db:migrate:down": "pnpm --filter @collab-editor/server run db:migrate:down",
     "db:reset": "pnpm --filter @collab-editor/server run db:reset",
     "db:seed": "pnpm --filter @collab-editor/server run db:seed",
+    "admin": "pnpm --filter @collab-editor/server run admin",
     "build": "pnpm -r --if-present run build",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

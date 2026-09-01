@@ -97,5 +97,38 @@ export function createHttpApp(deps: HttpAppDeps): Express {
     }
     res.status(200).json({ sessions: coordinator.listReceivedFrameCounts() });
   });
+  // Phase 18 DoD: "audit_runs rows are queryable and the 'last successful run' timestamp is
+  // exposed as a metric." Read-only, observability only — nothing here TRIGGERS an audit; that's
+  // auditScheduler.ts's recurring timer or scripts/admin.ts's on-demand CLI. `?limit=` defaults
+  // to 20, capped at 200 to keep this endpoint cheap regardless of how long a document has
+  // existed. Reads through `coordinator.operationStore` (real Postgres in production,
+  // `InMemoryOperationStore` in every pre-Phase-18 test) rather than a separate store reference,
+  // consistent with `/replay`'s own pattern above.
+  app.get("/v1/documents/:documentId/audit-runs", async (req, res) => {
+    const coordinator = deps.getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    const requestedLimit = Number(req.query.limit ?? 20);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 200)
+      : 20;
+    const [runs, lastSuccessAt] = await Promise.all([
+      coordinator.operationStore.listAuditRuns(req.params.documentId, limit),
+      coordinator.operationStore.getLastSuccessfulAuditRunAt(req.params.documentId),
+    ]);
+    res.status(200).json({
+      runs: runs.map((r) => ({
+        id: r.id,
+        replayedToSeq: r.replayedToSeq.toString(),
+        result: r.result,
+        divergenceSeq: r.divergenceSeq?.toString() ?? null,
+        detail: r.detail,
+        ranAt: r.ranAt.toISOString(),
+      })),
+      lastSuccessAt: lastSuccessAt?.toISOString() ?? null,
+    });
+  });
   return app;
 }

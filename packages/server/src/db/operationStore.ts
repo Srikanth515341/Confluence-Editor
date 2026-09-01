@@ -29,6 +29,7 @@
 // same thin per-connection signal Phase 8's random-UUID-per-session
 // already established.
 
+import { randomUUID } from "node:crypto";
 import type { Node, Operation } from "@collab-editor/engine";
 import {
   decodeFrame,
@@ -100,6 +101,32 @@ export interface WarmStartResult {
   readonly currentSeq: bigint;
 }
 
+/** One row of `snapshots`, content only — audit.ts's bisect (Phase 18) only ever needs `content` for the byte comparison, never `structure`; a separate, lighter query than `warmStart`'s (which needs `structure` to seed an engine). */
+export interface SnapshotRecord {
+  readonly seq: bigint;
+  readonly content: string;
+}
+
+/** One row of `operations`, WITH its seq — `loadFullOperationLog` (Phase 17) deliberately drops seq, since neither of its two consumers (httpApp.ts's diagnostic endpoints, Phase 17's own genesis-replay comparison) needed it. Phase 18's audit does: bisect needs to know exactly WHICH seq a given operation came from to report a divergence point, and the pendingCount()!==0 error path needs it to identify which persisted operation(s) never became ready. */
+export interface SeqOperation {
+  readonly seq: bigint;
+  readonly op: Operation;
+}
+
+/** API Spec §2.8 / §6.6 — one row of `audit_runs`. `result`/`divergenceSeq`/`detail` are exactly the columns AUDIT() (audit.ts) decides; `id`/`ranAt` are assigned by the database. */
+export interface AuditRunInput {
+  readonly documentId: string;
+  readonly replayedToSeq: bigint;
+  readonly result: "ok" | "mismatch" | "error";
+  readonly divergenceSeq: bigint | null;
+  readonly detail: string | null;
+}
+
+export interface AuditRunRow extends AuditRunInput {
+  readonly id: string;
+  readonly ranAt: Date;
+}
+
 export interface WriteSnapshotInput {
   readonly documentId: string;
   /** State AFTER applying operations up to and including this seq (API Spec §2.7's own column comment) — always `coordinator.currentSeq` AT THE MOMENT the snapshot is actually taken, which may be later (and higher) than whatever seq was current when the snapshot was first SCHEDULED, since writing runs off the hot path (snapshotter.ts). */
@@ -134,8 +161,26 @@ export interface OperationStore {
    */
   loadFullOperationLog(documentId: string): Promise<Operation[]>;
 
+  /** Same query as {@link loadFullOperationLog}, but keeping each operation's own `seq` — audit.ts's (Phase 18) bisect and pendingCount()-error reporting both need to name a specific seq, which the seq-stripped version can't provide. */
+  loadFullOperationLogWithSeq(documentId: string): Promise<SeqOperation[]>;
+
   /** Persists one snapshot row (API Spec §2.7, Phase 17 §6.4) — see snapshotter.ts for when this is called and why it's never awaited from the write path itself. */
   writeSnapshot(input: WriteSnapshotInput): Promise<void>;
+
+  /** The latest snapshot's `seq`/`content` (content only — see {@link SnapshotRecord}'s own comment), or `null` if none exists yet. AUDIT() step 1/4 (API Spec §6.6, audit.ts). */
+  getLatestSnapshot(documentId: string): Promise<SnapshotRecord | null>;
+
+  /** EVERY persisted snapshot for a document, ascending by `seq` — used only by bisect (audit.ts, Phase 18) when the latest snapshot's content fails the byte comparison, to localize which snapshot (there may be several, one per historical MAYBE-SNAPSHOT trigger) is the first one whose content disagrees with an independent genesis replay to that same seq. */
+  listSnapshots(documentId: string): Promise<SnapshotRecord[]>;
+
+  /** Persists one `audit_runs` row (API Spec §2.8, §6.6) — the permanent record AUDIT() leaves behind on every run, not only on failure (a healthy run's own `result: 'ok'` row is what "last successful run" — the DoD's own metric — is computed from). */
+  writeAuditRun(input: AuditRunInput): Promise<void>;
+
+  /** Most recent `audit_runs` rows for a document, newest first — the DoD's "audit_runs rows are queryable" requirement, served by httpApp.ts's own endpoint. */
+  listAuditRuns(documentId: string, limit: number): Promise<AuditRunRow[]>;
+
+  /** `ran_at` of the most recent `result: 'ok'` row for a document, or `null` if the document has never passed an audit — the DoD's own "'last successful run' timestamp is exposed as a metric" requirement. */
+  getLastSuccessfulAuditRunAt(documentId: string): Promise<Date | null>;
 
   /**
    * API Spec §6.3 step 8, ONE transaction for the WHOLE incoming message
@@ -242,11 +287,16 @@ export class PostgresOperationStore implements OperationStore {
   }
 
   async loadFullOperationLog(documentId: string): Promise<Operation[]> {
-    const { rows } = await this.pool.query<{ payload: Buffer }>(
-      `SELECT payload FROM operations WHERE document_id = $1 ORDER BY seq ASC`,
+    const seqOps = await this.loadFullOperationLogWithSeq(documentId);
+    return seqOps.map((r) => r.op);
+  }
+
+  async loadFullOperationLogWithSeq(documentId: string): Promise<SeqOperation[]> {
+    const { rows } = await this.pool.query<{ seq: string; payload: Buffer }>(
+      `SELECT seq, payload FROM operations WHERE document_id = $1 ORDER BY seq ASC`,
       [documentId],
     );
-    return rows.map((r) => decodeOperationPayload(r.payload));
+    return rows.map((r) => ({ seq: BigInt(r.seq), op: decodeOperationPayload(r.payload) }));
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
@@ -261,6 +311,71 @@ export class PostgresOperationStore implements OperationStore {
         input.opCount,
       ],
     );
+  }
+
+  async getLatestSnapshot(documentId: string): Promise<SnapshotRecord | null> {
+    // Served directly by snapshots_latest_idx (document_id, seq DESC) — Phase 15.
+    const { rows } = await this.pool.query<{ seq: string; content: string }>(
+      `SELECT seq, content FROM snapshots WHERE document_id = $1 ORDER BY seq DESC LIMIT 1`,
+      [documentId],
+    );
+    const row = rows[0];
+    return row ? { seq: BigInt(row.seq), content: row.content } : null;
+  }
+
+  async listSnapshots(documentId: string): Promise<SnapshotRecord[]> {
+    const { rows } = await this.pool.query<{ seq: string; content: string }>(
+      `SELECT seq, content FROM snapshots WHERE document_id = $1 ORDER BY seq ASC`,
+      [documentId],
+    );
+    return rows.map((r) => ({ seq: BigInt(r.seq), content: r.content }));
+  }
+
+  async writeAuditRun(input: AuditRunInput): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO audit_runs (id, document_id, replayed_to_seq, result, divergence_seq, detail)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)`,
+      [
+        input.documentId,
+        input.replayedToSeq.toString(),
+        input.result,
+        input.divergenceSeq === null ? null : input.divergenceSeq.toString(),
+        input.detail,
+      ],
+    );
+  }
+
+  async listAuditRuns(documentId: string, limit: number): Promise<AuditRunRow[]> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      document_id: string;
+      replayed_to_seq: string;
+      result: "ok" | "mismatch" | "error";
+      divergence_seq: string | null;
+      detail: string | null;
+      ran_at: Date;
+    }>(
+      `SELECT id, document_id, replayed_to_seq, result, divergence_seq, detail, ran_at
+         FROM audit_runs WHERE document_id = $1 ORDER BY ran_at DESC LIMIT $2`,
+      [documentId, limit],
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      documentId: r.document_id,
+      replayedToSeq: BigInt(r.replayed_to_seq),
+      result: r.result,
+      divergenceSeq: r.divergence_seq === null ? null : BigInt(r.divergence_seq),
+      detail: r.detail,
+      ranAt: r.ran_at,
+    }));
+  }
+
+  async getLastSuccessfulAuditRunAt(documentId: string): Promise<Date | null> {
+    const { rows } = await this.pool.query<{ ran_at: Date }>(
+      `SELECT ran_at FROM audit_runs WHERE document_id = $1 AND result = 'ok' ORDER BY ran_at DESC LIMIT 1`,
+      [documentId],
+    );
+    return rows[0]?.ran_at ?? null;
   }
 
   async commitOperations(
@@ -408,8 +523,50 @@ export class InMemoryOperationStore implements OperationStore {
     return [...(this.opsByDocument.get(documentId) ?? [])];
   }
 
+  async loadFullOperationLogWithSeq(documentId: string): Promise<SeqOperation[]> {
+    // This store never tracks a real per-operation seq (nothing durable exists to number) —
+    // array position (1-indexed) is a reasonable stand-in, since this store's own `ops` array
+    // is already append-only and gapless.
+    return (this.opsByDocument.get(documentId) ?? []).map((op, i) => ({ seq: BigInt(i + 1), op }));
+  }
+
   async writeSnapshot(_input: WriteSnapshotInput): Promise<void> {
     // No real durability (the entire point of this store) — snapshotting a document that isn't
     // actually persisted has nothing to snapshot INTO, so this is a no-op rather than an error.
+  }
+
+  async getLatestSnapshot(_documentId: string): Promise<SnapshotRecord | null> {
+    return null; // no real durability — never any snapshots to find
+  }
+
+  async listSnapshots(_documentId: string): Promise<SnapshotRecord[]> {
+    return [];
+  }
+
+  /** Purely so `listAuditRuns`/`getLastSuccessfulAuditRunAt` have something to read back — same "test double keeps state so the interface is genuinely exercised" reasoning as `opsByDocument`. */
+  private readonly auditRunsByDocument = new Map<string, AuditRunRow[]>();
+
+  async writeAuditRun(input: AuditRunInput): Promise<void> {
+    let runs = this.auditRunsByDocument.get(input.documentId);
+    if (!runs) {
+      runs = [];
+      this.auditRunsByDocument.set(input.documentId, runs);
+    }
+    runs.push({ ...input, id: randomUUID(), ranAt: new Date() });
+  }
+
+  async listAuditRuns(documentId: string, limit: number): Promise<AuditRunRow[]> {
+    const runs = this.auditRunsByDocument.get(documentId) ?? [];
+    return [...runs].reverse().slice(0, limit);
+  }
+
+  async getLastSuccessfulAuditRunAt(documentId: string): Promise<Date | null> {
+    const runs = this.auditRunsByDocument.get(documentId) ?? [];
+    for (let i = runs.length - 1; i >= 0; i--) {
+      if (runs[i]!.result === "ok") {
+        return runs[i]!.ranAt;
+      }
+    }
+    return null;
   }
 }

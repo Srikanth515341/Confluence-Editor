@@ -12,6 +12,27 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 18 — integrity audit and bisect.** The most important
+operational component in the system: every other check compares
+replicas to each other and would report health if they were all wrong
+in the same way; this one compares the live server against an
+INDEPENDENT replay of durable storage — a fresh `Engine`, replaying only
+what's in Postgres, sharing no code path or memory with anything else
+running. `auditDocument()` implements API Spec §6.6's six steps (Test
+Plan DUR-01), including checking `pendingCount() === 0` BEFORE any text
+comparison — a replay can materialize correctly while an operation has
+still been permanently orphaned, which a text match alone would miss.
+BISECT is a real binary search over a document's snapshot history, not
+a placeholder: a deliberately corrupted snapshot is detected, localized
+to its exact sequence number, and recorded in `audit_runs`. DUR-01
+passes on a genuine 5,000-operation, 3-client session; a 100,000-op
+document audits in ~13 seconds against a 30-second budget. Runs both as
+an in-process scheduled job (5-minute default interval) and a
+standalone `pnpm admin audit --doc=<id> --verbose` CLI. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 18 entry for the full account,
+including how BISECT's binary search shares the same monotonicity
+assumption (and limitation) as `git bisect`.
+
 **Phase 17 — snapshots and coordinator warm start.** A coordinator no
 longer replays a document's full operation history from genesis on
 every restart: RFC §13.2's MAYBE-SNAPSHOT() (500 operations or 30
@@ -211,7 +232,8 @@ runs this at full scale on a schedule.
 | **Milestone M1 — live multi-browser sync** | ✅ **Phase 14** (real app, real server, remote edits render live, real bugs found & fixed — see CLAUDE.md) |
 | Database schema + migrations               | ✅ Phase 15 (all 8 API Spec §2 tables, constraint-tested against real Postgres)                            |
 | Operation log + durable acknowledgement    | ✅ Phase 16 (broadcast before commit, ack after — DUR-04-tested; warm start from the persisted log)        |
-| Snapshots + snapshot-aware warm start      | ✅ **Phase 17** (RFC §13.2 MAYBE-SNAPSHOT, 500 ops/30s, off the hot path; <2s warm start at 50k ops)       |
+| Snapshots + snapshot-aware warm start      | ✅ Phase 17 (RFC §13.2 MAYBE-SNAPSHOT, 500 ops/30s, off the hot path; <2s warm start at 50k ops)           |
+| Integrity audit + bisect                   | ✅ **Phase 18** (independent log replay vs. live server; real BISECT; scheduled job + admin CLI)           |
 | Auth, presence                             | ⏳ not started (Phases 26-29, 31)                                                                          |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
 | Offline editing (queue-and-replay)         | ⏳ not started (Phase 22)                                                                                  |
