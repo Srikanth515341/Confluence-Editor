@@ -19,6 +19,8 @@
     "test:properties": "pnpm --filter @collab-editor/testkit run test:properties",
     "test:adversarial": "pnpm --filter @collab-editor/testkit run test:adversarial",
     "test:mutation": "pnpm --filter @collab-editor/testkit run test:mutation",
+    "test:index": "pnpm --filter @collab-editor/engine run test:index",
+    "test:benchmark": "pnpm --filter @collab-editor/testkit run test:benchmark",
     "test:db": "pnpm --filter @collab-editor/server run test:db",
     "check:purity": "node scripts/check-engine-purity.mjs",
     "db:migrate": "pnpm --filter @collab-editor/server run db:migrate",

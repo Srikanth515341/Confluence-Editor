@@ -12,6 +12,26 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 19 — indexed position structure.** `packages/engine`'s node
+storage moved from a flat array with O(N) linear-scan position lookup (a
+deliberate Phase 3 placeholder) to `PositionIndex` — an implicit-key
+treap with O(log N) expected `indexOf`/`nodeAtVisible`/`visibleIndexOf`/
+`splice`/`setDeleted` (Engine Spec §8.5). Not a performance-only change:
+two acceptance criteria (RC-27, M3-c) failed outright without it. A
+10,000-seed reference cross-check against a linear-scan oracle found zero
+disagreements; the full regression suite — 308 unit tests, 22 adversarial
+cases, 6 property suites, and 60,000 convergence-fuzz seeds across all 6
+configs — is unchanged and green; the mutation matrix is byte-for-byte
+identical to the Phase 6 baseline (9/10 killed). The scaling benchmark
+confirms it: p95 latency grows 0.80x over a 100x increase in document
+size (1,000 → 100,000 nodes) — flat, not the ~61x an O(N) scan would
+produce — and M3-c's 100,000-char-document p99 ≤ 16ms target is met with
+enormous margin (measured 0.030ms). See [`CLAUDE.md`](./CLAUDE.md)'s
+Phase 19 entry for the full account, including a genuine pre-existing
+CRLF-sensitivity bug in the mutation-testing harness found and fixed
+along the way, and [`docs/benchmarks.md`](./docs/benchmarks.md) for the
+full numbers.
+
 **Phase 18 — integrity audit and bisect.** The most important
 operational component in the system: every other check compares
 replicas to each other and would report health if they were all wrong
@@ -218,7 +238,7 @@ runs this at full scale on a schedule.
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | Repository / toolchain / CI                | ✅ Phase 0                                                                                                 |
 | Convergence test harness (fuzz)            | ✅ Phase 2 (now passing against the real engine, not just the toy engine)                                  |
-| OBSEQ convergence engine                   | ✅ Phase 3 (integrate(), causal readiness/buffering, delete; no index yet)                                 |
+| OBSEQ convergence engine                   | ✅ Phase 3 (integrate(), causal readiness/buffering, delete); indexed Phase 19                             |
 | Invariant assertions + property tests      | ✅ Phase 4 (I0–I9 runtime-checked; PROP-1..5 fast-check suites)                                            |
 | Adversarial suite                          | ✅ Phase 5 (ADV-01..22, all replica-id orderings where required)                                           |
 | Mutation testing + nightly CI gate         | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th)                                 |
@@ -233,7 +253,8 @@ runs this at full scale on a schedule.
 | Database schema + migrations               | ✅ Phase 15 (all 8 API Spec §2 tables, constraint-tested against real Postgres)                            |
 | Operation log + durable acknowledgement    | ✅ Phase 16 (broadcast before commit, ack after — DUR-04-tested; warm start from the persisted log)        |
 | Snapshots + snapshot-aware warm start      | ✅ Phase 17 (RFC §13.2 MAYBE-SNAPSHOT, 500 ops/30s, off the hot path; <2s warm start at 50k ops)           |
-| Integrity audit + bisect                   | ✅ **Phase 18** (independent log replay vs. live server; real BISECT; scheduled job + admin CLI)           |
+| Integrity audit + bisect                   | ✅ Phase 18 (independent log replay vs. live server; real BISECT; scheduled job + admin CLI)               |
+| Indexed position structure (O(log N))      | ✅ **Phase 19** (treap-backed PositionIndex; 0.80x p95 growth over 100x size; M3-c p99 0.030ms)             |
 | Auth, presence                             | ⏳ not started (Phases 26-29, 31)                                                                          |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
 | Offline editing (queue-and-replay)         | ⏳ not started (Phase 22)                                                                                  |

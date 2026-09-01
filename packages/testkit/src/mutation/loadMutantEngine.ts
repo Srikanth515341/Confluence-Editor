@@ -24,11 +24,15 @@ const engineSrcDir = join(here, "..", "..", "..", "engine", "src");
 // unmutated so assertInvariants() still runs against whatever Engine
 // instance the mutant produces (its import of Engine is type-only, so it
 // carries no runtime coupling to which Engine class is actually loaded).
+// positionIndex.ts was added Phase 19 — engine.ts imports it at runtime
+// (not just for types), so it must be copied into the scratch directory too
+// or the mutant build's own transpiled engine.js fails to resolve its import.
 const SOURCE_FILES = [
   "identifier.ts",
   "node.ts",
   "operation.ts",
   "grapheme.ts",
+  "positionIndex.ts",
   "engine.ts",
   "invariants.ts",
 ];
@@ -63,7 +67,7 @@ export interface EngineNodeLike {
 
 export interface EngineLike {
   readonly replicaId: number;
-  readonly nodes: EngineNodeLike[];
+  readonly nodes: readonly EngineNodeLike[];
   readonly pending: unknown[];
   readonly currentClock: number;
   mint(): { readonly c: number; readonly r: number };
@@ -104,7 +108,17 @@ export async function loadEngine(mutant: MutantDefinition | null): Promise<Loade
   writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module" }), "utf8");
 
   for (const fileName of SOURCE_FILES) {
-    let source = readFileSync(join(engineSrcDir, fileName), "utf8");
+    // Normalized to LF regardless of the checked-out line-ending style. This repo's working
+    // tree is a mix of CRLF and LF files (git core.autocrlf on Windows converts individual
+    // files as they're checked out — a pre-existing, repo-wide condition unrelated to any one
+    // phase's own edits, confirmed by scanning packages/**: 145 CRLF files vs 46 LF at the time
+    // this was found). Every mutant's `find`/`replace` text in mutants.ts is written with plain
+    // `\n` — without this normalization, any multi-line find-text silently stops matching the
+    // instant its target file happens to be checked out as CRLF, which is exactly what broke
+    // here (M2/M3/M5/M6/M7/M8/M9/M10 all have multi-line find-text; only single-line M1/M4
+    // survived). TypeScript's transpiler is line-ending-agnostic, so normalizing before both the
+    // find/replace AND the transpile step below is always safe.
+    let source = readFileSync(join(engineSrcDir, fileName), "utf8").replace(/\r\n/g, "\n");
     if (mutant && mutant.file === fileName) {
       const occurrences = source.split(mutant.find).length - 1;
       if (occurrences !== 1) {
