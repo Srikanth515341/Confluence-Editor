@@ -100,9 +100,6 @@ export class Engine {
     return this.index.toArray();
   }
 
-  /** Identifier → Node lookup K (Engine Spec Definition 2.2), keyed by a serialized identifier. */
-  private readonly byKey = new Map<string, Node>();
-
   /**
    * Origin stamps of operations already applied — the mechanism behind
    * Engine Spec §6.3's idempotence guarantee (applying an already-present
@@ -201,32 +198,52 @@ export class Engine {
     };
   }
 
+  /**
+   * Live block count (Engine Spec §7.5, Phase 20) — diagnostic only, read
+   * by no ordering logic, exposed purely so compression can be measured
+   * directly (`stats().totalElements / blockCount`) rather than inferred.
+   */
+  get blockCount(): number {
+    return this.index.blockCount;
+  }
+
+  /**
+   * Resolves an identifier to its materialized Node view. As of Phase 20,
+   * {@link PositionIndex} is the SOLE source of truth for identifier
+   * resolution — this class no longer keeps its own `byKey` map of stable
+   * Node objects (Phase 3/19's design), because block storage means most
+   * nodes are no longer stable, persistent objects at all: they're decoded
+   * on demand from whichever block currently contains them. Keeping a
+   * separate `byKey: Map<string, Node>` here would have held one full Node
+   * object per character regardless of what `PositionIndex` did internally
+   * — exactly the memory cost block compression exists to eliminate
+   * (Engine Spec §7.5, M8-b).
+   */
   private nodeById(id: Identifier | null): Node | null {
     if (id === null) {
       return null;
     }
-    return this.byKey.get(serializeId(id)) ?? null;
+    return this.index.nodeByIdentifier(id) ?? null;
   }
 
   private isOriginPresent(id: Identifier | null): boolean {
-    return id === null || this.byKey.has(serializeId(id));
+    return id === null || this.index.hasIdentifier(id);
   }
 
   /**
    * Total-order position of the node identified by `id`, via the O(log N)
-   * {@link PositionIndex.indexOf} (Phase 19 — an O(N) `this.nodes.indexOf`
-   * scan pre-Phase-19). Only ever called on an origin that `ready()` has
-   * already confirmed present — the thrown error documents that
-   * precondition rather than being a reachable runtime case.
+   * {@link PositionIndex.indexOf}. Only ever called on an origin that
+   * `ready()` has already confirmed present — the thrown error documents
+   * that precondition rather than being a reachable runtime case.
    */
   private indexOfOrigin(id: Identifier): number {
-    const node = this.byKey.get(serializeId(id));
-    if (node === undefined) {
+    const position = this.index.indexOf(id);
+    if (position === undefined) {
       throw new Error(
         `integrate(): origin ${serializeId(id)} is not present — ready() must be checked before integrating`,
       );
     }
-    return this.index.indexOf(node);
+    return position;
   }
 
   /** Causal readiness (Engine Spec Definition 4.1). */
@@ -234,7 +251,7 @@ export class Engine {
     if (op.kind === "insert") {
       return this.isOriginPresent(op.originLeft) && this.isOriginPresent(op.originRight);
     }
-    return this.byKey.has(serializeId(op.target));
+    return this.index.hasIdentifier(op.target);
   }
 
   /**
@@ -257,8 +274,15 @@ export class Engine {
     }
 
     let destIndex = leftIndex + 1;
-    const scanned = new Set<Node>();
-    const conflicting = new Set<Node>();
+    // Keyed by serialized identifier, not Node object identity — as of Phase 20, `nodeAt`/
+    // `nodeById` decode a FRESH Node object on every call (block storage no longer keeps stable,
+    // persistent objects per node, Phase 19's design), so an object-identity Set (`Set<Node>`,
+    // Phase 3-19's original shape) would silently never find a match: the SAME logical node read
+    // via `nodeAt` at one iteration and via `nodeById` at another would be two different object
+    // instances. Re-keying by identifier is the only change here — the algorithm's control flow
+    // and comparisons below are byte-for-byte what Phase 3 established.
+    const scanned = new Set<string>();
+    const conflicting = new Set<string>();
 
     // Engine Spec §8.2: this window is already effectively constant (p50=0, p95=4, p99=9 on a
     // 20,000-node structure) — direct positional reads here, one per scanned node, are the
@@ -269,8 +293,9 @@ export class Engine {
       if (!other) {
         break;
       }
-      scanned.add(other);
-      conflicting.add(other);
+      const otherKey = serializeId(other.id);
+      scanned.add(otherKey);
+      conflicting.add(otherKey);
 
       if (sameOrigin(node.originLeft, other.originLeft)) {
         // Case A: `other` was anchored at the same left origin as `node`.
@@ -288,38 +313,86 @@ export class Engine {
         // still undetermined, keep scanning without moving destIndex.
       } else {
         const otherOriginNode = this.nodeById(other.originLeft);
-        if (otherOriginNode !== null && scanned.has(otherOriginNode)) {
+        const otherOriginKey = otherOriginNode !== null ? serializeId(otherOriginNode.id) : null;
+        if (otherOriginKey !== null && scanned.has(otherOriginKey)) {
           // Case B (nested inside scanned region): the group set test.
-          if (!conflicting.has(otherOriginNode)) {
+          //
+          // *** ENGINE SPEC §6.2 SUB-CASE III-D CORRECTION, PART 2 (2026-09-02/03, R0009) ***
+          // Group-membership alone ("has this group already lost?") is NOT sound when
+          // `other` is chained onto an already-resolved node that was compared against a
+          // DIFFERENT pair than the one actually in question. R0009: a wide-window candidate
+          // correctly beats a direct competitor via Case A; a later, structurally-unrelated
+          // node anchored onto that competitor then blindly inherited its loss via this
+          // branch, WITHOUT its own rank vs the candidate ever being consulted — producing
+          // SILENT, delivery-order-dependent text divergence ("ipt" vs "itp"), no throw, no
+          // canary. For a genuine single-author contiguous run, every member shares its
+          // anchor's own replica id, so `compareRank(other, node) < 0` is automatically
+          // consistent with the group's decision — this check is a no-op there and RFC NQ-2's
+          // non-interleaving guarantee is preserved (verified against a same-author run swept
+          // by a concurrent competitor, plus a depth-2 chain crossing an authorship boundary).
+          // It only changes behavior when a chain crosses an authorship/replica boundary,
+          // which isn't really "one run" to begin with. Full investigation: CLAUDE.md's
+          // "Engine Spec §6.2 sub-case iii-d correction" entry; tests/regression/R0009.
+          if (conflicting.has(otherOriginKey)) {
+            // `other`'s origin is itself still an undetermined member of the current
+            // conflict group — stays undecided, keep scanning without moving destIndex.
+          } else if (compareRank(other, node) < 0) {
             destIndex = i + 1;
             conflicting.clear();
+          } else {
+            // The group resolved to "advance," but `other` itself does not outrank `node` —
+            // do not blindly inherit. Stop here, mirroring Case A/C's own "other does not
+            // outrank us" -> break.
+            break;
           }
-          // else: `other`'s origin is itself still an undetermined member of the
-          // current conflict group — stays undecided, keep scanning.
         } else {
-          // Case C: `other`'s origin lies outside this conflict group entirely.
+          // Case C: `other`'s own origin lies outside what THIS scan pass has walked
+          // (`scanned`) — either because it's ⊥ (the document boundary) or because it's a
+          // real node genuinely outside the current window.
           //
-          // Test-build canary (Phase 6, Test Plan §14.2 MUT-KILL-01 / Engine Spec §6.2
-          // sub-case iii-d): sub-case iii-d claims a Case C node can NEVER affect where
-          // `node` lands. MUT-KILL-01's directed 10^6-trial search (partially overlapping
-          // origin intervals) was built specifically to try to disprove that claim and did
-          // not find a counterexample. This restates the same claim as a live assertion
-          // rather than relying solely on that one search: if `other` would have outranked
-          // `node` in a same-window comparison, that is direct evidence that NOT breaking
-          // here (M3_no_case_c's mutation) could have moved `destIndex` for this exact
-          // input — i.e. this input would be a genuine witness disproving sub-case iii-d,
-          // not just a mutation-testing curiosity. Must never fire on any correct input;
-          // firing it is a hard failure.
+          // *** ENGINE SPEC §6.2 SUB-CASE III-D CORRECTION, PART 1 (2026-09-02, R0008) ***
+          // Sub-case iii-d, AS ORIGINALLY WRITTEN in the approved Engine Specification,
+          // claims a Case C node can NEVER outrank/affect where `node` lands, and until
+          // this fix this branch enforced that claim as a live assertion, throwing if
+          // violated. That claim is INCORRECT — confirmed as a flaw in the spec's own
+          // literal §4.3 pseudocode (line 17's "c.originLeft ≠ ⊥" conjunct), not an
+          // implementation deviation. R0008 found it firing at ~24% under ordinary
+          // randomized states once "immediate delivery" (a replica broadcasting an
+          // operation the instant it's minted — the ordinary shape of real, live
+          // multi-user editing) was fuzzed; a variant with no tombstoning at all produced
+          // direct, confirmed VISIBLE TEXT divergence ("ipt" vs "pit") from as few as 3
+          // operations. This correction has TWO parts — this is part 1; see the Case B
+          // branch above for part 2 (R0009), found while validating this fix. Full
+          // investigation, root cause, and both fixes: CLAUDE.md's "Engine Spec §6.2
+          // sub-case iii-d correction" entry; regression fixtures tests/regression/R0008
+          // and R0009 (both permanent, Test Plan §2.3).
+          //
+          // THE FIX: `other` now gets the SAME rank check Case A/B already give same-window
+          // competitors, instead of being unconditionally skipped. This is no longer a
+          // "canary that must never fire" — Case C legitimately participates in placement.
           if (compareRank(other, node) < 0) {
-            throw new Error(
-              `integrate(): Case C reached with candidate ${serializeId(node.id)} whose destination ` +
-                `would have moved past ${serializeId(other.id)} — this disproves Engine Spec §6.2 ` +
-                "sub-case iii-d (Test Plan §14.2 MUT-KILL-01).",
-            );
+            destIndex = i + 1;
+            conflicting.clear();
+          } else {
+            break;
           }
-          break;
         }
       }
+    }
+
+    // Test-build structural sanity check (redefined 2026-09-02/03 — the ORIGINAL canary here
+    // asserted Engine Spec §6.2 sub-case iii-d, which R0008 and R0009 both disproved, in two
+    // different branches (Case C and Case B respectively); seeing FALSE below would mean
+    // `destIndex` was computed outside the window this scan is even allowed to place into —
+    // an unrelated, still-live correctness property, true regardless of which branch (A/B/C)
+    // decided `destIndex`, worth keeping a cheap, always-on regression canary for.
+    if (destIndex < leftIndex + 1 || destIndex > rightIndex) {
+      throw new Error(
+        `integrate(): computed destIndex ${destIndex} for candidate ${serializeId(node.id)} ` +
+          `outside its own scan window [${leftIndex + 1}, ${rightIndex}] — this is an ` +
+          "integrate() bookkeeping bug, unrelated to the retired Engine Spec §6.2 sub-case " +
+          "iii-d claim (see the Case B/Case C comments above).",
+      );
     }
 
     this.index.insertAt(destIndex, node);
@@ -335,7 +408,6 @@ export class Engine {
       deleted: false,
       deletedBy: null,
     };
-    this.byKey.set(serializeId(op.id), node);
     this.integrate(node);
   }
 
@@ -351,13 +423,15 @@ export class Engine {
     if (node === null) {
       throw new Error(`applyDelete(): target ${serializeId(op.target)} is not present`);
     }
-    // Routed through the index (Phase 19), not `node.deleted = true` directly, so the
-    // augmented visibleCount along its ancestor path is recomputed in the same call —
-    // PositionIndex.setDeleted is the SOLE place `node.deleted` is ever written.
-    this.index.setDeleted(node, true);
-    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
-      node.deletedBy = op.id;
-    }
+    // The new deletedBy is computed from the CURRENT read, then passed into setDeleted
+    // together with the tombstone flag in one call — Phase 19's version mutated
+    // `node.deletedBy` directly on a live object reference afterward, which cannot work
+    // now that a materialized Node view is a disposable snapshot, not a stable object
+    // block storage (Phase 20) can keep mutating underneath. PositionIndex.setDeleted is
+    // the SOLE place a node's deleted/deletedBy are ever written.
+    const newDeletedBy =
+      node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0 ? op.id : node.deletedBy;
+    this.index.setDeleted(op.target, true, newDeletedBy);
   }
 
   /**
@@ -372,8 +446,7 @@ export class Engine {
       throw new Error(`applyUndelete(): target ${serializeId(op.target)} is not present`);
     }
     if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
-      this.index.setDeleted(node, false);
-      node.deletedBy = null;
+      this.index.setDeleted(op.target, false, null);
     }
   }
 

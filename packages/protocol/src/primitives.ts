@@ -40,7 +40,10 @@ export function decodeOptionalStamp(reader: ByteReader, present: boolean): Ident
 }
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM: true — see codec.ts's own textDecoder comment (same bug, same fix, found
+// incidentally while building Phase 20's block-aware SNAPSHOT body encoder): without it, a
+// string field whose first character legitimately IS U+FEFF gets silently corrupted on decode.
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** varint byte length + UTF-8 bytes (API Spec §3.1). */
 export function encodeString(writer: ByteWriter, value: string): void {

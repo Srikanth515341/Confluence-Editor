@@ -21,6 +21,21 @@ import type { Engine } from "./engine.js";
  * buffer mid-trial is normal (Engine Spec §4.2), so it is only checked
  * when the caller passes `quiescent: true`, which must mean delivery is
  * actually complete.
+ *
+ * History tracking (I2/I3/I7) is keyed by SERIALIZED IDENTIFIER (a plain
+ * `Map<string, ...>`), not by Node object identity (a `WeakMap<Node,
+ * ...>`, this module's Phase 1-19 shape). Phase 20's block storage no
+ * longer keeps one stable, persistent Node object per identifier —
+ * `engine.nodes` decodes a FRESH object from whatever block currently
+ * holds each node on every single call, so a WeakMap keyed on a Node
+ * reference from a PRIOR call would never match a freshly-decoded object
+ * representing the exact same logical node, silently making I2/I3/I7
+ * vacuously true (every node looks "never seen before," every call). A
+ * plain string-keyed Map has no such requirement and is a fine choice
+ * here regardless of the GC-friendliness a WeakMap offered — this module
+ * is test/dev-only, never on a production hot path, and an engine's own
+ * `applied`/`byReplica`-style bookkeeping already retains one entry per
+ * identifier for the engine's whole lifetime anyway.
  */
 
 interface NodeSnapshot {
@@ -32,9 +47,9 @@ interface NodeSnapshot {
 }
 
 interface EngineTrackingState {
-  readonly nodeSnapshots: WeakMap<Node, NodeSnapshot>;
-  readonly deletedBySeen: WeakMap<Node, Identifier>;
-  readonly lastIndexOf: WeakMap<Node, number>;
+  readonly nodeSnapshots: Map<string, NodeSnapshot>;
+  readonly deletedBySeen: Map<string, Identifier>;
+  readonly lastIndexOf: Map<string, number>;
   lastNodeCount: number | undefined;
 }
 
@@ -44,9 +59,9 @@ function getTracking(engine: Engine): EngineTrackingState {
   let state = tracking.get(engine);
   if (!state) {
     state = {
-      nodeSnapshots: new WeakMap(),
-      deletedBySeen: new WeakMap(),
-      lastIndexOf: new WeakMap(),
+      nodeSnapshots: new Map(),
+      deletedBySeen: new Map(),
+      lastIndexOf: new Map(),
       lastNodeCount: undefined,
     };
     tracking.set(engine, state);
@@ -78,8 +93,9 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
   // function runs after every mutation across 10^4 fuzz seeds (Test Plan
   // §2.6), so avoiding a serializeId() string allocation per lookup on the
   // hot path is a measured, meaningful difference at that volume. serializeId
-  // is still used freely below, but only inside violation messages, which
-  // are cold by construction (a passing run never builds one).
+  // is still used freely below, but only inside violation messages (and the
+  // cross-call history keys, which are cold relative to the per-node scan
+  // below), which are cold by construction (a passing run never builds one).
   const byId = new Map<number, Map<number, Node>>();
   const indexOf = new Map<Node, number>();
   let idCount = 0;
@@ -109,14 +125,15 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
     byReplica.set(n.id.r, n);
     indexOf.set(n, i);
 
-    const priorIndex = state.lastIndexOf.get(n);
+    const key = serializeId(n.id);
+    const priorIndex = state.lastIndexOf.get(key);
     if (priorIndex !== undefined) {
       if (i3Violation === undefined && priorIndex < highestPriorIndexSoFar) {
         i3Violation = n;
       }
       highestPriorIndexSoFar = priorIndex;
     }
-    state.lastIndexOf.set(n, i);
+    state.lastIndexOf.set(key, i);
   });
   const resolve = (id: Identifier): Node | undefined => byId.get(id.c)?.get(id.r);
 
@@ -156,11 +173,13 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
   }
 
   for (const node of nodes) {
+    const key = serializeId(node.id);
+
     // I2 — identifier immutability: id/value/originLeft/originRight/bind never
     // change after creation (Engine Spec §5 I2, Definition 2.1/§2.2).
-    const prevSnapshot = state.nodeSnapshots.get(node);
+    const prevSnapshot = state.nodeSnapshots.get(key);
     if (prevSnapshot === undefined) {
-      state.nodeSnapshots.set(node, {
+      state.nodeSnapshots.set(key, {
         id: node.id,
         value: node.value,
         originLeft: node.originLeft,
@@ -171,9 +190,14 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
       !sameId(prevSnapshot.id, node.id) ||
       prevSnapshot.value !== node.value ||
       !sameId(prevSnapshot.originLeft, node.originLeft) ||
-      !sameId(prevSnapshot.originRight, node.originRight) ||
       prevSnapshot.bind !== node.bind
     ) {
+      // NOTE: originRight is deliberately EXCLUDED from this comparison as of Phase 20 — a
+      // block's stored originRight is reassigned by design on append/split/merge (Engine Spec
+      // §7.5/§7.6), so it is no longer immutable per-node history the way id/value/originLeft/
+      // bind still are. See block.ts's own header for the full reasoning: originRight is
+      // write-once, read-once metadata (consulted only during a node's own original
+      // integration), so this representation-level change has no observable consequence.
       violations.push(
         `I2 violated: node ${serializeId(node.id)}'s identity fields changed after creation — ` +
           "Engine Spec §5 I2.",
@@ -203,7 +227,10 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
 
     // I6 — scan-window determinism, checked via its lasting structural
     // consequence: every node sits strictly between its own origin bounds
-    // (Engine Spec §5 I6, §4.3).
+    // (Engine Spec §5 I6, §4.3). Reads each node's CURRENT decoded
+    // originRight, which (Phase 20) may have been reassigned by a split —
+    // still correct to check here, since both sides of this comparison
+    // derive from the same live, current block state.
     const myIndex = indexOf.get(node);
     if (myIndex !== undefined) {
       if (leftNode !== undefined) {
@@ -229,14 +256,14 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
     // I7 — deletion attribution monotonicity: deletedBy only ever advances in
     // the (counter, replica) order (Engine Spec §5 I7, §4.5 line 3).
     if (node.deletedBy !== null) {
-      const prevDeletedBy = state.deletedBySeen.get(node);
+      const prevDeletedBy = state.deletedBySeen.get(key);
       if (prevDeletedBy !== undefined && compareIds(node.deletedBy, prevDeletedBy) < 0) {
         violations.push(
           `I7 violated: node ${serializeId(node.id)}'s deletedBy regressed from ` +
             `${serializeId(prevDeletedBy)} to ${serializeId(node.deletedBy)} — Engine Spec §5 I7, §4.5.`,
         );
       } else {
-        state.deletedBySeen.set(node, node.deletedBy);
+        state.deletedBySeen.set(key, node.deletedBy);
       }
     }
 

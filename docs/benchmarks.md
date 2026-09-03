@@ -66,3 +66,66 @@ does not measure `integrate()`'s Case A/B/C scan-window cost, which Engine
 Spec §8.2 already measured as effectively constant (p50=0, p95=4, p99=9
 nodes) and which this phase deliberately left un-indexed per its own
 "index what actually costs" instruction.
+
+# Block encoding compression benchmark (Phase 20)
+
+Generated via `pnpm test:benchmark`
+(`packages/testkit/src/benchmark/compression.bench.test.ts`, same gating
+as the scaling benchmark above). Source: `packages/testkit/src/benchmark/
+compression.ts`.
+
+## Results — Engine Spec §7.5's three named workloads
+
+| Workload | Ops | Visible | Blocks | Compression ratio |
+|---|---:|---:|---:|---:|
+| Pure sequential typing | 50,000 | 50,000 | 1 | **50,000x** (target: >1000x — PASSES) |
+| Realistic prose (2% reposition, 8% backspace) | 50,000 | 40,974 | 8,977 | **5.01x** (target: >4x — PASSES) |
+| Random-position editing | 10,000 | ~10,000 | 9,999 | **1.000x** (recorded, not asserted — matches the ≈1x the spec itself predicts) |
+
+Pure sequential typing collapses to a SINGLE block regardless of length —
+every character is a genuine Definition 7.5 continuation of the one
+before it. Realistic prose still compresses meaningfully (5x) because
+92% of characters are still sequential appends; the 8% backspace rate
+fragments blocks at each correction point but doesn't prevent the
+SURROUNDING runs from compressing. Random-position editing — every
+insert landing at an unrelated point — compresses at essentially 1:1, the
+theoretical floor, exactly as Engine Spec §7.5 itself predicts for this
+workload ("recorded, not asserted").
+
+## M8-b: replica memory re-measurement
+
+RFC §2.5 measured 12.9 MB (pre-blocks) for a 100,000-operation / ~10,000-
+visible document, against a 10 MB target.
+
+**Measured, post-blocks: 45.60 MB heapUsed delta** (100,000 ops / 10,000
+visible / **90,159 blocks**) — WORSE than the pre-blocks figure, not
+better, for this specific scenario. Root cause, verified directly (see
+`compression.ts`'s own header comment for the full account): the
+document is built via realistic sequential-typing bursts (which DO
+compress well, matching the workloads above) and then brought down to
+10,000 visible characters via CONTIGUOUS range deletes — but
+`Engine.localDelete(pos, count)` issues `count` SEPARATE
+`DeleteOperation`s (Engine Spec §4.1 — a delete is single-target only),
+each freshly minted with its OWN identity. Definition 7.5's condition 4
+requires a block's members to share `deletedBy` — but every character in
+ONE "select a paragraph, press Delete" user action gets a DIFFERENT
+`deletedBy`, so those ~90,000 tombstones can essentially never merge into
+blocks even though they were deleted together and sit contiguously
+(measured: ~90,000 tombstones landed in ~80,000+ separate one-node
+blocks). This is a genuine, spec-consistent limitation of block
+compression for TOMBSTONES specifically, not a bug — visible text
+compresses dramatically (see the table above), but a heavily-tombstoned
+document's memory is dominated by tombstones compression barely touches.
+Per Phase 20's own DoD: this is recorded as Test Plan C1 UNRESOLVED, not
+silently accepted — Phase 21's GC (real physical removal of
+causally-stable tombstones) is the next, and likely only real, lever for
+this specific scenario; compression cannot fix what is fundamentally an
+operation-identity problem, only removal can.
+
+An earlier attempt at this fixture used random-position single-character
+edits throughout and measured a degenerate 100,000 ops -> 100,000 blocks
+(no compression happened AT ALL, not even for the surviving visible
+text) — not a bug, just proof that fixture wasn't exercising anything
+representative; the current fixture (sequential bursts, then contiguous
+range deletes) is the fair, representative one, and the number above is
+real.
