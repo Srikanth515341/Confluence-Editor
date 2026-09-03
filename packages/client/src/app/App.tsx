@@ -28,9 +28,11 @@ function createClient(): SyncClient {
 export function App(): React.JSX.Element {
   const [sync] = useState(createClient);
   const [state, setState] = useState<ConnectionState>(sync.state.value);
+  const [unsyncedCount, setUnsyncedCount] = useState<number>(sync.unsyncedCount.value);
 
   useEffect(() => {
     const unsubscribe = sync.state.subscribe(setState);
+    const unsubscribeUnsynced = sync.unsyncedCount.subscribe(setUnsyncedCount);
     sync.connect();
     // Test/observability hook (Phase 14, Test Plan §2.7 E2E-CONV-01 assertions 2 and 4): the
     // E2E-CONV suite needs `engine.text()`/`engine.pending.length` INDEPENDENT of what the DOM
@@ -62,9 +64,26 @@ export function App(): React.JSX.Element {
       getReconnectAttemptCount: () => sync.reconnectAttemptCount,
       getConnectionState: () => sync.state.value,
       getReplicaId: () => sync.replicaId,
+      // Phase 22 additions — the same rationale as the hooks above: independent-of-the-DOM
+      // observability for DUR-07/08/09-shaped e2e assertions (unsynced count, durable-queue
+      // availability) that can't be read off the rendered indicator alone in every test shape.
+      getUnsyncedCount: () => sync.unsyncedCount.value,
+      getDurableQueueUnavailable: () => sync.durableQueueUnavailable,
+      // Test-only: deterministically severs the connection with NO further automatic
+      // reconnection (SyncClient.disconnect()'s own contract) — used by the DUR-07 e2e test
+      // (packages/client/e2e/durableQueue.spec.ts) in place of `context.setOffline(true)`,
+      // which was found NOT to reliably block an already-open WebSocket's outbound frames to a
+      // localhost server in this Playwright/Chromium combination (confirmed directly: the
+      // "severed" client's operations were still reaching and being committed by the server,
+      // producing duplicated content once the offline-queue reconcile logic ALSO resent them —
+      // a test-infrastructure gap, not a product bug, root-caused during this phase's own e2e
+      // verification work). `engine` is preserved (Phase 14's "last known state"), so editing
+      // after this call still works via Phase 22's relaxed requireEngine().
+      forceDisconnect: () => sync.disconnect(),
     };
     return () => {
       unsubscribe();
+      unsubscribeUnsynced();
       sync.disconnect();
     };
   }, [sync]);
@@ -88,7 +107,11 @@ export function App(): React.JSX.Element {
         }}
       >
         <strong>Confluence Editor</strong>
-        <ConnectionIndicator state={state} />
+        <ConnectionIndicator
+          state={state}
+          unsyncedCount={unsyncedCount}
+          durableQueueUnavailable={sync.durableQueueUnavailable}
+        />
       </header>
       <EditorView sync={sync} className="editor-root" />
     </div>

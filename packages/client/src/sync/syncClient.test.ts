@@ -300,6 +300,23 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     expect(client.state.value).toBe("reconnecting");
   });
 
+  it("Phase 22 fix: a genuinely idle-but-healthy session (regular PONGs, zero OPS traffic) does NOT force a reconnect", () => {
+    const ws = synced();
+    // Nobody edits anything, ever — but a real server responds to every PING with a PONG, on
+    // schedule, every PING_INTERVAL_MS. Before the fix, this alone would eventually trip
+    // hasStalled() (PONG never advanced the stall clock) and force a reconnect every ~8s,
+    // forever — found by Phase 22's own DUR-07 e2e test holding a real idle multi-client
+    // session against a real server for the first time in this project's history.
+    for (let i = 0; i < 5; i++) {
+      vi.advanceTimersByTime(PING_INTERVAL_MS);
+      ws.triggerMessage(
+        encodeControlFrame({ kind: "pong", clientTimeMs: 0, serverSeq: 0 }),
+      );
+    }
+    expect(ws.closed).toBe(false);
+    expect(client.state.value).toBe("synced");
+  });
+
   it("this client's own permanently-excluded operations (a real gap that will NEVER close) do NOT trigger a reconnect as long as OTHER traffic keeps arriving", () => {
     const ws = synced();
     // Simulate a sustained exchange where every OTHER seq is this client's own (never observed) —

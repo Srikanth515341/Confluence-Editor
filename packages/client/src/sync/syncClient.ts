@@ -21,7 +21,9 @@ import {
 } from "@collab-editor/protocol";
 import { Backoff, BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { ObservableValue, type ConnectionState, type Observable } from "./connectionState.js";
+import { openDurableQueue, type DurableQueue } from "./durableQueue.js";
 import { SequenceGapTracker } from "./gapTracker.js";
+import { reconcileOfflineQueue } from "./reconcileOfflineQueue.js";
 import { UnackedQueue } from "./unackedQueue.js";
 import { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
 
@@ -73,6 +75,23 @@ export interface SyncClientOptions {
   readonly createSocket?: (url: string, protocol: string) => WebSocketLike;
   /** Test-only observability hook: called with the exact delay just scheduled, right before the reconnect timer is armed. */
   readonly onReconnectScheduled?: (delayMs: number) => void;
+  /**
+   * Test-only injection point for Phase 22's durable queue (API Spec §7.9)
+   * — mirrors {@link createSocket}. Defaults to {@link openDurableQueue}
+   * using the real global `indexedDB`. A test supplies a stub that
+   * rejects/returns `null` to exercise DUR-09 (IndexedDB unavailable)
+   * without needing a real private-browsing browser context (Test Plan
+   * §3.6 DUR-09's own suggested approach), or one backed by
+   * `fake-indexeddb` to exercise DUR-07/08's persistence-across-restart
+   * behavior without a real browser crash.
+   *
+   * May return either a value directly OR a `Promise` — see
+   * `beginConnect`'s own comment for why this dual shape exists (it is
+   * what lets `connect()` stay perfectly synchronous, exactly matching
+   * every pre-Phase-22 test's timing assumptions, whenever there is
+   * genuinely no IndexedDB to restore from).
+   */
+  readonly openDurableQueue?: () => DurableQueue | null | Promise<DurableQueue | null>;
 }
 
 /**
@@ -94,6 +113,7 @@ export class SyncClient {
   private readonly serverUrl: string;
   private readonly createSocket: (url: string, protocol: string) => WebSocketLike;
   private readonly onReconnectScheduled: ((delayMs: number) => void) | undefined;
+  private readonly openDurableQueueFn: () => DurableQueue | null | Promise<DurableQueue | null>;
 
   private ws: WebSocketLike | null = null;
   private everSynced = false;
@@ -102,6 +122,15 @@ export class SyncClient {
   private readonly stateValue = new ObservableValue<ConnectionState>("offline");
   get state(): Observable<ConnectionState> {
     return this.stateValue;
+  }
+
+  /** PRD FR-OF-3: "connection state + unsynced-edit count" as UI-observable values, the same shape as {@link state} above. `unackedCount` (below) remains the plain, non-reactive snapshot every existing test already uses; this is the same number, exposed reactively for a real UI to subscribe to without polling. */
+  private readonly unsyncedCountValue = new ObservableValue<number>(0);
+  get unsyncedCount(): Observable<number> {
+    return this.unsyncedCountValue;
+  }
+  private syncUnsyncedCountObservable(): void {
+    this.unsyncedCountValue.set(this.unacked.size);
   }
 
   private readonly backoff = new Backoff();
@@ -115,11 +144,17 @@ export class SyncClient {
   /** The seq PING reports — the highest seq this client has ever applied, NOT the gap tracker's contiguous value (§3.7.5's "apply anyway" means these can legitimately differ while a gap is open). */
   private highestAppliedSeq = 0;
 
+  private durableQueue: DurableQueue | null = null;
+  private durableInitStarted = false;
+  /** PRD A-11: true once we've confirmed IndexedDB is unavailable (open failed/rejected, or the global doesn't exist at all) and this client has degraded to in-memory-only queueing. Never resets back to false — the degradation is for the lifetime of this page load, matching `openDurableQueueFn` only ever being attempted once (see `initDurableQueue`). */
+  private durableQueueUnavailableValue = false;
+
   constructor(opts: SyncClientOptions) {
     this.serverUrl = opts.url;
     this.documentId = opts.documentId;
     this.createSocket = opts.createSocket ?? defaultCreateSocket;
     this.onReconnectScheduled = opts.onReconnectScheduled;
+    this.openDurableQueueFn = opts.openDurableQueue ?? openDurableQueue;
   }
 
   /**
@@ -141,10 +176,101 @@ export class SyncClient {
     this.stateValue.set("synced");
   }
 
-  /** Opens (or re-opens) the connection. Safe to call once; automatic reconnection after a drop does not need it called again. */
+  /**
+   * Opens (or re-opens) the connection. Safe to call once; automatic
+   * reconnection after a drop does not need it called again.
+   *
+   * As of Phase 22, the FIRST call also kicks off the durable-queue init
+   * (open IndexedDB, restore any operations a prior page load never got to
+   * send — API Spec §7.9: "on document open, read before connecting so
+   * HELLO.unacked is complete"). `openSocket()` is not called until that
+   * settles (success OR fallback), so the very first HELLO this client
+   * ever sends already reflects a complete restored unacked set. Every
+   * SUBSEQUENT call (a real reconnect) skips straight to `openSocket()` —
+   * the durable queue, once attached, stays attached for this page's whole
+   * lifetime; there is nothing to restore again mid-session.
+   */
   connect(): void {
     this.explicitlyOffline = false;
     this.stateValue.set(this.everSynced ? "reconnecting" : "connecting");
+    this.beginConnect();
+  }
+
+  /**
+   * Deliberately NOT an `async` method. `openDurableQueueFn()` may return
+   * either a value directly or a genuine `Promise` (see its own doc
+   * comment) — branching on `instanceof Promise` here, rather than always
+   * `await`-ing, is what lets this whole method (and therefore
+   * `openSocket()`) run perfectly SYNCHRONOUSLY whenever there is
+   * genuinely no IndexedDB to restore from (this project's own
+   * Vitest/jsdom test suite, and any environment without the global at
+   * all): `await` on ANY value — even an already-resolved one — always
+   * defers by at least one microtask in JavaScript, which would silently
+   * break every pre-Phase-22 test's assumption that `connect()` opens the
+   * socket immediately, synchronously, within the same call. Only when a
+   * real (or injected) IndexedDB factory is actually present does this
+   * method defer `openSocket()` behind the genuinely-async restore.
+   */
+  private beginConnect(): void {
+    if (this.durableInitStarted) {
+      this.openSocket(); // a real reconnect — the durable queue (or its absence) is already settled
+      return;
+    }
+    this.durableInitStarted = true;
+    const result = this.openDurableQueueFn();
+    if (!(result instanceof Promise)) {
+      this.applyDurableQueueSync(result);
+      this.openSocket();
+      return;
+    }
+    void this.finishAsyncDurableInit(result);
+  }
+
+  private applyDurableQueueSync(durable: DurableQueue | null): void {
+    if (durable === null) {
+      this.durableQueueUnavailableValue = true; // PRD A-11 — degrade to in-memory, warn
+      return;
+    }
+    // A synchronously-available DurableQueue with nothing left to restore is not a shape any
+    // real implementation produces today (loadUnacked/loadMeta are always genuinely async, so a
+    // real open only ever reaches this method's OTHER (Promise) branch) — handled here for the
+    // injection point's own interface completeness, not exercised by any current caller.
+    this.unacked.attachDurable(durable, this.documentId);
+    this.durableQueue = durable;
+  }
+
+  private async finishAsyncDurableInit(pending: Promise<DurableQueue | null>): Promise<void> {
+    let durable: DurableQueue | null;
+    try {
+      durable = await pending;
+    } catch {
+      durable = null;
+    }
+    if (durable === null) {
+      this.durableQueueUnavailableValue = true; // PRD A-11 — degrade to in-memory, warn
+    } else {
+      try {
+        const [restoredOps, meta] = await Promise.all([
+          durable.loadUnacked(this.documentId),
+          durable.loadMeta(this.documentId),
+        ]);
+        this.unacked.restoreEntries(restoredOps);
+        this.unacked.attachDurable(durable, this.documentId);
+        this.durableQueue = durable;
+        if (meta) {
+          // Seeds HELLO's lastServerSeq from the last confirmed value BEFORE any real traffic
+          // this session (API Spec §7.9: meta's fields are "what HELLO needs to reconnect
+          // correctly").
+          this.gapTracker.reset(meta.lastServerSeq);
+          this.highestAppliedSeq = meta.lastServerSeq;
+        }
+      } catch {
+        // A read failure after a successful open degrades the same way an open failure would —
+        // there is no partial-durability story worth building for this phase (DUR-09 is about
+        // upfront unavailability, not a mid-init read error on an otherwise-working database).
+        this.durableQueueUnavailableValue = true;
+      }
+    }
     this.openSocket();
   }
 
@@ -201,16 +327,31 @@ export class SyncClient {
       ops.push(engine.localInsert(at, codePoint));
       at += 1;
     }
-    for (const msg of operationsToRunMessages(ops)) {
-      this.sendFrame(encodeFrame(msg));
-    }
+    // API Spec §7.9: "written in applyLocal before or concurrently with transmission, never
+    // after" — the durable-queue add (via unacked.add, which schedules the IndexedDB write)
+    // must happen BEFORE sendFrame below, not after. A crash between these two loops (in the
+    // old order) would have transmitted content the durable store never actually recorded —
+    // exactly the inconsistency this ordering rule exists to prevent.
     for (const op of ops) {
       this.unacked.add(op);
+    }
+    this.syncUnsyncedCountObservable();
+    for (const msg of operationsToRunMessages(ops)) {
+      this.sendFrame(encodeFrame(msg));
     }
     return ops;
   }
 
-  /** Number of locally-sent operations not yet acknowledged (API Spec §7.9) — exposed for tests/observability. */
+  /**
+   * Number of locally-sent operations not yet acknowledged (API Spec
+   * §7.9) — this IS the "unsynced-edit count" PRD FR-OF-3/Scope-IN asks
+   * the UI to display. Backed by `UnackedQueue`'s in-memory map, which is
+   * kept exactly consistent with what's durable: `ack()` schedules the
+   * durable removal BEFORE deleting in-memory (see unackedQueue.ts's own
+   * comment), so this count never overstates what has actually survived a
+   * crash up to this point — Test Plan DUR-08's own stated failure
+   * condition is a count that DOES overstate, not data loss itself.
+   */
   get unackedCount(): number {
     return this.unacked.size;
   }
@@ -225,34 +366,44 @@ export class SyncClient {
   }
 
   /**
-   * Requires BOTH a non-null engine AND `state.value === "synced"` — Phase
-   * 14 correction: `engine` is deliberately preserved (never nulled) across
-   * a disconnect (see `onClose`'s own comment), so checking for null alone
-   * does not catch the "reconnecting" window between an old connection
-   * dropping and a fresh SNAPSHOT replacing `engine` wholesale. A local
-   * edit minted against the OLD (soon-to-be-discarded) engine reference
-   * during that window would apply locally, attempt to send over a socket
-   * that's already gone, and then be silently ORPHANED the instant the new
-   * snapshot replaces `engine` — a real, confirmed data-loss path, found
-   * only by running a real multi-client session long enough to reconnect
-   * mid-edit (Test Plan §2.7's own E2E-CONV-01/-02). Throwing here instead
-   * of silently operating on a doomed reference is the same "throws if not
-   * currently synced" contract `localInsert`'s own doc comment already
-   * promised — this closes the gap between that promise and what the code
-   * actually checked. `EditorView`'s input pipeline (inputPipeline.ts)
-   * checks `state.value === "synced"` BEFORE ever reaching this call, so a
-   * real user typing during a reconnect never actually hits this throw —
-   * it's a backstop for direct/programmatic callers.
+   * Requires a non-null engine. Phase 14 originally ALSO required
+   * `state.value === "synced"`, specifically to block editing during the
+   * "reconnecting" window between an old connection dropping and a fresh
+   * SNAPSHOT replacing `engine` wholesale — otherwise a local edit would
+   * apply to the OLD (soon-to-be-discarded) engine reference, attempt to
+   * send over an already-dead socket, and then be silently ORPHANED the
+   * instant the new snapshot replaced `engine` (a real, confirmed
+   * data-loss path from that phase's own DoD verification).
+   *
+   * Phase 22 REMOVES that state check, deliberately: it is exactly the gap
+   * this phase's durable queue + `reconcileOfflineQueue` close, not a
+   * regression of Phase 14's fix. An edit minted while `reconnecting` (or
+   * `offline`) now: (a) applies to the CURRENT `engine` reference — still
+   * correct, since `engine` is only ever replaced by `handleSnapshot`, not
+   * mutated out from under a caller mid-call; (b) is durably queued via
+   * `sendOperation`/`UnackedQueue.add` (API Spec §7.9), surviving even a
+   * full browser crash; (c) is silently no-op'd on the wire by
+   * `sendFrame`'s existing `this.ws?.send(...)` guard while no socket
+   * exists; and (d) is reconciled against the NEXT fresh SNAPSHOT's engine
+   * by `handleSnapshot` — see `reconcileOfflineQueue.ts`. Nothing is
+   * orphaned anymore; the old bug's fix was "block editing," the new fix
+   * is "make editing during that window actually safe."
    */
   private requireEngine(): Engine {
-    if (!this.engine || this.stateValue.value !== "synced") {
-      throw new Error("SyncClient: not synced yet — call after state becomes 'synced'");
+    if (!this.engine) {
+      throw new Error("SyncClient: no engine yet — call after the first SNAPSHOT has been received");
     }
     return this.engine;
   }
 
+  /** PRD A-11: true once IndexedDB has been confirmed unavailable (open failed/rejected, or the global doesn't exist) and this client has degraded to in-memory-only queueing for the rest of this page load. The caller (ConnectionIndicator/App) is expected to surface this explicitly — silent degradation of a durability promise is the failure condition Test Plan DUR-09 exists to catch. */
+  get durableQueueUnavailable(): boolean {
+    return this.durableQueueUnavailableValue;
+  }
+
   private sendOperation(op: Operation): void {
     this.unacked.add(op);
+    this.syncUnsyncedCountObservable();
     this.sendFrame(encodeFrame(operationToOpsMessage(op)));
   }
 
@@ -320,9 +471,15 @@ export class SyncClient {
         this.handleSnapshot(msg.seq, msg.form, msg.body);
         break;
       case "pong":
+        // Phase 22 fix (found by this phase's own DUR-07 e2e test, unrelated to the durable
+        // queue itself): a PONG proves the connection is alive even when nothing has been
+        // edited — see gapTracker.ts's `markAlive()` doc comment for the full account of the
+        // false-positive "stalled" reconnect this closes.
+        this.gapTracker.markAlive();
+        break;
       case "goodbye":
       case "error":
-        break; // no RTT tracking, no special GOODBYE/ERROR handling this phase — 'close' drives reconnection either way
+        break; // no special GOODBYE/ERROR handling this phase — 'close' drives reconnection either way
       default:
         break; // hello/syncComplete/ping/leave are client-origin only; decodeControlFrame already enforces this
     }
@@ -340,15 +497,48 @@ export class SyncClient {
     } else {
       this.engine = new Engine(this.replicaId);
     }
-    this.unacked.clear(); // whatever this client sent under a PRIOR connection is already reflected in this fresh snapshot (or lost with that connection) — nothing to resend against a brand-new replica identity
+    // Phase 22: a fresh SNAPSHOT means a BRAND-NEW replica id (this project's server never
+    // resumes a session — see reconcileOfflineQueue.ts's own header comment) — so whatever this
+    // client had queued as unacked (from a prior connection this page session, OR restored from
+    // IndexedDB after a crash) can never be resent AS-IS; its stamps belong to a replica id the
+    // server will now reject as an identity mismatch. Instead: capture the queued operations,
+    // un-queue them (both memory and durable — they're about to be superseded, not acked),
+    // reconcile each one's INTENT against the freshly-seeded engine (producing brand-new
+    // operations under the new replica id), and send those. This is what makes offline editing
+    // during a "reconnecting" window (Scope-IN) actually reach the document, not just sit
+    // durably inert forever.
+    const queued = this.unacked.values();
+    for (const op of queued) {
+      this.unacked.ack(op.id);
+    }
+    this.syncUnsyncedCountObservable(); // covers the (rare) case resent.length === 0 below, where no later sendOperation call would otherwise refresh this
+    const resent = reconcileOfflineQueue(this.engine, queued);
+    for (const op of resent) {
+      this.sendOperation(op);
+    }
+
     this.gapTracker.reset(seq);
     this.highestAppliedSeq = seq;
+    this.persistMeta();
 
-    this.sendControl({ kind: "syncComplete", lastServerSeq: seq, resentCount: 0 });
+    this.sendControl({ kind: "syncComplete", lastServerSeq: seq, resentCount: resent.length });
 
     this.everSynced = true;
     this.stateValue.set("synced");
     this.startPingTimer();
+  }
+
+  /** Batches a `meta` row write (API Spec §7.9's exact three fields) whenever `replicaId`/`highestAppliedSeq` change — a no-op if the durable queue isn't attached (in-memory-only degradation, PRD A-11). */
+  private persistMeta(): void {
+    if (!this.durableQueue || this.replicaId === null) {
+      return;
+    }
+    this.durableQueue.scheduleWriteMeta({
+      documentId: this.documentId,
+      lastServerSeq: this.highestAppliedSeq,
+      replicaId: this.replicaId,
+      updatedAt: Date.now(),
+    });
   }
 
   /**
@@ -365,12 +555,27 @@ export class SyncClient {
         for (const ack of msg.acks) {
           this.unacked.ack(ack.ackedId);
         }
+        this.syncUnsyncedCountObservable();
         break;
       case "opReject":
-        // No retry/error-surface logic this phase — a rejected operation is simply given up on.
+        // No retry/error-surface logic this phase — a rejected operation is simply given up on
+        // (unchanged since Phase 10). Phase 22 adds durable PRESERVATION (API Spec §7.9's
+        // `rejected` store, "preservation of rejected operations") — the op is no longer
+        // silently discarded, just no longer actively retried.
         for (const rejected of msg.rejects) {
+          const op = this.unacked.get(rejected.rejectedId);
           this.unacked.ack(rejected.rejectedId);
+          if (op && this.durableQueue) {
+            this.durableQueue.scheduleWriteRejected({
+              documentId: this.documentId,
+              op,
+              reason: rejected.reason,
+              detail: msg.detail,
+              rejectedAt: Date.now(),
+            });
+          }
         }
+        this.syncUnsyncedCountObservable();
         break;
       default:
         this.handleOps(msg.seq, toOperations(msg));
@@ -397,6 +602,7 @@ export class SyncClient {
     const endSeq = ops.length > 0 ? seq + ops.length - 1 : seq;
     this.highestAppliedSeq = Math.max(this.highestAppliedSeq, endSeq);
     this.gapTracker.observe(endSeq);
+    this.persistMeta(); // batched (durableQueue.ts's 200ms trailing edge) — keeps meta.lastServerSeq reasonably fresh for a LATER crash, not just immediately post-snapshot
     // Reconnection off a stalled `gapTracker` is checked on the ping cadence (`startPingTimer`),
     // not armed here — see gapTracker.ts's own doc comment for why a per-call timer keyed off
     // "any single missing seq number" was the actual bug this phase found and fixed.

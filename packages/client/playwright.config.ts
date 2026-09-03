@@ -29,7 +29,10 @@ import { defineConfig, devices } from "@playwright/test";
 // Each project sets its OWN testMatch/testIgnore explicitly, rather than relying on a top-level
 // default plus per-project overrides — Playwright's merge behavior between the two is not worth
 // depending on when correctness here matters (running convergence.spec.ts exactly once).
-const SINGLE_ENGINE_MATCH = { testMatch: /.*\.spec\.ts/, testIgnore: /convergence\.spec\.ts/ };
+const SINGLE_ENGINE_MATCH = {
+  testMatch: /.*\.spec\.ts/,
+  testIgnore: [/convergence\.spec\.ts/, /durableQueue\.spec\.ts/],
+};
 
 export default defineConfig({
   testDir: "./e2e",
@@ -45,6 +48,20 @@ export default defineConfig({
       name: "convergence",
       testMatch: /convergence\.spec\.ts/,
       timeout: 300_000, // E2E-CONV-01..03 each run for up to ~60s of real typing plus setup/teardown
+    },
+    {
+      name: "durableQueue",
+      testMatch: /durableQueue\.spec\.ts/,
+      timeout: 60_000,
+      // Chromium-only (Phase 22, Test Plan §3.6 DUR-07): this file manages its own real, on-disk
+      // browser profile directly via chromium.launchPersistentContext() rather than using
+      // Playwright's `page`/`context` fixtures (see the file's own header comment for exactly
+      // what real Playwright API this needed, what it does NOT do — a literal SIGKILL turned out
+      // not to be achievable through any supported combination of Playwright APIs — and why that
+      // doesn't weaken the claim under test), so the `use` block below is unused and the
+      // single-engine projects above explicitly ignore this file to avoid running it redundantly
+      // three times under three unrelated `devices` configs — the same reasoning
+      // `convergence.spec.ts` already established for its own dedicated project.
     },
   ],
 });
