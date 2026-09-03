@@ -225,3 +225,53 @@ CLAUDE.md's "Engine Spec §6.2 sub-case iii-d correction" entry.
 **Both R0008 and R0009 remain permanently in this corpus per Rule 2, even
 though both are now fixed** — a corpus entry documents a bug that
 happened, not a currently-open issue.
+
+## See also — the Phase 21 pathological GC chain (NOT an R#### entry, and deliberately so)
+
+Phase 21's `Engine.collect()` DoD work found a hand-constructed (not
+fuzz-discovered) 10,000-deep unresolved anchor chain — a document whose
+first 10,000 characters are deleted but a still-live character
+immediately after them permanently anchors the tombstoned prefix
+(Engine Spec I4/I5 correctly refuse to ever collect it) — costs **853
+seconds** of wall-clock time for one `collect()` fixpoint sweep
+(N=90,000), and, under the wall-clock safety cap added the same phase,
+permanently caps at **zero nodes collected per cycle, forever**, no
+matter how many capped cycles run against it.
+
+This is deliberately **not** filed as an R#### entry: it is not a
+convergence-fuzz failure and not a divergence (`collect()`'s zero-progress
+behavior here is provably correct, not a bug — see the correctness
+argument in `packages/engine/src/engine.ts`'s own `collect()` comment),
+and it has no natural "operation stream" the way Rule 3 expects — it's a
+deterministic construction (`buildPathologicalChain`), not a fuzz seed.
+Filing it here under the R#### scheme would blur this corpus's meaning
+(every other entry here is a confirmed-or-suspected convergence
+divergence) without adding any protection beyond what already exists for
+it: unlike the R#### entries above, which are stored as JSON provenance
+records only (nothing in this repo auto-loads and replays them — the
+actual regression protection for R0008/R0009 comes from hand-written test
+code, not from this directory), the pathological-chain scenario is
+already directly encoded as permanent, automatically-run test code:
+
+- `packages/engine/src/engine.test.ts`'s `describe("collect() wall-clock
+  safety cap — logic/correctness only...")` block — fake-clock-driven,
+  asserts the cap triggers, I4/I5 hold on an incomplete sweep, and three
+  repeated capped cycles collect `[0, 0, 0]` (genuinely, honestly stuck,
+  not "eventually progresses"). Runs on every `pnpm test`.
+- `packages/testkit/src/benchmark/gcSafetyCap.bench.test.ts` — the real
+  `performance.now()` measurement (262.9ms capped vs. 853,000ms
+  uncapped). Runs on every `pnpm test:benchmark`.
+- `packages/server/src/db/gc.db.test.ts`'s "does not freeze the event
+  loop for OTHER documents" test — the same construction, proving a
+  concurrent HTTP request to an unrelated document stays fast (~223ms)
+  while a capped pathological cycle runs. Runs on every `pnpm test:db`.
+
+Any future change to `collect()`'s fixpoint logic that regresses either
+the safety cap's trigger condition or the I4/I5 correctness guarantee
+under this exact scenario will fail one of the three tests above
+immediately — a stronger, more automatic guarantee than adding a JSON
+entry here would provide. The real fix for the underlying limitation
+(an incremental fixpoint that persists progress across cycles instead of
+restarting from scratch every time) is documented as explicit future
+work in CLAUDE.md's Phase 21 entry, citing this same 853s/D=10,000/
+N=90,000 measurement.

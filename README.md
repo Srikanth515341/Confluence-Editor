@@ -12,6 +12,47 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 21 — tombstone garbage collection.** `Engine.collect()` (Engine
+Spec §7.4's COLLECT: a node is reclaimed only once it's deleted, its
+delete is causally stable — every currently active replica has observed
+it — no live node anchors it (a fixpoint sweep, since a live node may
+anchor to a dead one), and it's aged past the undo horizon), the real
+stability frontier (`sessions.last_ack_seq`/`last_seen_at`, API Spec
+§6.5), and a 60-second per-document GC cycle are all live. A stale
+session's tombstones are protected for a full 10-minute offline window
+and released automatically once it ages out — deliberately NOT the same
+8-second timer presence uses; conflating the two would let GC collect
+anchors a client mid-reconnect still needs. Verified with a 1,000-call
+randomized sweep (200 trials × 5 `(frontier, horizon)` combinations each)
+asserting, after EVERY single call, that no remaining node ever
+references a collected one — the exact invariant class this project's
+Phase 20 investigation found two real bugs in, so this phase treated
+"the same anchor-tracking mechanism, now used for physical removal" as a
+real risk to re-verify, not a formality. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 21 entry for the full account,
+including what's deliberately not built yet (an evicted replica's
+stale operations are safely stranded rather than corrupting anything,
+but no explicit rejection/export flow exists) and two unrelated
+Phase-20-era CI gaps (`pnpm typecheck`, `pnpm check:purity`) found and
+fixed along the way.
+
+**Phase 20 — block run-length encoding, and a major correctness
+correction.** Implements Engine Spec §7.5's block compression (a
+sequential 3,000-character run now measures a single block — over
+50,000x compression on real typing). Far more consequential: DoD
+verification for this phase found — and this project fixed — two
+real, previously-undiscovered bugs in the core convergence algorithm's
+Case B/C logic, present since Phase 3 and traced to an actual error in
+the approved Engine Specification's own §6.2 text, not an
+implementation bug. The investigation also found that this project's
+own 60,000-seed convergence fuzz suite had a structural blind spot —
+its delivery model made the failure class it needed to catch
+*impossible to reach* — and fixed that too, adding a permanent seventh
+fuzz configuration built specifically to close the gap. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 20 entry and its "Engine Spec §6.2
+sub-case iii-d correction" note for the full, deliberately
+undercompressed account of how this was found, root-caused, and fixed.
+
 **Phase 19 — indexed position structure.** `packages/engine`'s node
 storage moved from a flat array with O(N) linear-scan position lookup (a
 deliberate Phase 3 placeholder) to `PositionIndex` — an implicit-key

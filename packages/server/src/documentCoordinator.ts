@@ -83,6 +83,35 @@ export class DocumentCoordinator {
   lastSnapAt: Date;
   /** True while a snapshot write is in flight (snapshotter.ts) — prevents scheduling a second, overlapping write for the same coordinator. */
   snapshotInFlight = false;
+
+  /**
+   * GC observability (Phase 21, Scope-IN's own metrics list — "GC's failure mode is silent,
+   * so liveness is monitored, not errors"). All four are read by httpApp.ts's `/gc-status`
+   * endpoint and computed/updated by gcScheduler.ts on every tick, success or failure:
+   * `lastGcAttemptAt`/`lastGcSuccessAt` are separate (not merged) specifically so a run that
+   * THROWS still updates "attempted," letting `minutes_since_last_success` grow even while
+   * cycles keep firing on schedule — a stuck GC that still LOOKS alive (the timer fires) is
+   * exactly the silent failure this metric exists to catch. `lastCollectedCount` is the most
+   * recent cycle's own count (not cumulative). `frontierLastAdvancedAt`/`lastKnownFrontier`
+   * track when the stability frontier itself last MOVED — `frontier_lag_seconds` is derived
+   * from the former, a genuine staleness signal (a frontier stuck for a long time means no
+   * active session is acking, not necessarily that GC itself is broken).
+   */
+  lastGcAttemptAt: Date | null = null;
+  lastGcSuccessAt: Date | null = null;
+  lastGcCollectedCount = 0;
+  lastKnownFrontier = 0n;
+  frontierLastAdvancedAt: Date | null = null;
+  /**
+   * Phase 21 safety-cap metric (`gc.cycle_incomplete_count`): cumulative count, for this
+   * coordinator's lifetime, of GC cycles that hit `GcConfig.gcFixpointBudgetMs` before the
+   * fixpoint sweep naturally converged (engine.ts's `CollectResult.incomplete`). A cycle that
+   * hits this is NOT a failure — the collected set is still fully safe, just possibly smaller
+   * than the true maximum this time — but a document that keeps incrementing this every cycle
+   * without making progress is worth alerting on separately from `minutes_since_last_success`
+   * (that cycle DID succeed; it just didn't finish the whole sweep).
+   */
+  gcCycleIncompleteCount = 0;
   /**
    * RFC §13.2's cadence (500 ops / 30s), as instance fields rather than
    * only the module-level constants (snapshotter.ts) — test-only
@@ -153,8 +182,11 @@ export class DocumentCoordinator {
     if (snapshotNodes) {
       replaySnapshotNodesInto(this.engine, snapshotNodes);
     }
-    for (const op of suffixOps) {
-      this.engine.applyRemote(op);
+    for (const entry of suffixOps) {
+      // Phase 21: thread seq/committed-time through so a Delete replayed after a restart
+      // still carries GC context (see WarmStartSuffixOperation's own doc comment) — passed
+      // unconditionally (engine.applyRemote only consults it for `kind: "delete"` ops).
+      this.engine.applyRemote(entry.op, { seq: entry.seq, atMs: entry.committedAtMs });
     }
     if (this.engine.pending.length !== 0) {
       throw new Error(

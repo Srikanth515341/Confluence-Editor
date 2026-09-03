@@ -17,7 +17,7 @@ export type {
 } from "./operation.js";
 export { isClusterContinuing } from "./grapheme.js";
 export { Engine } from "./engine.js";
-export type { ClockEvent, EngineStats } from "./engine.js";
+export type { ClockEvent, CollectOptions, CollectResult, EngineStats } from "./engine.js";
 export { assertInvariants, InvariantViolation } from "./invariants.js";
 export type { AssertInvariantsOptions } from "./invariants.js";
 // Block encoding (Engine Spec §7.5, Phase 20) — exported for

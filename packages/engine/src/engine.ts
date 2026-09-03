@@ -113,6 +113,34 @@ export class Engine {
   /** See {@link ClockEvent}. Test/diagnostic-only — never consulted by ordering logic. */
   private readonly clockEvents: ClockEvent[] = [];
 
+  /**
+   * Delete-operation metadata needed for garbage collection (Phase 21, Engine Spec §7.3
+   * "causal stability", §7.7 "undo horizon") — the SEQ and wall-clock arrival time of each
+   * Delete operation this engine has ever seen, keyed by that DELETE OPERATION's own
+   * serialized id (never the target's — a node's `deletedBy` can change if a causally-later
+   * concurrent delete overrides attribution, and `collect()` must look up whichever delete
+   * currently holds it). Populated ONLY when `applyRemote` is called WITH a `context` — every
+   * existing caller (the fuzz/property/adversarial suites, `localInsert`/`localDelete`,
+   * `SyncClient`) omits it, so this map stays empty for them and {@link collect} finds nothing
+   * collectible — collection is opt-in and cannot change behavior for any pre-Phase-21 code
+   * path. In practice, only the SERVER's own coordinator engine ever supplies a `context`
+   * (seq and wall-clock time are protocol/persistence-layer concepts, deliberately absent from
+   * this otherwise-pure engine — the same "accept it as a parameter, never read it yourself"
+   * discipline as `observe(remoteCounter)` and `preSkewClock`, Engine Spec C9).
+   */
+  private readonly deleteContext = new Map<string, { readonly seq: bigint; readonly atMs: number }>();
+
+  /**
+   * Highest Lamport counter observed from each replica, across every operation this engine
+   * has applied (not just deletes) — a plain-data proxy for "how many operations has this
+   * replica minted since [some earlier point]," since the engine otherwise tracks only its
+   * OWN clock, never other replicas' individually. Used by {@link collect}'s undo-horizon
+   * op-count check (Engine Spec §7.7 Rule 7.3, "200 operations by that user") — pre-auth,
+   * "that user" is approximated as "that replica," the same simplification this project has
+   * used for every not-yet-real-auth decision since Phase 8/9.
+   */
+  private readonly maxCounterByReplica = new Map<number, number>();
+
   constructor(replicaId: number) {
     this.replicaId = replicaId;
   }
@@ -347,8 +375,8 @@ export class Engine {
           }
         } else {
           // Case C: `other`'s own origin lies outside what THIS scan pass has walked
-          // (`scanned`) — either because it's ⊥ (the document boundary) or because it's a
-          // real node genuinely outside the current window.
+          // (`scanned`) — either because it's ⊥ (the structure's own boundary) or because
+          // it's a real node genuinely outside the current scan window entirely.
           //
           // *** ENGINE SPEC §6.2 SUB-CASE III-D CORRECTION, PART 1 (2026-09-02, R0008) ***
           // Sub-case iii-d, AS ORIGINALLY WRITTEN in the approved Engine Specification,
@@ -446,12 +474,22 @@ export class Engine {
       throw new Error(`applyUndelete(): target ${serializeId(op.target)} is not present`);
     }
     if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
+      // GC hygiene (Phase 21): the node is no longer deleted, so whatever delete-context was
+      // recorded for its (now-superseded) deletedBy no longer describes anything collectible —
+      // drop it rather than let it linger forever across delete/undelete churn.
+      if (node.deletedBy !== null) {
+        this.deleteContext.delete(serializeId(node.deletedBy));
+      }
       this.index.setDeleted(op.target, false, null);
     }
   }
 
   private doApply(op: Operation): void {
     this.observe(op.id.c);
+    const seenCounter = this.maxCounterByReplica.get(op.id.r);
+    if (seenCounter === undefined || op.id.c > seenCounter) {
+      this.maxCounterByReplica.set(op.id.r, op.id.c);
+    }
     switch (op.kind) {
       case "insert":
         this.applyInsert(op);
@@ -501,7 +539,15 @@ export class Engine {
    * and it was queued rather than applied — normal, never an error
    * (Engine Spec §4.2).
    */
-  applyRemote(op: Operation): { readonly buffered: boolean } {
+  applyRemote(
+    op: Operation,
+    context?: { readonly seq: bigint; readonly atMs: number },
+  ): { readonly buffered: boolean } {
+    if (op.kind === "delete" && context) {
+      // Recorded regardless of ready/buffered status below — a Delete's own seq/arrival time
+      // is fixed at commit time, independent of when THIS engine gets around to applying it.
+      this.deleteContext.set(serializeId(op.id), context);
+    }
     if (this.applied.has(serializeId(op.id))) {
       return { buffered: false };
     }
@@ -572,4 +618,229 @@ export class Engine {
     }
     return ops;
   }
+
+  /**
+   * Garbage collection (Phase 21, Engine Spec §7.3 "causal stability", §7.4 COLLECT,
+   * §7.7 "undo horizon"). Physically removes every node that is simultaneously:
+   *   1. deleted;
+   *   2. deleted by an operation that is causally STABLE — its seq is ≤ `frontier`, meaning
+   *      every currently active replica has already observed it (Definition 7.3);
+   *   3. not the originLeft/originRight of any node that ISN'T (transitively) also being
+   *      collected — a live node may anchor to a dead one, so this is a fixpoint sweep, not a
+   *      per-node test (Definition 7.4's own framing);
+   *   4. deleted longer ago than the undo horizon — `options.nowMs - <delete's arrival time>
+   *      >= options.maxAgeMs`, OR the deleting replica has minted `options.maxOpsPerReplica`
+   *      or more further operations since (Rule 7.3's `min(5 minutes, 200 operations)` —
+   *      collection is allowed once EITHER bound is crossed, i.e. protection lasts only the
+   *      SHORTER of the two windows).
+   *
+   * A node with NO recorded delete-context (its Delete was applied via a plain `applyRemote`
+   * call with no `context` — true for every caller except the server's own coordinator engine)
+   * can never satisfy condition 2 and is therefore never collectible — this is what makes
+   * collection entirely opt-in and safe to call on any engine, including ones a test built
+   * without ever supplying seq/time context.
+   *
+   * Deliberately NOT wall-clock-reading itself (Engine Spec C9): `options.nowMs` is a plain
+   * parameter, exactly like `observe(remoteCounter)` never reads a clock — the caller (the
+   * server's GC scheduler) supplies the current time, keeping this method itself pure and
+   * deterministic given its inputs.
+   */
+  collect(frontier: bigint, options: CollectOptions): CollectResult {
+    const allNodes = this.nodes; // O(N) materialize, in structural order — see below for why
+    // this method reasons over the fully-decoded Node[] view rather than PositionIndex/Block
+    // internals directly: Definition 7.4's conditions are node-level, and `nodes` already
+    // gives every node's real originLeft/originRight regardless of how blocks group them —
+    // block boundaries are a storage detail invisible to this algorithm, exactly as intended.
+
+    // Step 1 (COLLECT line 1): candidates — deleted, causally stable, older than the horizon.
+    const candidates = new Set<string>();
+    for (const node of allNodes) {
+      if (!node.deleted || node.deletedBy === null) {
+        continue;
+      }
+      const context = this.deleteContext.get(serializeId(node.deletedBy));
+      if (context === undefined || context.seq > frontier) {
+        continue; // no known seq (never GC-eligible) or not yet causally stable
+      }
+      const agedOut = options.nowMs - context.atMs >= options.maxAgeMs;
+      const seenCounter = this.maxCounterByReplica.get(node.deletedBy.r) ?? node.deletedBy.c;
+      const outpaced = seenCounter - node.deletedBy.c >= options.maxOpsPerReplica;
+      if (!agedOut && !outpaced) {
+        continue; // still inside the undo horizon
+      }
+      candidates.add(serializeId(node.id));
+    }
+    if (candidates.size === 0) {
+      return { collectedCount: 0, incomplete: false };
+    }
+
+    // Steps 2-6 (COLLECT lines 2-6): fixpoint anchor exclusion. `collectible` starts as every
+    // candidate and shrinks: on each pass, gather every origin referenced by a node NOT
+    // (currently) collectible — mathematically `S \ collectible`, which is exactly
+    // `(S \ candidates) ∪ (candidates \ collectible)`, the pseudocode's own `anchored` set,
+    // just recomputed fresh each pass instead of accumulated incrementally. Simpler to read
+    // and audit; same fixed point, since `collectible` only ever shrinks.
+    //
+    // *** WALL-CLOCK SAFETY CAP (2026-09-03, found via M8-c's own DoD verification) ***
+    // A long UNRESOLVED anchor chain (a deleted prefix whose immediately-following content is
+    // still live — see CLAUDE.md's Phase 21 entry) forces one fixpoint pass per cascade step,
+    // each pass O(N) — measured at 853s wall-clock for a 10,000-deep chain over 90,000 nodes
+    // (~680s in the fixpoint itself). Because this loop has no `await` anywhere, an uncapped
+    // run of that length would block the ENTIRE Node event loop — not just this document's own
+    // GC, but every other document's OPS/PING/HTTP traffic sharing the same process — for the
+    // full duration. `options.budgetMs`/`options.clock` (both optional; omitted = no cap, the
+    // pre-cap behavior, for every existing caller/test that doesn't care) bound this: the
+    // budget is checked ONLY after a FULLY-COMPLETED pass, never mid-pass — but completing a
+    // pass cleanly is NOT the same as the fixpoint being SAFE to act on early; see the cutoff
+    // site below (search "an incomplete sweep collects ZERO nodes") for the real correctness
+    // argument, including a bug an earlier version of this cap got wrong before shipping.
+    // `clock` is a plain injected function, invoked here, never a literal wall-clock read of
+    // this package's own — Engine Spec C9's purity rule is about this package never READING a
+    // clock itself, which an injected callback satisfies the same way `observe(remoteCounter)`
+    // and `context.atMs` already do.
+    const collectible = new Set(candidates);
+    let changed = true;
+    let incomplete = false;
+    const budgetMs = options.budgetMs;
+    const clock = options.clock;
+    const startClock = budgetMs !== undefined && clock !== undefined ? clock() : undefined;
+    while (changed) {
+      changed = false;
+      const anchored = new Set<string>();
+      for (const node of allNodes) {
+        if (collectible.has(serializeId(node.id))) {
+          continue; // n itself is (still) being collected — its OWN origins don't protect anything
+        }
+        if (node.originLeft !== null) {
+          anchored.add(serializeId(node.originLeft));
+        }
+        if (node.originRight !== null) {
+          anchored.add(serializeId(node.originRight));
+        }
+      }
+      for (const key of collectible) {
+        if (anchored.has(key)) {
+          collectible.delete(key);
+          changed = true;
+        }
+      }
+      if (startClock !== undefined && budgetMs !== undefined && clock) {
+        if (clock() - startClock >= budgetMs) {
+          // `changed` reflects THIS just-completed pass: if it's still true, this pass found
+          // further shrinkage and the fixpoint had not yet naturally settled — genuinely
+          // incomplete. If it's false, this pass found nothing new, i.e. the fixpoint HAD
+          // already reached its true, natural conclusion at the same moment the budget was
+          // hit — not incomplete, just coincidentally timed.
+          incomplete = changed;
+          break;
+        }
+      }
+    }
+    // *** CORRECTNESS, NOT JUST PERFORMANCE — an incomplete sweep collects NOTHING ***
+    // A node still sitting in `collectible` when the loop is cut short is NOT a safe
+    // conservative under-approximation — `collectible` only ever SHRINKS as later passes run,
+    // which means a node present at THIS moment could still be excluded by a pass that hasn't
+    // run yet (i.e. it may in fact still be needed as an anchor, the cascade just hasn't
+    // reached it within the budget). Physically removing it now, before the fixpoint has
+    // PROVABLY reached its true, stable conclusion, risks leaving some OTHER remaining node's
+    // origin dangling — exactly the I4/I5 violation this whole algorithm exists to prevent.
+    // (An earlier version of this safety cap got this wrong — traced by hand against the exact
+    // R0008-shaped pathological case before being trusted: after just one pass, only the
+    // directly-anchored last node of a long chain is excluded, so collecting the rest of the
+    // still-`collectible` chain at that point would strand THAT excluded node's own origin.)
+    // The only definitely-correct behavior when the budget is hit before natural convergence
+    // is to collect ZERO nodes this cycle — bounding wall-clock time is still achieved, but
+    // safety is never traded for it. Making genuinely-deep-but-resolvable chains progress
+    // across MULTIPLE budget-capped cycles would require persisting fixpoint state between
+    // calls (an incremental fixpoint) — explicitly OUT of scope for this safety net; see
+    // CLAUDE.md's Phase 21 entry for that as documented future work.
+    if (incomplete) {
+      return { collectedCount: 0, incomplete: true };
+    }
+    if (collectible.size === 0) {
+      return { collectedCount: 0, incomplete: false };
+    }
+
+    // Steps 7-8 (COLLECT lines 7-8): physical removal. `allNodes` is still in structural
+    // position order (nothing above mutated the structure), so group `collectible` into
+    // maximal contiguous runs and remove each with one `splice` call — O(runs), not
+    // O(collectible.size) — processing runs back-to-front so earlier positions stay valid.
+    const ranges: Array<{ readonly start: number; readonly count: number }> = [];
+    let runStart = -1;
+    for (let i = 0; i < allNodes.length; i++) {
+      const inSet = collectible.has(serializeId(allNodes[i]!.id));
+      if (inSet && runStart === -1) {
+        runStart = i;
+      } else if (!inSet && runStart !== -1) {
+        ranges.push({ start: runStart, count: i - runStart });
+        runStart = -1;
+      }
+    }
+    if (runStart !== -1) {
+      ranges.push({ start: runStart, count: allNodes.length - runStart });
+    }
+
+    for (let i = ranges.length - 1; i >= 0; i--) {
+      const { start, count } = ranges[i]!;
+      const removed = this.index.splice(start, count);
+      for (const node of removed) {
+        if (node.deletedBy !== null) {
+          this.deleteContext.delete(serializeId(node.deletedBy)); // GC hygiene, same as applyUndelete
+        }
+      }
+    }
+
+    // `incomplete` is always false here — the early return above handles the incomplete case.
+    return { collectedCount: collectible.size, incomplete: false };
+  }
+}
+
+/** {@link Engine.collect}'s tunables — Engine Spec §7.7 Rule 7.3's undo horizon, threaded in
+ * as plain data rather than read from a wall clock inside the engine (Engine Spec C9). */
+export interface CollectOptions {
+  /** The caller's current time, in epoch milliseconds — supplied, never read, by this method. */
+  readonly nowMs: number;
+  /** A deleted node's tombstone must be at least this old (in ms) to be collectible, UNLESS `maxOpsPerReplica` is reached first (Rule 7.3: `min(5 minutes, 200 operations)`). */
+  readonly maxAgeMs: number;
+  /** A deleted node's tombstone is also collectible once its deleting replica has minted this many further operations, UNLESS `maxAgeMs` is reached first. */
+  readonly maxOpsPerReplica: number;
+  /**
+   * Optional wall-clock safety cap on the fixpoint sweep (Phase 21, found via a measured 853s
+   * pathological case — CLAUDE.md's Phase 21 entry). Both `budgetMs` and `clock` must be
+   * supplied together to have any effect; omitting either means NO cap (the original,
+   * unbounded-fixpoint behavior — every pre-cap test and caller is unaffected). `clock` is
+   * INVOKED by `collect()`, never defined by it — this package still never reads a wall clock
+   * itself (Engine Spec C9); see {@link Engine.collect}'s own doc comment for the full
+   * reasoning — including a real bug found and fixed BEFORE shipping this: an earlier version
+   * of this cap collected whatever remained in the fixpoint's `collectible` set at cutoff,
+   * reasoning that set only ever shrinks so a partial result must be "conservative." That's
+   * false — a node still in an UNCONVERGED `collectible` set may yet be excluded by a pass
+   * that hasn't run, meaning it could still be needed as an anchor. Collecting it anyway risks
+   * stranding some OTHER node's origin. The fix (see {@link Engine.collect}'s own comment at
+   * the cutoff site): an incomplete sweep collects ZERO nodes, always — bounding wall-clock
+   * time without ever trading away correctness.
+   */
+  readonly budgetMs?: number;
+  /** Supplies the current time in epoch milliseconds when invoked — typically a thin wrapper around the platform's own wall clock, defined and kept OUTSIDE this package (e.g. gcScheduler.ts). */
+  readonly clock?: () => number;
+}
+
+/** {@link Engine.collect}'s result. */
+export interface CollectResult {
+  /**
+   * True iff the fixpoint sweep was cut short by `options.budgetMs` before naturally
+   * converging. When `true`, `collectedCount` is ALWAYS `0` — an incomplete sweep NEVER
+   * physically removes anything (see {@link CollectOptions.budgetMs}'s own doc comment for
+   * why a partial fixpoint result cannot safely be treated as a conservative under-
+   * approximation). A caller should expect that a document whose unresolved anchor chain is
+   * deeper than the budget allows will keep returning `incomplete: true, collectedCount: 0`
+   * on EVERY cycle, indefinitely, until either the budget is raised or (future work — see
+   * CLAUDE.md's Phase 21 entry) the fixpoint is made incremental across calls — this is NOT
+   * "eventually makes progress across several cycles" today. Worth surfacing as its own
+   * metric (`gc.cycle_incomplete_count`): a document that keeps hitting this every cycle
+   * without ever transitioning to `collectedCount > 0` is worth knowing about.
+   */
+  readonly incomplete: boolean;
+  /** How many nodes were physically removed from S this call — 0 is normal (nothing due yet), and ALWAYS 0 when `incomplete` is true. */
+  readonly collectedCount: number;
 }

@@ -3486,31 +3486,472 @@ audit-runs`** — the DoD's "audit_runs rows are queryable and the 'last
   test itself — now finally clean with NO skip/workaround logic at all,
   since there is nothing left to skip.
 
+- **Phase 21 — Tombstone garbage collection** (Engine Spec §7.3 causal
+  stability, §7.4 COLLECT, §7.6 eviction, §7.7 undo horizon; API Spec §6.5;
+  Test Plan M8-c/M8-d). Reclaims tombstones once no active replica can
+  reference them, bounding the unbounded tombstone growth PRD R2 names as
+  the canonical long-horizon failure mode. Built against the real spec
+  text (Definitions 7.1-7.4, the COLLECT pseudocode, Rules 7.1-7.3) pasted
+  in up front, with an explicit warning from the user going in: Phase 20
+  had just found and fixed two serious bugs in the SAME anchor-tracking
+  mechanism (`originLeft`/`originRight` membership) that GC's own
+  condition 3 depends on, so this phase's verification treats that
+  overlap as a real risk, not a formality — see the exhaustive-check
+  paragraph below.
+
+  **`Engine.collect(frontier, options)`** (`packages/engine/src/engine.ts`)
+  implements Definition 7.4's four conditions and §7.4's fixpoint sweep
+  directly over `engine.nodes` (the fully-decoded `Node[]` view) rather
+  than reasoning about Phase 20's block storage internally — block
+  boundaries are a storage detail invisible to this algorithm, exactly as
+  intended; removal at the end goes through `PositionIndex.splice()`,
+  which Phase 19 already built (and left fully implemented, unused) for
+  exactly this purpose. Two new small pieces of engine-side bookkeeping
+  make this possible without breaking Engine Spec C9's "no wall clock, no
+  externally-numbered concepts" purity rule: `deleteContext: Map<string,
+  {seq, atMs}>`, populated ONLY when `applyRemote(op, context)` is called
+  WITH its new, optional third argument — every existing caller (the
+  fuzz/property/adversarial suites, `localInsert`/`localDelete`,
+  `SyncClient`) omits it, so this map stays empty for them and `collect()`
+  finds nothing collectible — collection is opt-in and provably cannot
+  change behavior for any pre-Phase-21 code path (confirmed: the full
+  default `pnpm test`, `test:adversarial`, and `test:properties` suites
+  all re-ran clean, unchanged, after this landed). `atMs`/`seq` are
+  supplied, never read from a clock, the same discipline
+  `observe(remoteCounter)` and `preSkewClock` already established.
+  `maxCounterByReplica: Map<number, number>` (highest Lamport counter
+  seen per replica, updated on every applied op) is what lets the undo
+  horizon's op-count half ("200 operations by that user," Rule 7.3) be
+  computed at all — pre-auth, "that user" is approximated as "that
+  replica" minting the delete, the same simplification this project has
+  used for every not-yet-real-auth decision since Phase 8/9.
+
+  **`invariants.ts` gained `AssertInvariantsOptions.afterCollect`** — the
+  ONE sanctioned exception to I5's "structure never shrinks" check,
+  resetting that check's baseline to the new, smaller count rather than
+  weakening the invariant generally: any OTHER shrinkage is still a real
+  I5 violation. I4 (origin presence) is deliberately NOT exempted by this
+  flag and runs exactly as always — a passing I4 check immediately after
+  `collect()` is the live, per-call proof that no remaining node
+  references a removed one, not a property `collect()` is trusted to have
+  gotten right on its own say-so.
+
+  **The exhaustive check the user explicitly asked for, given Phase 20's
+  own history with this exact mechanism**: `engine.test.ts` gained a
+  200-trial randomized test that builds a document, deletes roughly half
+  of it WITH GC context, then sweeps 5 different randomly-chosen
+  `(frontier, horizon)` combinations against the SAME engine — 1,000 total
+  `collect()` calls — asserting `assertInvariants(engine, { afterCollect:
+  true })` (which includes I4) after EVERY SINGLE call, not just the
+  last, plus that visible text never changes. All 1,000 calls pass with
+  zero I4 violations. Beyond the fuzz-style check, dedicated hand-built
+  tests separately verify each of Definition 7.4's four conditions in
+  isolation, the "no context = never collectible" backward-compatibility
+  guarantee, and — the case this project's own Phase 20 history says to
+  distrust most — the multi-level fixpoint anchor cascade: a chain of
+  three consecutively-deleted nodes B→C→D stays fully protected as long
+  as a LIVE node anchors to D, and becomes collectible as one unit the
+  moment that live anchor is itself deleted and ages out, verified via
+  `engine.text()` staying correct and `stats().totalElements` reflecting
+  the expected count at each step. The M8-c server-side DoD test
+  (below) repeats this same "no live node names a collected node as an
+  origin" check a second, independent way — a from-scratch re-derivation
+  of the id-reference scan, not a call into `assertInvariants`' own code
+  path — specifically because Phase 20's own lesson was "the same
+  mechanism checking itself is not enough confidence" for this exact bug
+  class.
+
+  **Server-side wiring**: `packages/server/src/db/operationStore.ts`
+  gained `SessionHeartbeatInput`/`upsertSessionHeartbeat` and
+  `getStabilityFrontier` on the `OperationStore` interface (both
+  implementations). `upsertSessionHeartbeat` is a REAL, necessary fix, not
+  just new functionality: `sessions.last_ack_seq`/`last_seen_at` (Phase
+  15's own schema, built specifically for this phase — see that
+  migration's own comments anticipating "the GC stability-frontier
+  query") had NEVER been written by anything before this phase, outside
+  writePath.ts's one-time auto-provisioning insert on a session's FIRST
+  committed operation. A session that only ever READS would have been
+  silently invisible to the frontier query forever — this phase closes
+  that gap by upserting the heartbeat at JOIN time (gateway.ts, so even a
+  silent reader gets a row immediately) and on every PING thereafter
+  (replacing/supplementing the in-memory-only `coordinator.watermarks`
+  Phase 8 built). `getStabilityFrontier` implements API Spec §6.5's own
+  query almost verbatim: `MIN(last_ack_seq)` across sessions with
+  `last_seen_at` inside the 10-minute offline window, `COALESCE`d to
+  `documents.current_seq` when nobody's active — cold-load compaction,
+  by construction, with no separate code path.
+
+  **Rule 7.1 (eviction) needed NO separate eviction bookkeeping at all** —
+  a session simply stops appearing in `getStabilityFrontier`'s own result
+  once its `last_seen_at` ages past the query's 10-minute WHERE clause.
+  The literal required comment ("10 minutes, NOT the 8-second
+  presence-stale threshold...") appears at BOTH `heartbeat.ts`'s
+  `SESSION_INACTIVE_MS` constant (now genuinely live, previously dead per
+  Phase 9's own scaffolding note) and at the SQL query itself in
+  `operationStore.ts`, since SQL can't import a JS constant and the two
+  values have to be kept in sync by hand.
+
+  **`writePath.ts`'s step 5/6 boundary was reordered, not just extended**:
+  `startSeq` is now computed BEFORE `applyRemote` runs (not after), so
+  each operation's own seq is known AT apply time and can be threaded
+  into `applyRemote`'s new context argument — under the ORIGINAL
+  apply-then-assign order, a Delete would have no seq yet at the moment
+  it needed one. Still fully synchronous end to end (no `await` between
+  reading and advancing `coordinator.currentSeq`), so the "no other
+  write path can interleave here" monotonicity argument the original
+  code's own comment made is unaffected — confirmed by re-reading, not
+  merely assumed.
+
+  **Warm start now threads GC context through a server restart too, not
+  just live traffic**: `WarmStartResult.suffixOps` changed from `readonly
+  Operation[]` to `readonly WarmStartSuffixOperation[]` (`{op, seq,
+  committedAtMs}`), reading `operations.committed_at` — a column that
+  already existed (Phase 15), explicitly marked "observability ONLY;
+  never read for ordering." Using it for GC's age check is not an
+  ordering use (it never decides WHERE an operation integrates, only WHEN
+  a tombstone becomes eligible for removal), so this doesn't violate that
+  constraint. Without this, a Delete replayed after a restart would carry
+  no GC context at all and could never become collectible until
+  superseded by a fresh delete — a real effectiveness gap for any
+  long-lived, previously-restarted document, not merely cosmetic, closed
+  before it could ever be observed in production.
+
+  **`gcScheduler.ts`** (new, mirrors `auditScheduler.ts`'s Phase 18 shape
+  exactly, including WHY: in-process, one GC cycle per currently-open
+  coordinator, `timer.unref()` so tests never need to remember to stop
+  it, one document's failure never stopping the rest of that tick's
+  sweep). `runOneDocument` is exported directly (not only reachable via
+  the timer) specifically so tests can trigger exactly one deterministic
+  cycle instead of waiting on the real interval or faking timers.
+  `config.ts` gained `GcConfig` (`undoHorizonMaxAgeMs`/
+  `undoHorizonMaxOpsPerReplica`/`gcIntervalMs`), env-overridable with
+  RFC-matching defaults (5min/200ops/60s) — Scope-IN's own explicit
+  instruction: the undo horizon is CONFIGURATION, not a constant, because
+  Engine Spec §7.7 itself flags the proposed values as "unvalidated."
+  `index.ts`'s direct-run block starts `startGcScheduler` alongside the
+  existing `startAuditScheduler`, same reasoning, same "only a real `pnpm
+run dev` process starts either; every test constructs its own server and
+  never reaches this branch" scoping.
+
+  **Metrics** (Scope-IN's own list — "GC's failure mode is silent, so
+  liveness is monitored, not errors"): `DocumentCoordinator` gained
+  `lastGcAttemptAt`/`lastGcSuccessAt`/`lastGcCollectedCount`/
+  `lastKnownFrontier`/`frontierLastAdvancedAt`, updated by every GC cycle
+  (success OR failure — `lastGcAttemptAt` always advances so
+  `minutes_since_last_success` can grow even while cycles keep firing on
+  schedule, which is exactly the "looks alive but is actually stuck"
+  failure this metric exists to catch). Exposed read-only via a new
+  `GET /v1/documents/:id/gc-status` endpoint (`httpApp.ts`, same pattern
+  as Phase 18's `/audit-runs`): `minutesSinceLastSuccess`,
+  `nodesCollectedLastCycle`, `frontier`, `frontierLagSeconds` (seconds
+  since the frontier's own value last advanced — a genuine staleness
+  signal distinct from GC's own success/failure), `tombstoneRatio`
+  (`doc.tombstone_ratio`), `totalElements`/`tombstones`.
+
+  **DoD tests** (`packages/server/src/db/gc.db.test.ts`, new — **written,
+  then actually executed against a real, migrated Postgres instance
+  (`docker compose up -d`, `pnpm db:migrate`, `pnpm test:db`), not merely
+  typechecked** — the user explicitly required this before accepting the
+  phase, and it surfaced real bugs a typecheck alone could never have
+  caught (below), which is exactly why). M8-c: a 90,000-character document
+  bulk-seeded for fixture speed (same technique Phase 17/18 established —
+  fixture SETUP speed must never be confused with what's actually
+  measured), then 10,000 real deletes through the ACTUAL write path (the
+  only path that attaches GC context) across two simulated clients, both
+  acking, one real GC cycle via `runOneDocument` (not calling
+  `engine.collect()` directly — exercises the real frontier-query/config
+  plumbing too). **Observed, real result**: `frontier=100000,
+  collectedCount=10000, totalElements 90000→80000, tombstones 10000→0,
+  tombstoneRatio→0` — a full 100% drop, not merely "material." Visible
+  text confirmed byte-identical before/after. The integrity audit
+  (Phase 18) ran for real and returned `result: "ok", replayedToSeq:
+  100000, detail: "replayed 100000 operation(s) through seq 100000;
+  pendingCount() === 0; matches snapshot at seq 99554; matches the live
+  coordinator"`. The specifically-requested exhaustive check ran for
+  real, over all 80,000 remaining nodes: `assertInvariants(...,
+  {afterCollect: true})` (I4) raised nothing, AND the independently-
+  written, from-scratch dangling-origin scan (never calling into I4's own
+  code path) also found zero violations across all 80,000 nodes' origin
+  references. M8-d: **observed, real result**: with the slow client
+  acked only to seq 0 and 9 minutes stale, `getStabilityFrontier`
+  returned exactly `0n` and a real GC cycle collected 0 (blocked); after
+  pushing past 11 minutes, `getStabilityFrontier` returned `2n`
+  (=`currentSeq`) and the next real cycle collected exactly 1, dropping
+  tombstones from 1 to 0. Cold-load compaction: `getStabilityFrontier`
+  returned `2n` (the COALESCE fallback to `documents.current_seq`) once
+  the only session was aged out, and the real cycle collected the one
+  eligible tombstone. `gc.minutes_since_last_success`: confirmed `null`
+  before any cycle, populated (<1 minute) immediately after a real one.
+  The `GET /v1/documents/:id/gc-status` endpoint was ALSO queried for
+  real — a real `createCollabServer()`, a real listening port, a real
+  operation through the real write path, a real GC cycle, then a real
+  `fetch()` HTTP GET — returning HTTP 200 with
+  `{lastSuccessAt, minutesSinceLastSuccess: 0.00025,
+  nodesCollectedLastCycle: 1, frontier: "2", frontierLagSeconds: 0.016,
+  tombstoneRatio: 0, totalElements: 0, tombstones: 0}`.
+
+  **Five real bugs were found and fixed getting these tests to actually
+  pass — none of them were caught by typechecking, and several are worth
+  remembering independent of this phase**:
+  1. `buildSimulatedClient` built a brand-new, EMPTY client engine with
+     no seeding step — fine for a client joining a still-empty document,
+     wrong for M8-c's own pre-existing 90,000-character base. Fixed by
+     replaying `coordinator.engine.nodes` into the fresh client engine
+     via `replaySnapshotNodesInto` (the same function the real
+     warm-start/SNAPSHOT path uses), reproducing what a real client
+     actually receives on join.
+  2. M8-d's first version acked BOTH clients to `coordinator.currentSeq`
+     BEFORE aging the slow one — meaning the slow client had already
+     confirmed the delete, so its later staleness never held anything
+     back at all (the very first cycle collected immediately). Test Plan
+     M8-d's own wording is "held at a STALE WATERMARK" — the watermark
+     itself must stay behind, not merely the timestamp. Fixed by acking
+     the slow client only to seq 0 and never advancing it.
+  3. Cold-load compaction's precondition ("zero active sessions") is NOT
+     the same as "zero session rows" — `commitOperations` (Phase 16)
+     auto-provisions a session row as a side effect of ANY commit
+     (`ON CONFLICT DO NOTHING`, needed for `operations.author_session`'s
+     FK), with schema defaults `last_ack_seq=0, last_seen_at=now()` — a
+     real, FRESH row that permanently constrains the frontier to 0
+     regardless of what the test's OWN comment claimed. A first fix
+     attempt (`DELETE FROM sessions ...`) failed too, for a DIFFERENT
+     reason: `operations.author_session` references it with no CASCADE,
+     so deleting a referenced session row violates that FK. The correct
+     fix — and the more accurate representation of what cold-load
+     actually is — is to AGE the row out past the same 10-minute window
+     Rule 7.1 uses everywhere else, never to delete it.
+  4. The same auto-provisioning bit M8-c too, one layer further:
+     `seedAppendChainDocument`'s bulk-seed fixture hardcoded replica id
+     `1`, colliding with `coordinator.allocateReplicaId()`'s own first
+     allocation to the first REAL simulated client joined afterward —
+     `sessions_replica_uq` (UNIQUE on `(document_id, replica_id)`)
+     rejected the second session's insert. Fixed by reserving a replica
+     id (`999_999`) far outside the coordinator's own low sequential
+     range for fixture-only "sessions." Also fixed by aging THIS
+     fixture's own auto-provisioned session row out immediately after
+     creating it — otherwise it becomes a FOURTH instance of bug #3's
+     same "phantom active session holds the frontier at 0 forever"
+     class, discovered only once #3 itself was already fixed.
+  5. **A genuine structural finding, not a test-fixture triviality**:
+     M8-c's original delete pattern (always delete visible position 0,
+     tombstoning a PREFIX of `seedAppendChainDocument`'s single unbroken
+     append chain) constructed a document that could NEVER be
+     collected, by correct design — the first still-live character right
+     after the deleted prefix permanently anchors the last tombstoned
+     character via its own `originLeft`, which anchors the one before
+     it, cascading all the way back (Engine Spec I4/I5: a live node's
+     origin must never be removed out from under it). This is `collect()`
+     working exactly as specified, not a bug in it — but it meant this
+     fixture shape could never demonstrate GC effectiveness at ANY
+     frontier or horizon. It also produced a real, separate PERFORMANCE
+     finding: with nothing ever leaving `collectible`, the fixpoint still
+     had to cascade one step per loop pass for a 10,000-deep anchor
+     chain before concluding nothing was collectible — each pass
+     rescanning all 90,000 nodes (`collect()`'s fixpoint recomputes
+     `anchored` fresh each pass, by design, for auditability — see its
+     own doc comment) — roughly 900 million node-visits total, measured
+     at **853 seconds** wall time for that one GC cycle. Fixed the test
+     by deleting from the visible END instead (nothing is ever inserted
+     after the last character, so nothing anchors to it — no cascade,
+     no pathology) — collection then completed correctly in well under a
+     second. The underlying performance characteristic — `collect()`'s
+     fixpoint cost scales with anchor-CHAIN DEPTH, not just document
+     size, for a long UNRESOLVED chain specifically — is real and
+     disclosed here rather than silently avoided: a production document
+     with a long-undeleted prefix followed by very little live content
+     could in principle hit a slow GC cycle this same way. Because
+     `collect()` runs entirely synchronously with no `await` anywhere in
+     it, an uncapped run of this length would block the ENTIRE Node
+     event loop — not just this one document's GC, but every other
+     document's OPS/PING/HTTP traffic sharing the same process — for the
+     full duration. Given that severity, a CONTAINMENT fix (the wall-
+     clock safety cap below) WAS added this same phase, on top of the
+     original test fix; the deeper, root-cause fix (an incremental
+     fixpoint that persists progress across calls instead of restarting
+     from scratch every cycle) remains explicit future work — see the
+     safety-cap entry immediately below for exactly where the line was
+     drawn and why.
+
+  **The wall-clock safety cap (added the same day, after the 853s finding
+  was reported and the user explicitly required containment before this
+  phase could be considered mergeable)**: `Engine.collect()` gained
+  optional `CollectOptions.budgetMs`/`clock` (both must be supplied
+  together; omitted — every pre-cap caller — means no cap, the original
+  unbounded behavior). The budget is checked ONLY after a fully-completed
+  fixpoint pass, never mid-pass, so `collectible` is never inspected in an
+  inconsistent state — but this is NOT the same as saying it's safe to
+  collect whatever `collectible` contains at that checkpoint, and getting
+  that distinction wrong was a real bug caught before it shipped:
+
+  **A genuine correctness bug was found and fixed IN THE SAFETY CAP ITSELF,
+  hand-traced against the exact pathological case before being trusted —
+  the same discipline this project has applied since Phase 6/20.** The
+  first version reasoned "`collectible` only ever shrinks, so a partial
+  result is a safe conservative under-approximation" and collected
+  whatever remained at cutoff. Tracing this by hand against the R0008-
+  shaped 10,000-deep chain: after only ONE pass, just the single node
+  directly touching the live successor has been excluded — the other
+  9,999 are still sitting in `collectible`, entirely UNPROVEN. Physically
+  removing them at that point would leave the just-excluded node's own
+  `originLeft` dangling — exactly the I4/I5 violation the whole algorithm
+  exists to prevent. The fix: an incomplete sweep (`CollectResult.
+  incomplete === true`) now collects EXACTLY ZERO nodes, unconditionally
+  — bounding wall-clock time without ever trading away correctness. This
+  has a real, honestly-tested consequence: a chain deeper than one
+  budget-window's worth of passes makes ZERO cumulative progress across
+  REPEATED capped cycles (each cycle independently restarts the fixpoint
+  from scratch and hits the identical wall) — this is the precise
+  boundary of what today's cap does and does NOT solve; see the
+  incremental-fixpoint future-work note above for the actual fix to that.
+
+  **Where each measurement lives, and why it's split this way**: real
+  wall-clock timing needs `performance.now()`, which engine purity
+  forbids everywhere in `packages/engine/src` — including test files —
+  the identical split Phase 19's own scaling benchmark already
+  established. So `packages/engine/src/engine.test.ts`'s new describe
+  block proves the CORRECTNESS/logic claims (does the cap trigger, does
+  an incomplete sweep collect zero, does I4/I5 still hold, do repeated
+  cycles genuinely not progress) using a fake, deterministic clock — no
+  real timing, fully reproducible. The REAL "214ms not 853,000ms" timing
+  claim itself lives in a new `packages/testkit/src/benchmark/
+  gcSafetyCap.bench.test.ts` (run via `pnpm test:benchmark`), against the
+  IDENTICAL pathological chain construction. A third test, in
+  `gc.db.test.ts` (`pnpm test:db`), proves the actual property that
+  matters operationally — event-loop responsiveness — via a real
+  `createCollabServer()`.
+
+  **Measured results, all against the IDENTICAL pathological
+  10,000-deep/90,000-node chain the 853s figure came from**: the real
+  wall-clock benchmark measured a capped sweep (`budgetMs: 150`) at
+  **262.9ms** (`gcSafetyCap.bench.test.ts`) — `incomplete: true`,
+  `collectedCount: 0`, tombstones unchanged at 10,000. The engine-level
+  fake-clock tests independently confirm the same logic: I4/I5 intact via
+  `assertInvariants(..., {afterCollect: true})`; three repeated capped
+  cycles on the same unchanged structure collect `[0, 0, 0]` — confirmed
+  genuinely stuck, not a hoped-for "eventually progresses" result; a
+  genuinely collectible case (delete from a document's END, which has no
+  live successor to block it) still collects normally under the identical
+  budget (`collectedCount: 10`, `incomplete: false`) — the cap doesn't
+  regress ordinary GC. Most importantly, the actual property under test in
+  `gc.db.test.ts`: a REAL HTTP request to a completely UNRELATED document,
+  issued concurrently with the capped, pathological GC cycle on a real
+  `createCollabServer()`, completed in **242.6ms** (then **250.2ms** on a
+  second full-suite run) — proof the whole-server-freeze risk is now
+  bounded to roughly the cap's own duration, not 853 seconds. `GcConfig`
+  gained `gcFixpointBudgetMs` (default
+  150ms, `GC_FIXPOINT_BUDGET_MS` env-overridable, deliberately
+  conservative — Scope-IN's own "GC cycle every 60s" cadence, and this
+  bounds each document's slice of that budget to a small fraction of it).
+  `DocumentCoordinator.gcCycleIncompleteCount` and `/gc-status`'s new
+  `cycleIncompleteCount` field expose Scope-IN's own "observable, not
+  silent" principle applied to this specific failure mode: a cycle
+  hitting the cap is NOT itself an error (the collected set is still
+  fully correct), but a document that keeps incrementing this every
+  cycle without ever transitioning to `collectedCount > 0` is worth
+  alerting on separately from `minutes_since_last_success`.
+
+  **A real, unrelated regression from Phase 20 was found and fixed along
+  the way, by running `pnpm typecheck` as its own explicit step**:
+  `packages/testkit/src/mutation/mutKill01.ts`'s `MUT_KILL_01_CONFIG`
+  object literal was never updated when Phase 20 added a required
+  `deliveryMode` field to `TrialConfig` — meaning `pnpm typecheck` had
+  been silently broken since Phase 20's own merge, never caught because
+  that phase's own closing verification round ran `pnpm test`/
+  `test:convergence`/`test:mutation`/etc. individually but not `pnpm
+typecheck` as its own command. Fixed by adding `deliveryMode:
+  "deferred-shuffled"` (this search was never re-run as an
+  "immediate-delivery" variant, so its historical behavior is the correct
+  default to restore). **A second, similar Phase-20-era gap**: `pnpm
+check:purity` was ALSO silently broken by two comments (one in
+  `block.ts`, pre-existing; one in `engine.ts`, written during Phase 20's
+  own R0008 merge) that happened to end a sentence in "...the document."
+  / "...the current window." — the purity script's grep pattern
+  (`\bdocument\s*\.` / `\bwindow\s*\.`) exists to catch real DOM access
+  like `document.getElementById(...)`, not prose, but is text-based, not
+  AST-based, and can't tell the difference. Both reworded to avoid the
+  trailing-period false match; `pnpm check:purity` now passes clean
+  again. Neither of these two gaps was introduced by this phase's own
+  work, but both were found BY this phase's own more thorough
+  closing-verification discipline (running every gate as its own
+  explicit command, not just the ones a phase's own new work obviously
+  touches) and are recorded here rather than silently fixed and
+  forgotten.
+
+  **What is deliberately NOT built this phase**: Rule 7.2 ("return after
+  eviction" — an evicted replica's queued operations naming since-collected
+  nodes must be explicitly REJECTED, with local content preserved and
+  exportable, never silently discarded and never left in `pending`
+  indefinitely) is NOT in this phase's own Scope-IN bullet list, unlike
+  Rule 7.1, and was left unbuilt rather than invented under schedule
+  pressure. The ENGINE's own passive behavior already matches part of
+  Rule 7.2's text incidentally: `ready()` returns `false` forever for an
+  operation whose target was physically collected (`index.hasIdentifier`
+  correctly returns false), so such an operation buffers in `pending`
+  permanently rather than crashing or corrupting anything — but the
+  "explicit rejection, with content preserved and exportable, never left
+  in P indefinitely" HALF of Rule 7.2 (a real client-facing flow) does not
+  exist yet, and a client that reconnects after eviction with stale
+  pending operations will simply have them sit in `pending` forever with
+  no explicit signal. Flagged here explicitly rather than either building
+  it speculatively or letting it pass unmentioned.
+
 ## Current phase in progress
 
-None — Phase 20 (block run-length encoding) complete, INCLUDING the
-Engine Spec §6.2 sub-case iii-d correction found during its own DoD
-verification (two distinct, now-fixed bugs in `integrate()`'s Case B and
-Case C, present since Phase 3 — see the Phase 20 completed-phase entry
-above in full, and the "Engine Spec §6.2 sub-case iii-d correction" entry
-under Key Technical Decisions below). All required regression gates
-re-run clean on the real, merged `engine.ts`: default `pnpm test`
-(321/321), `pnpm test:adversarial` (22/22), `pnpm test:properties` (6/6,
-10,000 cases each), `pnpm test:index` (10,000-seed cross-check, zero
-disagreements), `pnpm test:benchmark` (scaling + Phase 20 compression,
-all DoD targets met), `pnpm test:convergence` across all SEVEN configs
-(C1-C6 plus the new, permanent C7_IMMEDIATE_DELIVERY — the only config
-capable of reaching this bug class), and `pnpm test:mutation` — see the
-Phase 20 entry's own mutation-matrix paragraph for exact results. Phase
-19's own indexed position structure is retroactively confirmed NOT the
-source of this bug (verified via `git worktree` comparison against
-pre-Phase-19 commits, byte-identical firing rate) — it was under
-suspicion early in the investigation and is now cleared.
+None — Phase 21 (tombstone garbage collection) complete. `Engine.collect()`
+(Definition 7.4's four conditions plus its fixpoint anchor sweep),
+`sessions.last_ack_seq`/`last_seen_at` now genuinely persisted and read
+back for the stability frontier (API Spec §6.5), Rule 7.1 eviction (no
+separate bookkeeping — a stale session simply falls out of the frontier
+query), the undo horizon as real configuration, `gcScheduler.ts`'s 60s
+per-document cycle, and the four Scope-IN metrics are all built — see the
+Phase 21 completed-phase entry above for the full account, including
+what's deliberately NOT built (Rule 7.2's client-facing "explicit
+rejection" flow) and two unrelated Phase-20-era gaps (`pnpm typecheck`
+and `pnpm check:purity` were both silently broken since Phase 20's own
+merge) found and fixed along the way. Regression gates re-run clean on
+the real, merged `engine.ts`/server code: default `pnpm test` (329/329),
+`pnpm test:adversarial` (22/22), `pnpm test:properties` (6/6), `pnpm
+test:index` (10,000-seed cross-check, zero disagreements), `pnpm
+typecheck`, `pnpm check:purity`. `pnpm test:convergence` (the full
+70,000-seed, ~35-minute run) — [PENDING/FILLED IN BELOW ONCE COMPLETE —
+the user explicitly required this be actually run, not assumed inert
+from the shape of the change alone, given this session's own prior
+history of "should be safe" claims that turned out to have real gaps].
+`pnpm test:db`'s new `gc.db.test.ts` (M8-c/M8-d, cold-load compaction,
+the `gc.minutes_since_last_success` metric, and the `/gc-status` HTTP
+endpoint) was ACTUALLY EXECUTED against a real, migrated Postgres
+instance — all 4 tests pass, with real observed numbers (100% tombstone
+reduction on the M8-c scenario, audit `result: "ok"`, a real HTTP 200
+from `/gc-status`) — see the Phase 21 completed-phase entry above for
+the exact figures and the five real bugs found and fixed getting there,
+none of which a typecheck alone could have caught.
+
+Phase 20 (block run-length encoding) is complete, INCLUDING the Engine
+Spec §6.2 sub-case iii-d correction found during its own DoD verification
+(two distinct, now-fixed bugs in `integrate()`'s Case B and Case C,
+present since Phase 3 — see the Phase 20 completed-phase entry above in
+full, and the "Engine Spec §6.2 sub-case iii-d correction" entry under
+Key Technical Decisions below). Phase 19's own indexed position structure
+is retroactively confirmed NOT the source of that bug (verified via `git
+worktree` comparison against pre-Phase-19 commits, byte-identical firing
+rate) — it was under suspicion early in that investigation and is now
+cleared.
 
 ## What is explicitly NOT yet built
 
 Undo/redo's real resurrection semantics beyond Undelete's structural
-inverse (Phase 36); garbage collection (Phase 21). Block run-length
+inverse (Phase 36). Tombstone garbage collection is now BUILT (Phase 21,
+Engine Spec §7.3/§7.4/§7.6/§7.7) — `Engine.collect()`, the real stability
+frontier (API Spec §6.5), Rule 7.1 eviction, and the undo horizon are all
+live; what remains unbuilt from that same spec section is specifically
+Rule 7.2 (an evicted replica's queued operations targeting since-collected
+nodes must be explicitly REJECTED with local content preserved and
+exportable — the engine's own passive behavior already leaves such an
+operation stuck in `pending` forever rather than corrupting anything, but
+no explicit rejection/export flow exists yet); any retention/pruning
+policy for the `snapshots` table itself (unrelated to tombstone GC — every
+MAYBE-SNAPSHOT trigger still adds a new row forever, nothing prunes old
+snapshot rows). Block run-length
 encoding is now BUILT (Phase 20, Engine Spec §7.5) — SNAPSHOT's
 structure-form body serialization (`packages/protocol/src/snapshotBody.ts`)
 is a real block-encoded wire format, no longer the Phase 9 one-record-
@@ -3522,16 +3963,21 @@ Reconnection catch-up (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.7) is not
 built server-side — only fresh handshakes work, so every reconnect (Phase
 10's `SyncClient` now performs these automatically, with real backoff) gets
 a brand-new replica id and a full fresh SNAPSHOT, never a delta. Session-
-inactivity eviction (10 minutes with no PING) is scaffolded (constant
-defined, cited to §11.4) but not wired to anything — Phase 21's concern.
+inactivity eviction (10 minutes with no PING) is now LIVE as of Phase 21 —
+not as separate eviction bookkeeping, but as the natural consequence of
+`getStabilityFrontier`'s own 10-minute WHERE clause (a stale session
+simply stops appearing in the frontier computation).
 **Operations are durably persisted as of Phase 16, and snapshotted as of
 Phase 17** — every operation is committed to Postgres before its client
 is acknowledged (API Spec §6.3), and a coordinator warm-starts from the
 latest snapshot plus only the operation-log suffix after it (RFC §13.2's
-MAYBE-SNAPSHOT, 500 ops/30s), not a full genesis replay. What remains NOT
-built: garbage collection (Phase 21); any retention/pruning policy
-for the `snapshots` table itself (every MAYBE-SNAPSHOT trigger adds a new
-row forever — not a problem yet, but nothing prunes old ones);
+MAYBE-SNAPSHOT, 500 ops/30s), not a full genesis replay. Tombstone
+garbage collection is now BUILT as of Phase 21 (see that phase's own
+completed-phase entry and the "What is explicitly NOT yet built" section
+above for Rule 7.2's own remaining gap). What remains NOT built: any
+retention/pruning policy for the `snapshots` table itself, UNRELATED to
+tombstone GC (every MAYBE-SNAPSHOT trigger still adds a new row forever —
+not a problem yet, but nothing prunes old snapshot rows);
 `SyncClient`'s unacked-operation queue is still in-memory only client-side
 (IndexedDB is Phase 22 — a client that closes its tab mid-edit still loses
 whatever hadn't been acked yet, even though the SERVER now durably has
@@ -4179,7 +4625,17 @@ validation runs actually used for most of its repeated-run confidence
 many times, and the honest DoD status this phase is actually shipping
 with).
 
-`pnpm test` currently passes: 321 tests across 38 files (up from 308/37 —
+`pnpm test` currently passes: 329 tests across 38 files (up from 321/38 —
+Phase 21 added 8 `Engine.collect()` tests to `packages/engine/src/
+engine.test.ts`, no new test FILES; see the Phase 21 entry above for the
+full account). `pnpm test:db` gained a new file, `packages/server/src/db/
+gc.db.test.ts` (M8-c/M8-d, cold-load compaction, the `gc.minutes_since_
+last_success` metric) — actually executed against a real, migrated
+Postgres instance (all 4 tests pass); see the Phase 21 entry above for
+the real observed numbers and the five real bugs found and fixed
+getting there.
+
+Historical: 321 tests across 38 files (up from 308/37 —
 Phase 20 added `packages/engine/src/block.test.ts` and other new files;
 see the Phase 20 entry above for the full account, including the Engine
 Spec §6.2 sub-case iii-d correction found and fixed during this phase).

@@ -81,6 +81,28 @@ author_session REFERENCES sessions(id)`, and `sessions.user_id
   readonly displayName: string;
 }
 
+/**
+ * One operation from `warmStart`'s suffix replay, carrying what
+ * `engine.applyRemote`'s optional GC context needs (Phase 21, Engine Spec
+ * §7.3) — `seq` (for causal-stability) and `committedAtMs` (for the undo
+ * horizon, §7.7), sourced from `operations.committed_at`. That column's
+ * own comment says "observability ONLY; never read for ordering (PRD
+ * FR-CE-2)" — reading it here is not an ordering use (GC's age check
+ * never decides WHERE an operation integrates, only WHEN a tombstone
+ * becomes eligible for physical removal), so this does not violate that
+ * constraint. Without this, a delete replayed after a server restart
+ * would carry no GC context at all (the pre-Phase-21 shape of
+ * `WarmStartResult.suffixOps: Operation[]`) and could never become
+ * collectible until superseded by a fresh delete — a real, if gradual,
+ * effectiveness regression for any long-lived document that survives a
+ * restart, not merely a cosmetic gap.
+ */
+export interface WarmStartSuffixOperation {
+  readonly op: Operation;
+  readonly seq: bigint;
+  readonly committedAtMs: number;
+}
+
 export interface WarmStartResult {
   /**
    * The latest snapshot's decoded node structure (Phase 17, API Spec
@@ -95,8 +117,8 @@ export interface WarmStartResult {
   readonly snapshotNodes: readonly Node[] | null;
   /** The snapshot's own `seq` (0n if `snapshotNodes` is null — genesis) — `suffixOps` is exactly the operations with `seq > snapshotSeq`. */
   readonly snapshotSeq: bigint;
-  /** Operations with `seq > snapshotSeq`, in seq order — replay these (and ONLY these) on top of `snapshotNodes` to reach the document's current state. */
-  readonly suffixOps: readonly Operation[];
+  /** Operations with `seq > snapshotSeq`, in seq order — replay these (and ONLY these) on top of `snapshotNodes` to reach the document's current state. Carries `seq`/`committedAtMs` (Phase 21) so GC context survives a restart. */
+  readonly suffixOps: readonly WarmStartSuffixOperation[];
   /** `documents.current_seq` AFTER provisioning — the highest seq ever assigned for this document, including seq values "spent" on a resent duplicate that hit ON CONFLICT DO NOTHING (see commitOperations's own doc comment) and therefore left no row of their own. This, not `MAX(operations.seq)` or `ops.length`, is what a coordinator must resume numbering from — using either of those instead would eventually reissue an already-spent seq and crash on the operations table's own PRIMARY KEY the moment a genuinely new operation collided with it. */
   readonly currentSeq: bigint;
 }
@@ -137,6 +159,16 @@ export interface WriteSnapshotInput {
   readonly structure: Uint8Array;
   /** Operations committed since the PREVIOUS snapshot — the DoD's own "~500" observable. */
   readonly opCount: number;
+}
+
+/** API Spec §6.5 / Engine Spec Definition 7.1 — one session's liveness/ack heartbeat, upserted at JOIN time and on every PING so `sessions.last_ack_seq`/`last_seen_at` (the GC stability frontier's own raw material) are actually kept current. Before Phase 21, both columns existed in the schema (Phase 15) but nothing ever wrote them outside the one-time auto-provisioning insert `commitOperations` does on a session's FIRST commit — a session that only ever READS (never commits an operation) would otherwise never appear in the frontier query at all. */
+export interface SessionHeartbeatInput {
+  readonly sessionId: string;
+  readonly documentId: string;
+  readonly userId: string;
+  readonly replicaId: number;
+  readonly displayName: string;
+  readonly lastAckSeq: bigint;
 }
 
 export interface OperationStore {
@@ -201,6 +233,27 @@ export interface OperationStore {
    * BEFORE assigning seq) isn't one of API Spec §6.3's nine listed steps.
    */
   commitOperations(input: CommitOperationsInput): Promise<{ readonly insertedCount: number }>;
+
+  /**
+   * Engine Spec Definition 7.1/7.2 — upserts one session's ack watermark and liveness
+   * timestamp. Called at JOIN time (so a session that never commits an operation still
+   * appears in the frontier query) and on every PING (§3.6.11) thereafter. `ON CONFLICT (id)
+   * DO UPDATE` rather than a separate insert-then-update: a session's row may or may not
+   * exist yet (JOIN is the first write for it), and this must be idempotent across repeated
+   * PINGs regardless.
+   */
+  upsertSessionHeartbeat(input: SessionHeartbeatInput): Promise<void>;
+
+  /**
+   * API Spec §6.5 / Engine Spec Definition 7.2 — the GC stability frontier F: the MINIMUM
+   * `last_ack_seq` across sessions active within the offline window (Rule 7.1, 10 minutes —
+   * a session whose `last_seen_at` has aged past that is evicted from the frontier simply by
+   * falling out of this query's own WHERE clause, no separate eviction bookkeeping needed).
+   * COALESCEs to `documents.current_seq` when no session is currently active — cold-load
+   * compaction: with nobody connected, EVERYTHING durably committed is by definition stable,
+   * so GC can collect anything otherwise eligible.
+   */
+  getStabilityFrontier(documentId: string): Promise<bigint>;
 }
 
 /** Re-encodes one engine Operation as the single-op OPS message it corresponds to, seq=0 (a placeholder — the real seq lives in the `operations.seq` column, never inside the payload itself) — reuses Phase 7's fully-tested codec rather than inventing a second serialization format for the same data. */
@@ -270,8 +323,12 @@ export class PostgresOperationStore implements OperationStore {
       ? decodeStructureSnapshotBody(new Uint8Array(snapshotRow.structure))
       : null;
 
-    const { rows: opRows } = await this.pool.query<{ payload: Buffer }>(
-      `SELECT payload FROM operations WHERE document_id = $1 AND seq > $2 ORDER BY seq ASC`,
+    const { rows: opRows } = await this.pool.query<{
+      seq: string;
+      payload: Buffer;
+      committed_at: Date;
+    }>(
+      `SELECT seq, payload, committed_at FROM operations WHERE document_id = $1 AND seq > $2 ORDER BY seq ASC`,
       [documentId, snapshotSeq.toString()],
     );
     const { rows: docRows } = await this.pool.query<{ current_seq: string }>(
@@ -281,7 +338,11 @@ export class PostgresOperationStore implements OperationStore {
     return {
       snapshotNodes,
       snapshotSeq,
-      suffixOps: opRows.map((r) => decodeOperationPayload(r.payload)),
+      suffixOps: opRows.map((r) => ({
+        op: decodeOperationPayload(r.payload),
+        seq: BigInt(r.seq),
+        committedAtMs: r.committed_at.getTime(),
+      })),
       currentSeq: docRows[0] ? BigInt(docRows[0].current_seq) : 0n,
     };
   }
@@ -474,6 +535,56 @@ export class PostgresOperationStore implements OperationStore {
       client.release();
     }
   }
+
+  async upsertSessionHeartbeat(input: SessionHeartbeatInput): Promise<void> {
+    // Same per-session auto-provisioning as commitOperations (this store's own header
+    // comment) — a session that joins but never commits an operation still needs a real
+    // `users` row for `sessions.user_id`'s FK, and this may be the FIRST write that session
+    // ever makes (JOIN happens before any operation is necessarily sent).
+    await this.pool.query(
+      `INSERT INTO users (id, email, display_name, password_hash)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        input.userId,
+        `${input.userId}@placeholder.collab-editor.internal`,
+        input.displayName,
+        SYSTEM_USER_PASSWORD_HASH_PLACEHOLDER,
+      ],
+    );
+    await this.pool.query(
+      `INSERT INTO sessions (id, user_id, document_id, replica_id, role_at_connect, last_ack_seq, last_seen_at)
+       VALUES ($1, $2, $3, $4, 'editor', $5, now())
+       ON CONFLICT (id) DO UPDATE
+         SET last_ack_seq = GREATEST(sessions.last_ack_seq, EXCLUDED.last_ack_seq),
+             last_seen_at = now()`,
+      [input.sessionId, input.userId, input.documentId, input.replicaId, input.lastAckSeq.toString()],
+    );
+  }
+
+  async getStabilityFrontier(documentId: string): Promise<bigint> {
+    // 10 minutes, NOT the 8-second presence-stale threshold. These are different
+    // timers and merging them is a correctness bug: evicting at 8s lets GC collect
+    // tombstones a client mid-tunnel still needs as anchors, stranding its operations
+    // forever. API Spec §11.4; the failure trace is Engine Spec §10.3.
+    //
+    // sessions_frontier_idx (document_id, last_seen_at, last_ack_seq — Phase 15's own schema
+    // comment anticipated exactly this query) serves the WHERE + MIN directly. The 10-minute
+    // window is Rule 7.1's own literal value (heartbeat.ts's `SESSION_INACTIVE_MS`, kept in
+    // sync by hand — SQL cannot import a JS constant) — kept as a query-time interval rather
+    // than a parameter, since nothing about "active" is meant to be tunable per call the way
+    // the undo horizon is (Scope-IN: horizon is configuration; the offline window is a spec
+    // constant).
+    const { rows } = await this.pool.query<{ frontier: string }>(
+      `SELECT COALESCE(
+         (SELECT MIN(last_ack_seq) FROM sessions
+           WHERE document_id = $1 AND last_seen_at > now() - interval '10 minutes'),
+         (SELECT current_seq FROM documents WHERE id = $1)
+       ) AS frontier`,
+      [documentId],
+    );
+    return rows[0] ? BigInt(rows[0].frontier) : 0n;
+  }
 }
 
 /**
@@ -505,6 +616,15 @@ export class InMemoryOperationStore implements OperationStore {
   // because the test double happens to.
   async warmStart(_documentId: string): Promise<WarmStartResult> {
     return { snapshotNodes: null, snapshotSeq: 0n, suffixOps: [], currentSeq: 0n };
+  }
+
+  /** GC-relevant methods (Phase 21) — see this file's own header for why this store never has real durability. No sessions exist to query, so the frontier is always the coordinator's own current_seq-equivalent (0n here, since this store tracks no seq at all) — cold-load compaction's own COALESCE fallback shape, degenerately. */
+  async getStabilityFrontier(_documentId: string): Promise<bigint> {
+    return 0n;
+  }
+
+  async upsertSessionHeartbeat(_input: SessionHeartbeatInput): Promise<void> {
+    // No real durability — nothing to persist.
   }
 
   async commitOperations(

@@ -175,6 +175,30 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       armPresenceStaleTimer(session);
       logger.info("ws.connect", { documentId: ctrlMsg.documentId, sessionId, replicaId });
 
+      // Phase 21: persist this session's row NOW, at join time, not only on its first
+      // committed operation (writePath.ts's own auto-provisioning) — a session that only
+      // ever READS must still appear in the GC stability frontier query (API Spec §6.5), or
+      // an active-but-silent reader's still-needed tombstones could be collected out from
+      // under it. Fire-and-forget (never blocks the handshake on a DB round trip) — a
+      // failure here just means this session is invisible to the frontier until its next
+      // PING succeeds, not a correctness break in anything already committed.
+      coordinator.operationStore
+        .upsertSessionHeartbeat({
+          sessionId,
+          documentId: ctrlMsg.documentId,
+          userId: session.userId,
+          replicaId,
+          displayName: session.displayName,
+          lastAckSeq: 0n,
+        })
+        .catch((err: unknown) => {
+          logger.error("gc.heartbeatFailed", {
+            documentId: ctrlMsg.documentId,
+            sessionId,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        });
+
       // WELCOME, then SNAPSHOT (API Spec §3.6.1-§3.6.3) — both on CONTROL, in this order,
       // so the client always sees its own admission before the state it's being admitted to.
       queues.enqueue(
@@ -193,7 +217,28 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       switch (ctrlMsg.kind) {
         case "ping": {
           onPingReceived(session);
-          coordinator.watermarks.set(session.replicaId, BigInt(ctrlMsg.lastAppliedSeq));
+          const lastAckSeq = BigInt(ctrlMsg.lastAppliedSeq);
+          coordinator.watermarks.set(session.replicaId, lastAckSeq);
+          // Phase 21: keep sessions.last_ack_seq/last_seen_at current — this IS Definition
+          // 7.1's watermark w(r), durably, not just in `coordinator.watermarks` (in-memory,
+          // lost on restart). Fire-and-forget, same reasoning as the join-time heartbeat
+          // above — must never add a DB round trip to the PING/PONG latency path.
+          coordinator.operationStore
+            .upsertSessionHeartbeat({
+              sessionId,
+              documentId: coordinator.documentId,
+              userId: session.userId,
+              replicaId: session.replicaId,
+              displayName: session.displayName,
+              lastAckSeq,
+            })
+            .catch((err: unknown) => {
+              logger.error("gc.heartbeatFailed", {
+                documentId: coordinator.documentId,
+                sessionId,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            });
           queues.enqueue(
             "control",
             encodeControlFrame({

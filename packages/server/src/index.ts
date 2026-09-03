@@ -48,6 +48,8 @@ export {
   startAuditScheduler,
   type AuditScheduler,
 } from "./auditScheduler.js";
+export { startGcScheduler, runOneDocument as runOneGcCycle, type GcScheduler } from "./gcScheduler.js";
+export type { GcConfig } from "./config.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
@@ -55,6 +57,7 @@ import { createPool } from "./db/pool.js";
 import { PostgresOperationStore } from "./db/operationStore.js";
 import { createCollabServer } from "./server.js";
 import { startAuditScheduler } from "./auditScheduler.js";
+import { startGcScheduler } from "./gcScheduler.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
 // or `tsx src/index.ts`, Phase 14's `pnpm --filter @collab-editor/server run
@@ -81,4 +84,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   // (every test constructs its own server directly, not through this direct-run block), so no
   // test needs to remember to stop it.
   startAuditScheduler(server.gateway);
+  // Phase 21: tombstone garbage collection — same "only the direct-run block starts this"
+  // reasoning as the audit scheduler immediately above.
+  startGcScheduler(server.gateway, config.gc);
 }

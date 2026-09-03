@@ -31,6 +31,11 @@ export const MUT_KILL_01_CONFIG: TrialConfig = {
   hotRegionWidth: 3,
   duplicateRate: 0,
   clockSkew: false,
+  // Unchanged from this search's original design (deferred-shuffled, C1-C6's shape) — never
+  // re-run as an "immediate delivery" variant. C7_IMMEDIATE_DELIVERY (Phase 20, Engine Spec
+  // §6.2 sub-case iii-d correction) is a separate, permanent fuzz config, not a retrofit of
+  // this one.
+  deliveryMode: "deferred-shuffled",
 };
 
 export interface MutKillResult {
