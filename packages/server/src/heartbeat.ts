@@ -10,14 +10,20 @@ import { logger } from "./logger.js";
  */
 export const PING_INTERVAL_MS = 3_000;
 export const PRESENCE_STALE_MS = 8_000;
+// 10 minutes, NOT the 8-second presence-stale threshold. These are different
+// timers and merging them is a correctness bug: evicting at 8s lets GC collect
+// tombstones a client mid-tunnel still needs as anchors, stranding its operations
+// forever. API Spec §11.4; the failure trace is Engine Spec §10.3.
 export const SESSION_INACTIVE_MS = 10 * 60 * 1000;
 
-// Session-inactivity eviction (10 minutes with no PING) is intentionally
-// NOT implemented this phase — scaffolding only, per the phase brief.
-// When Phase 21's garbage collection lands, this is where a session with
-// no PING for SESSION_INACTIVE_MS stops holding its watermark's tombstones
-// live for compaction (API Spec §11.4) and gets evicted from the
-// coordinator's GC frontier. Nothing reads SESSION_INACTIVE_MS yet.
+// Phase 21: this constant is now LIVE, but not read from here — Rule 7.1's eviction is
+// implemented as the WHERE clause of `PostgresOperationStore.getStabilityFrontier`
+// (packages/server/src/db/operationStore.ts), a SQL `now() - interval '10 minutes'`
+// literal kept in sync with this constant's own value by hand (SQL cannot import a JS
+// module). A session simply falls out of that query's own frontier computation once
+// `last_seen_at` ages past the window — no separate in-memory eviction bookkeeping exists
+// or is needed, since the frontier query IS the only place "is this replica still active"
+// is ever asked (Engine Spec Definition 7.2).
 
 /** Starts (or restarts) the 8-second presence-stale timer for a session — called on join and on every PING (§3.6.11). */
 export function armPresenceStaleTimer(session: CoordinatorSession): void {

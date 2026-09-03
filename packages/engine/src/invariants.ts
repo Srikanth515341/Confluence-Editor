@@ -82,6 +82,19 @@ export class InvariantViolation extends Error {}
 export interface AssertInvariantsOptions {
   /** Only pass `true` once a trial's delivery is fully complete (Engine Spec §4.2) — I9 only holds at quiescence. */
   readonly quiescent?: boolean;
+  /**
+   * Pass `true` for the ONE call immediately after `engine.collect()` (Phase 21, Engine Spec
+   * §7.4) — the only legitimate way the structure is ever allowed to shrink. This does not
+   * weaken I5 into "shrinkage is fine": it resets THIS call's baseline to the new, smaller
+   * count rather than comparing against the pre-collect count, so I5 still fires on any OTHER
+   * mutation path that shrinks the structure (which remains a real bug — `collect()` is the
+   * sole sanctioned exception, not a general exemption). I4 (origin presence) is NOT
+   * exempted by this flag and runs exactly as always — since `collect()`'s own fixpoint is
+   * supposed to guarantee no remaining node ever references a removed one, a passing I4 check
+   * immediately after a `collect()` call is the exhaustive, per-call proof of that guarantee
+   * Test Plan M8-c asks for, not a check `collect()` itself is trusted to have gotten right.
+   */
+  readonly afterCollect?: boolean;
 }
 
 export function assertInvariants(engine: Engine, options: AssertInvariantsOptions = {}): void {
@@ -285,18 +298,24 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
     }
   }
 
-  // I5 — tombstone retention: a node once integrated is never later missing,
-  // deleted or not (Engine Spec §5 I5, §4.5/§7.4). Full retention is already
-  // implied by I3's subsequence check above (a removed node couldn't
-  // reappear in the match) combined with I1's uniqueness — this is a cheap
-  // O(1) restatement so a shrinking structure is attributed to I5
-  // specifically rather than surfacing only as an I3 message. No GC exists
-  // yet (Phase 21), so this can only fire on a genuine regression.
-  if (state.lastNodeCount !== undefined && nodes.length < state.lastNodeCount) {
+  // I5 — tombstone retention: a node once integrated is never later missing
+  // EXCEPT through garbage collection (Engine Spec §5 I5, §4.5/§7.4 as
+  // amended by Phase 21's §7.4 COLLECT). Full retention is already implied
+  // by I3's subsequence check above (a removed node couldn't reappear in
+  // the match) combined with I1's uniqueness — this is a cheap O(1)
+  // restatement so a shrinking structure is attributed to I5 specifically
+  // rather than surfacing only as an I3 message. `options.afterCollect`
+  // is the ONE sanctioned exception (see its own doc comment) — any OTHER
+  // shrinkage is still a genuine violation.
+  if (
+    options.afterCollect !== true &&
+    state.lastNodeCount !== undefined &&
+    nodes.length < state.lastNodeCount
+  ) {
     violations.push(
-      `I5 violated: the structure shrank from ${state.lastNodeCount} to ${nodes.length} node(s) — a ` +
-        "node referenced as an origin must never be physically removed while it may still be needed " +
-        "as an anchor — Engine Spec §5 I5, §4.5/§7.4.",
+      `I5 violated: the structure shrank from ${state.lastNodeCount} to ${nodes.length} node(s) outside ` +
+        "of engine.collect() — a node referenced as an origin must never be physically removed while it " +
+        "may still be needed as an anchor — Engine Spec §5 I5, §4.5/§7.4.",
     );
   }
   state.lastNodeCount = nodes.length;

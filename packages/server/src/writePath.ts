@@ -135,10 +135,24 @@ export async function processIncomingOperation(
     return;
   }
 
+  // Step 5/6, reordered relative to their numbering but not their EFFECT: `startSeq` is
+  // computed (not yet committed to `coordinator.currentSeq`) BEFORE applying, so each
+  // operation's seq is known AT apply time and can be threaded into `applyRemote`'s optional
+  // GC context (Phase 21, Engine Spec §7.3) — a Delete's causal-stability check needs to know
+  // its OWN seq, which didn't exist yet under the original apply-then-assign order. Still
+  // fully synchronous end to end (no `await` between reading `coordinator.currentSeq` and
+  // advancing it below), so the "no other write path can interleave here" monotonicity
+  // argument this step's own original comment made is unaffected.
+  //
   // Step 5: apply to the server's own engine, same order as the wire representation (a
-  // run/batch's internal ordering is already causally correct per expand.ts).
-  for (const op of ops) {
-    coordinator.engine.applyRemote(op);
+  // run/batch's internal ordering is already causally correct per expand.ts). `atMs` is
+  // wall-clock time ONLY the server ever supplies — packages/engine itself never reads a
+  // clock (Engine Spec C9); this is server code, outside that purity boundary.
+  const startSeq = coordinator.currentSeq + 1n;
+  const appliedAtMs = Date.now();
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i]!;
+    coordinator.engine.applyRemote(op, { seq: startSeq + BigInt(i), atMs: appliedAtMs });
   }
 
   // Step 6: assign seq. PER OPERATION, not per frame — operations.seq is the operations
@@ -147,7 +161,6 @@ export async function processIncomingOperation(
   // stamp_c), both singular columns) — there is no way to represent N operations sharing one
   // seq as one row. A run/batch of N operations therefore consumes N consecutive seq values;
   // the relayed/acked seq below is the STARTING seq of that range, not a single shared value.
-  const startSeq = coordinator.currentSeq + 1n;
   coordinator.currentSeq += BigInt(ops.length);
 
   // Step 7: BROADCAST to peers, BEFORE the transaction below. The relay keeps msg's ORIGINAL

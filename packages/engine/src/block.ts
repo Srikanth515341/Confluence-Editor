@@ -177,8 +177,8 @@ export function splitBlockAt(block: Block, j: number): readonly [Block, Block] {
  * Can `right` be appended onto the end of `left`, forming one larger valid
  * block per Definition 7.5's four conditions PLUS originRight equality
  * (see this file's header for why that fifth check is necessary here,
- * not merely defensive)? Order matters: `left` precedes `right` in the
- * document. Both single-node blocks (the common case, checked once per
+ * not merely defensive)? Order matters: `left` precedes `right` in
+ * structural order. Both single-node blocks (the common case, checked once per
  * `PositionIndex.insertAt`) and multi-node blocks (checked once per
  * opportunistic re-merge after a delete/undelete) are valid inputs.
  */

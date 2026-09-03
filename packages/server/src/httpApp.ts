@@ -130,5 +130,35 @@ export function createHttpApp(deps: HttpAppDeps): Express {
       lastSuccessAt: lastSuccessAt?.toISOString() ?? null,
     });
   });
+  // Phase 21 DoD: "gc.minutes_since_last_success is a metric — GC's failure mode is silent, so
+  // liveness is monitored, not errors." Read-only, observability only — nothing here TRIGGERS a
+  // GC cycle; that's gcScheduler.ts's recurring timer. `minutesSinceLastSuccess` is `null` before
+  // this coordinator's very first GC cycle has ever completed (nothing to measure against yet),
+  // matching `/audit-runs`'s own `lastSuccessAt: null` convention for the identical situation.
+  app.get("/v1/documents/:documentId/gc-status", (req, res) => {
+    const coordinator = deps.getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    const stats = coordinator.engine.stats();
+    const nowMs = Date.now();
+    res.status(200).json({
+      lastAttemptAt: coordinator.lastGcAttemptAt?.toISOString() ?? null,
+      lastSuccessAt: coordinator.lastGcSuccessAt?.toISOString() ?? null,
+      minutesSinceLastSuccess: coordinator.lastGcSuccessAt
+        ? (nowMs - coordinator.lastGcSuccessAt.getTime()) / 60_000
+        : null,
+      nodesCollectedLastCycle: coordinator.lastGcCollectedCount,
+      cycleIncompleteCount: coordinator.gcCycleIncompleteCount,
+      frontier: coordinator.lastKnownFrontier.toString(),
+      frontierLagSeconds: coordinator.frontierLastAdvancedAt
+        ? (nowMs - coordinator.frontierLastAdvancedAt.getTime()) / 1_000
+        : null,
+      tombstoneRatio: stats.totalElements === 0 ? 0 : stats.tombstones / stats.totalElements,
+      totalElements: stats.totalElements,
+      tombstones: stats.tombstones,
+    });
+  });
   return app;
 }
