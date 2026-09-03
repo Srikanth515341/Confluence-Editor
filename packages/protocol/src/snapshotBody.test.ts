@@ -78,9 +78,92 @@ describe("structure snapshot body — round-trip against a real Engine's node li
   });
 
   it("rejects a reserved flag bit set", () => {
-    // Hand-build a malformed body: nodeCount=1, flags byte with bit 5 set (reserved).
+    // Hand-build a malformed body: blockCount=1, flags byte with bit 5 set (reserved) — the
+    // reserved-bit check fires immediately after reading the flags byte, before any subsequent
+    // (now block-shaped, not per-node-shaped, Phase 20) bytes are read, so this hand-built
+    // prefix is still valid for this specific assertion regardless of the wire format's shape.
     const bytes = new Uint8Array([1, 0b0010_0000, 1, 1, 0x61]);
     expect(() => decodeStructureSnapshotBody(bytes)).toThrow(ProtocolDecodeError);
+  });
+
+  // Phase 20 DoD: "Encode/decode round trip is lossless over 500 randomized engine states."
+  // Unlike the property test above (arbitrary, mostly-unrelated node descriptors — mostly
+  // exercises the one-node-per-block degenerate case), this drives REAL `Engine` instances
+  // through randomized local inserts/deletes across multiple replicas with cross-replica
+  // syncing, so blocks actually FORM the way real usage produces them, and checks both
+  // structural round-trip AND that a document rebuilt from the decoded nodes materializes the
+  // identical text.
+  it("round-trips 500 randomized real Engine states losslessly, including materialized text", () => {
+    function mulberry32(seed: number): () => number {
+      let s = seed >>> 0;
+      return () => {
+        s = (s + 0x6d2b79f5) | 0;
+        let t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // Earlier revisions of this test wrapped each trial's body in a try/catch, tracking and
+    // bounding a "skipped" count for trials that tripped Engine Spec §6.2 sub-case iii-d's
+    // test-build canary (Phase 6) at a measured ~24% rate. That canary and the bug it was
+    // catching (Case C's — and, found while validating that fix, ALSO Case B's — origin-
+    // bounded integration logic) are both fixed as of 2026-09-03 (see CLAUDE.md's "Engine
+    // Spec §6.2 sub-case iii-d correction" entry; tests/regression/R0008, R0009). The
+    // workaround is removed now that there is nothing left to skip.
+    const TRIALS = 500;
+    for (let trial = 0; trial < TRIALS; trial++) {
+      const rng = mulberry32(trial);
+      const replicaCount = 1 + Math.floor(rng() * 3);
+      const engines = Array.from({ length: replicaCount }, (_, i) => new Engine(i + 1));
+      const opCount = Math.floor(rng() * 40);
+
+      for (let step = 0; step < opCount; step++) {
+        const engine = engines[Math.floor(rng() * engines.length)]!;
+        const visibleLength = engine.stats().visibleLength;
+        const action = rng();
+        let op;
+        if (action < 0.75 || visibleLength === 0) {
+          const pos = Math.floor(rng() * (visibleLength + 1));
+          op = engine.localInsert(pos, 97 + Math.floor(rng() * 26));
+        } else {
+          const pos = Math.floor(rng() * visibleLength);
+          op = engine.localDelete(pos, 1)[0];
+        }
+        if (op) {
+          for (const other of engines) {
+            if (other !== engine) other.applyRemote(op);
+          }
+        }
+      }
+
+      const source = engines[0]!;
+      const body = encodeStructureSnapshotBody(source.nodes);
+      const decoded = decodeStructureSnapshotBody(body);
+      expect(sameNodes(decoded, source.nodes)).toBe(true);
+
+      // Rebuild a fresh engine purely from the decoded nodes (mirroring
+      // @collab-editor/protocol's own seedEngineFromSnapshot) and confirm it materializes the
+      // identical text — the ultimate, representation-independent correctness check.
+      const rebuilt = new Engine(0);
+      for (const n of decoded) {
+        rebuilt.applyRemote({
+          kind: "insert",
+          id: n.id,
+          value: n.value,
+          originLeft: n.originLeft,
+          originRight: n.originRight,
+          bind: n.bind,
+        });
+      }
+      for (const n of decoded) {
+        if (n.deleted && n.deletedBy) {
+          rebuilt.applyRemote({ kind: "delete", id: n.deletedBy, target: n.id });
+        }
+      }
+      expect(rebuilt.text()).toBe(source.text());
+    }
   });
 });
 

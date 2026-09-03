@@ -152,3 +152,76 @@ this investigation + 8 from the decisive test), the latter 8 verified at
 the wire-frame level, not just the text level. The relay/injection-layer
 freeze is documented here as a known, bounded test-infrastructure
 limitation, not a blocker to the milestone's actual deliverable.
+
+## R0008 (2026-09-02, Phase 20) — the SAME canary, reachable with NO network at all
+
+R0008 fires the identical Case C canary assertion via ordinary, direct
+`Engine.localInsert`/`localDelete`/`applyRemote` calls in a single Node
+process — no relay, no browser, no network of any kind. This is NOT
+explained by R0001-R0007's FINAL RESOLUTION (which attributed those
+firings entirely to a defect in the delay-injection test-infrastructure
+layer): R0008 has no injection layer in its path whatsoever. It is also
+the first entry in this corpus to fully satisfy Rule 3 (a byte-exact,
+4-operation minimal reproduction, not a post-hoc log/seed).
+
+Verified NOT a Phase 19 or Phase 20 regression: the identical 500-trial
+generator reproduces this at the same ~23-24% rate, with the identical
+first-failing case, on the original pre-Phase-19 flat-array `engine.ts`
+(commit `88b3fec`) and on post-Phase-19/pre-Phase-20 `main` (commit
+`d18d658`), via isolated `git worktree` checkouts. This has been a
+property of the original Phase 3 `integrate()` algorithm all along.
+
+Hand-traced and empirically checked for convergence impact (see the
+entry's own `handTrace`/`convergenceImpact`/`followUpOperationImpact`
+fields): for the minimal 4-op input alone, visible TEXT still converges
+identically regardless of delivery order, but the full node STRUCTURE
+(Engine Spec Definition 2.2's `S`, tombstones included) does not — a
+tombstoned node ends up in a delivery-order-dependent position.
+
+**That structural divergence is not cosmetic.** A follow-up test
+delivered one more ordinary insert — anchored (as originLeft and/or
+originRight) to the same tombstoned node — to all three already-divergent
+replicas. 3 of 4 tested anchor variants produced genuinely different
+VISIBLE TEXT across replicas (e.g. `"itX"` vs `"Xit"`) — a direct,
+confirmed violation of this project's core PRD convergence promise, not
+a rare theoretical curiosity.
+
+**Status: FIXED (2026-09-03).** Root cause confirmed as a flaw in Engine
+Spec §6.2 sub-case iii-d as literally written, not an implementation
+deviation. Fixed in Case C (see R0009 below for a second, related fix in
+Case B found while validating this one). Full account: CLAUDE.md's
+"Engine Spec §6.2 sub-case iii-d correction" entry.
+
+## R0009 (2026-09-02/03, same investigation as R0008) — a SECOND gap, in Case B, found while validating R0008's fix
+
+Discovered immediately after merging R0008's Case C fix, while building a
+*properly validated* (non-confounded) permanent regression repro for
+R0008 itself — treated as the same investigation, not split into a
+separate follow-up. A wide-window candidate (`originLeft=originRight=
+null`) whose scan encounters a node anchored onto an already-resolved
+competitor from earlier in the SAME scan pass blindly inherited that
+competitor's fate via Case B's group-membership test, without ever
+directly comparing its own rank against the candidate's — producing
+genuinely different VISIBLE TEXT (`"ipt"` vs `"itp"`) depending purely on
+delivery order, with **no throw, no canary, nothing catching it at all**.
+Unlike R0008, this was a silent divergence.
+
+Same general principle as R0008 ("scan-window membership is not a sound
+proxy for safe-to-skip-by-rank"), refined: an anchor being *inside* the
+scanned region isn't sufficient either, when the specific comparison that
+put it there was between a different pair than the one actually in
+question.
+
+**Status: FIXED (2026-09-03).** Fix hand-traced against RFC NQ-2's own
+non-interleaving requirement before being implemented, specifically to
+confirm it does not reintroduce the "zcybxa" interleaving bug for genuine
+single-author contiguous runs — verified both by hand-trace and by a
+dedicated same-author-chain-swept-by-a-competitor test. Case A was also
+explicitly hunted for a third instance of this same bug shape and
+confirmed architecturally immune (it always performs a direct pairwise
+rank comparison, never inherits from group membership). Full account:
+CLAUDE.md's "Engine Spec §6.2 sub-case iii-d correction" entry.
+
+**Both R0008 and R0009 remain permanently in this corpus per Rule 2, even
+though both are now fixed** — a corpus entry documents a bug that
+happened, not a currently-open issue.

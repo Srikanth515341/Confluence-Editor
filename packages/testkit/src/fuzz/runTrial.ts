@@ -75,6 +75,29 @@ export function runTrial<Op>(
   }
 
   const deliveries: Delivery<Op>[] = [];
+  const immediate = config.deliveryMode === "immediate";
+
+  /**
+   * Delivers one op to every replica other than its origin. Under
+   * `"immediate"` (C7 only — Engine Spec §6.2 sub-case iii-d correction,
+   * R0008), this happens SYNCHRONOUSLY, right here, before the next
+   * operation is even generated — so a later op CAN legally anchor to a
+   * peer's just-arrived node, unlike deferred-shuffled delivery where no
+   * replica sees any peer's node until the whole trial's generation is
+   * done. Duplicate injection is inlined here too (rather than only at
+   * the end, as deferred mode does) so `duplicateRate` means the same
+   * thing under both modes: a per-delivery chance of a second, redundant
+   * `applyRemote` of that same op.
+   */
+  function deliverNow(op: Op, originIndex: number): void {
+    for (let j = 0; j < replicas.length; j++) {
+      if (j === originIndex) continue;
+      replicas[j]?.applyRemote(op);
+      if (rand() < config.duplicateRate) {
+        replicas[j]?.applyRemote(op);
+      }
+    }
+  }
 
   try {
     for (let round = 0; round < config.rounds; round++) {
@@ -91,15 +114,23 @@ export function runTrial<Op>(
             const visibleIndex = hotRegionIndex(rand, currentLength, config.hotRegionWidth);
             const value = 0x61 + randInt(rand, 0, 25); // 'a'..'z' — readable in failure diagnostics
             const op = replica.localInsert(visibleIndex, value);
-            for (let j = 0; j < replicas.length; j++) {
-              if (j !== i) deliveries.push({ op, targetReplica: j });
+            if (immediate) {
+              deliverNow(op, i);
+            } else {
+              for (let j = 0; j < replicas.length; j++) {
+                if (j !== i) deliveries.push({ op, targetReplica: j });
+              }
             }
           } else {
             const visibleIndex = hotRegionIndex(rand, currentLength - 1, config.hotRegionWidth);
             const ops = replica.localDelete(visibleIndex, 1);
             for (const op of ops) {
-              for (let j = 0; j < replicas.length; j++) {
-                if (j !== i) deliveries.push({ op, targetReplica: j });
+              if (immediate) {
+                deliverNow(op, i);
+              } else {
+                for (let j = 0; j < replicas.length; j++) {
+                  if (j !== i) deliveries.push({ op, targetReplica: j });
+                }
               }
             }
           }
@@ -107,21 +138,23 @@ export function runTrial<Op>(
       }
     }
 
-    // Duplicate injection (Test Plan §2.2): duplicate delivery is a
-    // consequence of correct retry behaviour, not a network defect
-    // (API Spec §9.3), and must be exercised above production rates.
-    const withDuplicates = [...deliveries];
-    for (const delivery of deliveries) {
-      if (rand() < config.duplicateRate) {
-        withDuplicates.push(delivery);
+    if (!immediate) {
+      // Duplicate injection (Test Plan §2.2): duplicate delivery is a
+      // consequence of correct retry behaviour, not a network defect
+      // (API Spec §9.3), and must be exercised above production rates.
+      const withDuplicates = [...deliveries];
+      for (const delivery of deliveries) {
+        if (rand() < config.duplicateRate) {
+          withDuplicates.push(delivery);
+        }
       }
-    }
 
-    // Global shuffle across ALL rounds and ALL replicas' deliveries at once.
-    fisherYatesShuffle(withDuplicates, rand);
+      // Global shuffle across ALL rounds and ALL replicas' deliveries at once.
+      fisherYatesShuffle(withDuplicates, rand);
 
-    for (const delivery of withDuplicates) {
-      replicas[delivery.targetReplica]?.applyRemote(delivery.op);
+      for (const delivery of withDuplicates) {
+        replicas[delivery.targetReplica]?.applyRemote(delivery.op);
+      }
     }
   } catch (error) {
     return { status: "errored", seed, error };

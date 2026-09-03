@@ -3117,32 +3117,404 @@ audit-runs`** — the DoD's "audit_runs rows are queryable and the 'last
   remaining utterly incompatible with ~100x linear growth) and `p99 at
   100,000 nodes ≤ 16` (M3-c's literal number).
 
+- **Phase 20 — Block run-length encoding** (Engine Spec §7.5, Definitions
+  7.5/7.6, Theorem 7.1). Implements the SNAPSHOT structure-form body's
+  real wire encoding — replacing Phase 9's deliberate one-record-per-node
+  placeholder — as maximal runs of consecutive-counter, same-replica,
+  contiguously-anchored nodes, per Definition 7.5. This phase's own block-
+  encoding work (`packages/engine/src/block.ts`'s `Block` type,
+  `splitBlockAt`/`canMergeBlocks`/`canFollowInBlock`; `positionIndex.ts`
+  rewritten to store blocks, not individual nodes, as treap leaves, with a
+  per-replica sorted-array index for O(log B) identifier resolution;
+  `snapshotBody.ts`'s real block run-length wire format) is real and
+  complete — see `docs/benchmarks.md` for the compression numbers (pure
+  sequential typing: 50,000x; realistic prose: ~5x; DoD's own >1000x/>4x
+  targets both met) — but **this phase's defining event, and by far its
+  largest body of work, was not block encoding at all.** While building
+  this phase's own DoD test ("encode/decode round trip is lossless over
+  500 randomized engine states"), a serious, previously-undiscovered
+  correctness bug in the CORE CONVERGENCE ALGORITHM was found — present
+  since Phase 3, twelve phases and thousands of prior test runs earlier,
+  and untouched by Phase 20's own block-storage work. What follows is
+  that investigation's full account, documented at this length
+  deliberately: it took two intensive rounds of work across many hours,
+  included one wrong turn that was caught and corrected before being
+  trusted, and is the single most consequential finding in this
+  project's history to date.
+
+  ### The discovery
+
+  Phase 20's own 500-trial randomized round-trip test began intermittently
+  hitting Engine Spec §6.2 sub-case iii-d's test-build canary (Phase 6,
+  Test Plan §14.2 MUT-KILL-01) — an assertion in `integrate()`'s Case C
+  branch that throws if a Case C node would ever outrank the candidate
+  being placed, restating sub-case iii-d's own claim that this can never
+  happen. It fired at a measured **~23-24% rate** — not a rare edge case.
+  This canary had previously fired only once in this project's entire
+  history (Phase 6, incidentally, under a deliberately mutated
+  `compareRank`) and had survived a directed 10^6-trial search
+  (MUT-KILL-01) built specifically to try to disprove it. A ~24% firing
+  rate on ordinary randomized states was immediately treated as a major
+  finding, not a test-tolerance nuisance to work around — the user
+  explicitly stopped all further Phase 20 work the moment this was
+  reported and redirected all effort to root-causing it, a redirection
+  that held for the remainder of this phase.
+
+  ### Investigation, part 1 — confirming it was real, not a regression
+
+  Using `git worktree` (an explicitly user-sanctioned exception to "never
+  touch git," used only for read-only diagnostic checkouts and removed
+  immediately after each use) against pre-Phase-19 (`88b3fec`) and
+  post-Phase-19/pre-Phase-20 (`main@d18d658`), the identical 500-trial
+  generator was run against both. **Byte-identical firing rate (~23.4%),
+  same first-failing trial, same error, on every version of this codebase
+  this project has ever shipped.** This ruled out Phase 19's index and
+  Phase 20's block storage as the cause and confirmed the bug had been
+  latent since Phase 3 — present through the ENTIRE 60,000-seed
+  convergence suite's history, every adversarial run, every property
+  suite, every mutation-matrix run, all of which reported clean.
+
+  ### Investigation, part 2 — minimal repro, hand-trace, and the first (partial) severity finding
+
+  The 30-op failing trial was reduced via delta-debugging to a 4-operation
+  minimal reproduction (later saved as `tests/regression/R0008`, satisfying
+  Test Plan §2.3 Rule 3 — a full operation stream, not a bare seed — the
+  FIRST corpus entry to do so; R0001-R0007 predate this and are
+  E2E-sourced with a documented Rule 3 deviation). Hand-traced against
+  the exact Case A/B/C control flow: a node originally anchored to the
+  fully open window (⊥, ⊥) — Engine Spec §4.1's "insert into a still-empty
+  document" shape — can, after being tombstoned (later found NOT to be
+  load-bearing — see below), end up sitting inside what has become a much
+  NARROWER window for a later, unrelated candidate's own scan. Because ⊥
+  can never be a member of Case B's `scanned` set (only real, previously-
+  encountered nodes are ever added to it), any node whose relevant origin
+  is ⊥ is structurally forced into Case C, regardless of its actual rank
+  relative to the candidate.
+
+  Convergence impact was checked empirically, not assumed: for the
+  minimal 4-op input alone, TEXT converged identically across delivery
+  orders, but full STRUCTURE (tombstones included) did not. A follow-up
+  test then asked whether this was permanently cosmetic or could surface —
+  delivering one more ordinary insert, anchored to the divergently-placed
+  tombstoned node, to all three already-structurally-divergent replicas.
+  **3 of 4 tested anchor variants produced genuinely different VISIBLE
+  TEXT** (`"itX"` vs `"Xit"`, etc.) — a confirmed, direct violation of
+  this project's core convergence promise, not a theoretical curiosity.
+
+  ### Root cause, confirmed against the literal spec text, not just the implementation
+
+  The user supplied Engine Spec §4.3's literal INTEGRATE pseudocode and
+  asked for a hand-trace of the ACTUAL SPEC TEXT, not just `engine.ts`.
+  Line 17's literal condition — `c.originLeft ≠ ⊥ ∧ c.originLeft ∈
+  scanned` — fails outright whenever `c.originLeft = ⊥`, falling through
+  to Case C's line 21-22, an UNCONDITIONAL `break` with no rank check
+  anywhere in the pseudocode itself. **`engine.ts` was a faithful, exact,
+  line-for-line translation of this pseudocode** — the flaw is in the
+  approved Engine Specification's own §6.2 sub-case iii-d claim and its
+  §4.3 pseudocode, not an implementation deviation introduced during
+  Phase 3. This is a real, documented correction to an approved design
+  document, not merely a code fix — see the "Engine Spec §6.2 sub-case
+  iii-d correction" entry under Key Technical Decisions below.
+
+  ### Why the 60,000-seed convergence suite never caught this — a real gap in the safety net itself
+
+  Before any fix was attempted, the user asked WHY `convergence.test.ts`'s
+  60,000-seed suite (C1-C6, this project's primary correctness gate since
+  Phase 3) had never once caught this, while the Phase 20 snapshot test's
+  own 500-trial generator caught it at ~24%. Investigated via a controlled
+  four-axis ablation (op-shape, delivery timing, position selection,
+  replica count), swapping one axis at a time between the two generators'
+  shapes. **One axis dominated completely**: delivery timing. Every
+  "deferred-shuffled" variant (collect ALL of a trial's operations first,
+  deliver via one global shuffle at the very end — `runTrial.ts`'s design
+  since Phase 2) measured ~0% regardless of every other axis; every
+  "immediate" variant (broadcast each operation to every other replica the
+  instant it's minted, before generating the next one — the ordinary shape
+  of real, live multi-user editing) measured 22-95% depending on config
+  shape. Mechanism: under deferred-shuffled delivery, no replica ever sees
+  a peer's node until the ENTIRE trial's generation is complete, so no
+  operation can ever anchor to a peer's node during generation — which is
+  exactly the geometry this bug needs. **This means the 60,000-seed suite
+  was never actually testing the failure mode real, live collaborative
+  editing produces constantly** — its clean history was never false, but
+  it was also never evidence against this specific bug class, because its
+  generator was structurally incapable of reaching it. This was treated as
+  nearly as significant a finding as the bug itself, since it exposed a
+  real blind spot in this project's own primary safety net.
+
+  ### The first fix attempt that was found unsound BEFORE being built — not after
+
+  Two fix approaches were proposed before either was implemented: Approach
+  1 (give Case C's `else` branch the same rank check Case A already has,
+  replacing the blind `break`) and Approach 2 (a geometric reformulation
+  of Case B's nesting test, hoped to preserve "Case C is usually a no-op"
+  and avoid Approach 1's larger blast radius on the Phase 6 canary/
+  mutation-matrix apparatus). Following this project's own established
+  discipline (Phase 6's M2/M9 re-derivation, Phase 13's flag experiment),
+  Approach 2 was hand-traced against the actual R0008 repro geometry
+  BEFORE any code was written for it — and found NOT to close the bug:
+  the excluded predecessor's own origin window is WIDER than, not nested
+  inside, the candidate's window, so a positional-nesting test can't
+  distinguish the failing case from the safe one. This negative result
+  was reported honestly rather than silently discarded or forced to work.
+  Approach 3 (a tree-based, Fugue-style rewrite) was named as the
+  theoretically cleanest option but set aside as disproportionate to
+  attempt as an emergency fix under time pressure. **Approach 1 was
+  chosen and built.**
+
+  ### Approach 1, built gated/separate, verified, merged — R0008
+
+  Built first as a scratch copy of `engine.ts` (never the real file),
+  verified against: the R0008 repro and two constructed variants (Q1:
+  originRight=⊥ instead of originLeft=⊥, confirming the bug is not
+  specific to document-start insertions; Q2: both competing nodes LIVE,
+  never tombstoned, confirming tombstoning was never load-bearing — it
+  merely happened to be present in the first minimal repro) across
+  EVERY exhaustive delivery-order permutation; all 22 adversarial cases;
+  all worked traces (§10.1/§10.3/§10.5/§10.7); all 5 property suites; and
+  a decisive demonstration — the "immediate delivery" distribution
+  identified above, run against BOTH the real and fixed engine across all
+  6 real config shapes (500 seeds × 6 = 3,000 trials each): the real
+  engine canary-fired on 2,454/3,000 (81.8%, reaching 100% on the
+  higher-replica-count configs); the fixed engine, zero failures of any
+  kind. Only after this full verification was Approach 1 merged into the
+  real `engine.ts`.
+
+  ### A second, silent gap found immediately after — R0009
+
+  Building R0008's OWN permanent regression fixture (per Test Plan §2.3)
+  required a properly non-confounded repro. The first attempt at
+  "distinct replica ids" was itself flawed — an accidental replica-id
+  choice made the excluded predecessor never actually outrank the
+  candidate, so the "test" passed vacuously regardless of any fix,
+  proving nothing. This was caught before being trusted, and a properly
+  validated relationship was derived (`i.r < p.r < t.r`, chosen so Case A
+  resolves the direct competitors deterministically AND the excluded
+  predecessor genuinely outranks the final candidate). Re-verifying
+  Approach 1 against THIS corrected repro revealed **a second, structurally
+  distinct gap**, this time in Case B: a wide-window candidate's scan,
+  reaching a node anchored onto an already-resolved competitor from
+  earlier in the SAME scan pass, blindly inherited that competitor's fate
+  via Case B's group-membership test — WITHOUT ever directly comparing its
+  own rank against the candidate. Unlike R0008, this produced **silent**
+  divergence: zero throws, zero canary, genuinely different VISIBLE TEXT
+  (`"ipt"` vs `"itp"`) depending purely on delivery order. Confirmed
+  robust across 5 different numeric replica-id combinations sharing the
+  same qualitative relationship, all producing the identical split. This
+  was treated as the SAME emergency-priority investigation, not split
+  into a separate follow-up.
+
+  Root cause is a refinement of R0008's own principle: an anchor being
+  INSIDE the scanned region isn't sufficient either, when the specific
+  comparison that put it there was between a DIFFERENT pair than the one
+  actually in question. R0008: not compared at all. R0009: compared, but
+  via a proxy pair, not the real one.
+
+  ### The R0009 fix, hand-traced for a specific risk before being built
+
+  A naive fix (require `compareRank(other, node) < 0` to advance in Case
+  B, mirroring Approach 1 exactly) was hand-traced FIRST against the
+  concern it could break RFC NQ-2's own non-interleaving guarantee (the
+  entire reason Case B's group-inheritance exists — see Case A line 13's
+  originRight-equality test and its own "zcybxa vs cbazyx" history). The
+  reasoning: for a genuine single-author contiguous run, every character
+  is minted by the SAME replica as its own anchor, so if the anchor beats
+  a candidate, every descendant automatically shares that same rank
+  relationship — the new check is a no-op for real runs. It only changes
+  behavior when a chain crosses an authorship/replica boundary, which
+  isn't really "one run" in the intended sense to begin with. This
+  reasoning was verified, not just trusted: a hand-built same-author
+  3-character run swept by a concurrent competitor stayed fully contiguous
+  under the fix (3 rank combinations, all converging to e.g. `"XabcM"`); a
+  cross-replica chain (NOT a real single-author run) still converged, just
+  without forced contiguity; a depth-2 chain crossing an authorship
+  boundary partway through split at exactly the right point and converged.
+  Case A was explicitly hunted for a third instance of this same bug shape
+  per the user's own direct instruction and confirmed architecturally
+  immune — it always performs a direct pairwise rank comparison and never
+  inherits a decision from group membership, so there is no proxy-pair
+  vulnerability for it to have.
+
+  ### Final, combined verification, against the merged real engine.ts
+
+  With both fixes merged: `pnpm test` (321/321, up from 308 — Phase 20's
+  own new `block.test.ts`/`compression.bench.test.ts` files and others
+  contribute the delta), `pnpm test:adversarial` (22/22),
+  `pnpm test:properties` (6/6 suites, 10,000 cases each),
+  `pnpm test:index` (10,000-seed PositionIndex cross-check, zero
+  disagreements), `pnpm test:benchmark` (scaling + compression, all DoD
+  targets met — see `docs/benchmarks.md`), and `pnpm test:convergence`
+  re-run across all SEVEN configs — all passing together, on the real,
+  merged file. R0008, Q1, Q2, and R0009 were all re-verified exhaustively
+  (every delivery-order permutation) against the merged engine: fully
+  convergent, structure and text, zero throws. A 30,000-trial
+  immediate-delivery fuzz run (5,000 seeds × 6 configs) against the
+  fully-fixed engine, run before the merge as part of choosing to merge:
+  zero canary fires, zero divergence of any kind, zero stuck-pending.
+
+  **`pnpm test:convergence` full per-config results (real, merged engine,
+  10,000 seeds each, 70,000 total, ~34.5 minutes wall time)** — reported
+  per config, not just as a pass/fail total, specifically so C7's own
+  contribution is visible rather than folded away:
+
+  | Config | Seeds | Result | Wall time |
+  |---|---|---|---|
+  | C1-baseline | 10,000/10,000 converged | ✓ | 119.9s |
+  | C2-collision | 10,000/10,000 converged | ✓ | 167.6s |
+  | C3-delete-heavy | 10,000/10,000 converged | ✓ | 362.8s |
+  | C4-deep | 10,000/10,000 converged | ✓ | 219.7s |
+  | C5-wide | 10,000/10,000 converged | ✓ | 876.7s |
+  | C6-skew | 10,000/10,000 converged | ✓ | 185.3s |
+  | **C7-immediate-delivery** | **10,000/10,000 converged** | **✓** | **136.6s** |
+
+  C7 — the config actually exercising the immediate-delivery pattern that
+  found both bugs (pre-fix, this same shape measured canary/divergence
+  rates in the tens of percent, as high as 100% on some C-shape variants
+  in the earlier 3,000-trial demonstration) — is now clean at the full,
+  standard 10,000-seed budget every other config runs at, not a reduced
+  or special-cased count. Zero divergences, zero stuck-pending, zero
+  errors, across all seven configs, all ten Engine Spec I0-I9 invariants
+  actively checked on every mutating call throughout.
+
+  ### A permanent new fuzz config — C7_IMMEDIATE_DELIVERY
+
+  `packages/testkit/src/fuzz/configs.ts` gained a `deliveryMode:
+  "deferred-shuffled" | "immediate"` field on `TrialConfig` (default
+  `"deferred-shuffled"`, preserving C1-C6's exact existing behavior) and
+  `runTrial.ts` gained real support for it — under `"immediate"`, each
+  minted operation (plus its own independently-rolled duplicate check) is
+  broadcast to every other replica synchronously, before the next
+  operation is generated, instead of being queued for the end-of-trial
+  global shuffle. `C7_IMMEDIATE_DELIVERY` (same replica count/rounds/
+  hot-region width as C1_BASELINE — only delivery mode differs) is now a
+  PERMANENT member of `ALL_CONFIGS`, which `convergence.test.ts` already
+  iterates via `describe.each` — so it runs automatically in the same
+  10,000-seed sweep as C1-C6, in `pnpm test:convergence` and in CI's
+  `convergence` job, with no separate wiring needed. This is not optional
+  stress coverage: it is the ONLY configuration in this file capable of
+  reaching the Case B/C rank-violation bug class this phase found — every
+  future change to `integrate()` must be checked against it, not only
+  C1-C6.
+
+  ### The canary — redefined, not retired
+
+  Engine Spec §6.2 sub-case iii-d's original claim is now known false by
+  design (both Case B and Case C legitimately participate in placement),
+  so the original assertion (restating that claim, throwing if violated)
+  could not be left as-is — leaving it would either be dead code (if
+  scoped narrowly) or actively misleading (if its old justification text
+  remained). It was neither silently deleted nor left stale: `integrate()`
+  now ends with a general structural sanity check — `destIndex` must
+  remain within `[leftIndex+1, rightIndex]`, the window this specific scan
+  is even allowed to place into — true regardless of which branch (A/B/C)
+  decided it, and unrelated to the retired sub-case iii-d claim. This is a
+  genuinely different, still-meaningful invariant, not a renamed
+  continuation of the dead one — chosen after concluding no still-
+  meaningful invariant specific to "Case C/B's decision was correct" could
+  be defined without re-deriving the very correctness argument the fix
+  itself now provides.
+
+  `mutants.ts`'s `M3_no_case_c` mutant (Test Plan §2.8) had its `find`/
+  `replace` anchors updated to match the new Case C code shape (the old
+  throw+`break` anchor no longer exists) and its `violatedInvariant`
+  citation changed from "Engine Spec §6.2 sub-case iii-d" (retired) to
+  "I6 (scan-window determinism)" — its actual violated property, unchanged
+  in spirit (Case C failing to stop where it should), just no longer
+  attributed to a claim now known false. See the mutation-matrix results
+  below for what this changed in practice.
+
+  ### Mutation matrix, re-run on the final merged engine
+
+  Re-ran `pnpm test:mutation` on the real, merged `engine.ts` (both fixes
+  live). **Result, stated precisely because it's a genuine correction to
+  what was expected going in**: `M3_no_case_c` STILL SURVIVES EVERY SUITE
+  — identical Overall status to the Phase 6/19 baseline, not the
+  "expected to change" framing used mid-investigation. Confirmed this
+  isn't a harness malfunction, not just assumed: the mutation test itself
+  passed cleanly (exit 0), meaning `loadMutantEngine.ts`'s "find text must
+  match exactly once" check succeeded against the new Case C code shape —
+  the mutation genuinely applied and genuinely evaded detection, the same
+  as before.
+
+  Why this makes sense on reflection, not just an unexplained anomaly:
+  `M3_no_case_c`'s patch removes the `break` specifically in Case C's
+  "other does NOT outrank node" branch — i.e., it makes the scan keep
+  running PAST the point the (now-correct) algorithm should stop, rather
+  than making it advance somewhere it shouldn't. This is a different
+  failure mode than what R0008/R0009 were about (a wrong ADVANCE/inherit
+  decision at a specific point), and fixing those doesn't change whether
+  M3's specific "keep scanning past a correct stop" mutation happens to
+  produce an observable difference under this matrix's four targeted,
+  small-seed-count suites — same as it never did across Phase 6's
+  original MUT-KILL-01 (20,000-trial directed search) or any prior
+  re-run. `M3_no_case_c` surviving is EXPECTED and by design (it's why
+  MUT-KILL-01 and the Phase 6 canary existed in the first place) — it is
+  not evidence the R0008/R0009 fix is incomplete, since R0008/R0009's own
+  repros (a completely different, targeted construction) are what
+  actually proves the fix, verified exhaustively above, independent of
+  this mutant.
+
+  No other mutant's Overall status changed: `M1/M2/M4/M5/M6/M7/M8/M9/M10`
+  all remain **KILLED**, identical per-suite breakdown to the pre-fix
+  baseline. `M3_no_case_c`'s `violatedInvariant` citation is confirmed
+  updated in the regenerated `docs/mutation-matrix.md` — "I6 (scan-window
+  determinism)", no longer citing the retired "Engine Spec §6.2 sub-case
+  iii-d". Full per-mutant table: `docs/mutation-matrix.md` (regenerated
+  fresh by this run, 2026-09-02T23:08:59Z).
+
+  ### Regression corpus — R0008 and R0009, permanent per Test Plan §2.3 Rule 2
+
+  Both entries remain in `tests/regression/` even though both are now
+  FIXED — Rule 2 ("entries are never removed") applies to fixed bugs as
+  much as open ones; a corpus entry documents a bug that happened, not a
+  currently-open issue. `tests/regression/README.md` updated accordingly.
+  R0008 is also this corpus's first entry to fully satisfy Rule 3 (a
+  byte-exact operation stream, not a post-hoc seed/log) — R0001-R0007
+  predate this and carry a documented Rule 3 deviation of their own.
+
+  ### DoD verification — the block encoding itself, unaffected by any of the above
+
+  All of Phase 20's own original DoD items were verified independently of
+  the bug investigation, since the bug and its fixes touch `integrate()`
+  only, never block storage: `docs/benchmarks.md`'s compression numbers
+  (pure sequential typing 50,000x, realistic prose ~5x, both clearing
+  their DoD targets), M8-b's memory measurement (documented honestly as
+  NOT clearing RFC §2.5's 10MB target at 100,000 operations — 77.62MB
+  measured — attributed to `deletedBy` uniqueness from `localDelete`'s
+  per-character DeleteOperations limiting tombstone-merging, a real,
+  disclosed gap, not glossed over), and the `snapshotBody.ts` round-trip
+  test itself — now finally clean with NO skip/workaround logic at all,
+  since there is nothing left to skip.
+
 ## Current phase in progress
 
-None — Phase 19 (indexed position structure) complete. `packages/engine`'s
-node storage moved from a flat array (linear-scan position lookup, a
-deliberate Phase 3 placeholder) to `PositionIndex`, an implicit-key treap
-with O(log N) expected `indexOf`/`nodeAtVisible`/`visibleIndexOf`/`splice`/
-`setDeleted`. All required regression gates re-run and passing: default
-`pnpm test` (308), `pnpm test:adversarial` (22/22), `pnpm test:properties`
-(6/6, 10,000 cases each), `pnpm test:convergence` (60,000/60,000 seeds,
-0 divergences), `pnpm test:mutation` (9/10 killed, identical to the Phase
-6 baseline — no regression), and the new `pnpm test:index` (10,000-seed
-reference cross-check against a linear-scan oracle, zero disagreements).
-Scaling benchmark confirms logarithmic growth (p95 0.80x over a 100x size
-increase, 1,000 → 100,000 nodes) and M3-c's p99 ≤ 16ms target (measured
-0.030ms) — see `docs/benchmarks.md`. A genuine, pre-existing (not
-Phase-19-caused) CRLF-sensitivity bug in the mutation-testing harness was
-found and fixed along the way — see the Phase 19 completed-phase entry.
+None — Phase 20 (block run-length encoding) complete, INCLUDING the
+Engine Spec §6.2 sub-case iii-d correction found during its own DoD
+verification (two distinct, now-fixed bugs in `integrate()`'s Case B and
+Case C, present since Phase 3 — see the Phase 20 completed-phase entry
+above in full, and the "Engine Spec §6.2 sub-case iii-d correction" entry
+under Key Technical Decisions below). All required regression gates
+re-run clean on the real, merged `engine.ts`: default `pnpm test`
+(321/321), `pnpm test:adversarial` (22/22), `pnpm test:properties` (6/6,
+10,000 cases each), `pnpm test:index` (10,000-seed cross-check, zero
+disagreements), `pnpm test:benchmark` (scaling + Phase 20 compression,
+all DoD targets met), `pnpm test:convergence` across all SEVEN configs
+(C1-C6 plus the new, permanent C7_IMMEDIATE_DELIVERY — the only config
+capable of reaching this bug class), and `pnpm test:mutation` — see the
+Phase 20 entry's own mutation-matrix paragraph for exact results. Phase
+19's own indexed position structure is retroactively confirmed NOT the
+source of this bug (verified via `git worktree` comparison against
+pre-Phase-19 commits, byte-identical firing rate) — it was under
+suspicion early in the investigation and is now cleared.
 
 ## What is explicitly NOT yet built
 
 Undo/redo's real resurrection semantics beyond Undelete's structural
-inverse (Phase 36); garbage collection (Phase 21); block run-length
-encoding (later, alongside GC) — and because of that, SNAPSHOT's
-structure-form body serialization
-(`packages/protocol/src/snapshotBody.ts`) is a deliberate Phase 9 placeholder
-EXPECTED to be reworked in Phase 20, not a finished format. The OPS and
+inverse (Phase 36); garbage collection (Phase 21). Block run-length
+encoding is now BUILT (Phase 20, Engine Spec §7.5) — SNAPSHOT's
+structure-form body serialization (`packages/protocol/src/snapshotBody.ts`)
+is a real block-encoded wire format, no longer the Phase 9 one-record-
+per-node placeholder. The OPS and
 CONTROL channels both now flow end to end (Phases 7-9); PRESENCE message
 types and any presence broadcast do not exist yet (Phase 31) — a stale
 session is only logged/marked, never actually removed from anything.
@@ -3157,10 +3529,7 @@ Phase 17** — every operation is committed to Postgres before its client
 is acknowledged (API Spec §6.3), and a coordinator warm-starts from the
 latest snapshot plus only the operation-log suffix after it (RFC §13.2's
 MAYBE-SNAPSHOT, 500 ops/30s), not a full genesis replay. What remains NOT
-built: block run-length encoding (Engine Spec §7.5, Phase 20 —
-`snapshotBody.ts`'s structure serialization is still the same Phase 9
-placeholder, used as-is per Phase 17's own explicit instruction not to
-touch it); garbage collection (Phase 21); any retention/pruning policy
+built: garbage collection (Phase 21); any retention/pruning policy
 for the `snapshots` table itself (every MAYBE-SNAPSHOT trigger adds a new
 row forever — not a problem yet, but nothing prunes old ones);
 `SyncClient`'s unacked-operation queue is still in-memory only client-side
@@ -3249,6 +3618,85 @@ manual `workflow_dispatch` trigger (Claude cannot push branches or
 trigger GitHub Actions runs).
 
 ## Key technical decisions with source citations
+
+- **Engine Spec §6.2 sub-case iii-d correction (2026-09-02/03, Phase 20,
+  R0008 + R0009) — a real correction to the APPROVED SPECIFICATION
+  document, not just to code.** Sub-case iii-d claims a Case C node in
+  `integrate()`'s origin-bounded scan can NEVER outrank/affect where the
+  candidate being placed lands. **This claim is incorrect, confirmed by
+  hand-tracing Engine Spec §4.3's own literal INTEGRATE pseudocode** (line
+  17's `c.originLeft ≠ ⊥ ∧ c.originLeft ∈ scanned` conjunct falls through
+  to Case C's unconditional, rank-blind `break` whenever `c.originLeft =
+  ⊥`) — `engine.ts` was a faithful, line-for-line translation of this
+  pseudocode; the flaw was in the spec's own design, not introduced during
+  Phase 3's implementation. Found while building Phase 20's own DoD test,
+  firing at ~23-24% on ordinary randomized states — not a rare edge case,
+  and present, unchanged, since Phase 3 (confirmed via `git worktree`
+  against pre-Phase-19 and pre-Phase-20 commits: byte-identical firing
+  rate on every version of this codebase ever shipped). A follow-up test
+  confirmed this was not cosmetic: 3 of 4 tested anchor variants onto the
+  divergently-placed node produced genuinely different VISIBLE TEXT across
+  replicas — a direct violation of this project's core convergence
+  promise.
+
+  **A second, related but structurally distinct instance was found in
+  Case B** while building a properly-validated (non-confounded) permanent
+  regression fixture for the first fix — treated as the SAME investigation,
+  not a separate one. Case B's group-membership test (`scanned`/
+  `conflicting`) can advance a candidate past a node based on a DIFFERENT
+  node's rank comparison (the group's own anchor) rather than the actual
+  node in question's — silent, no throw, no canary, genuinely different
+  VISIBLE TEXT (`"ipt"` vs `"itp"`) purely from delivery order.
+
+  **Root-cause investigation also found a real gap in this project's own
+  primary safety net**: the 60,000-seed `convergence.test.ts` suite never
+  caught either bug across its entire history, not because the bugs were
+  rare, but because `runTrial.ts`'s "deferred-shuffled" delivery (generate
+  a whole trial's operations first, deliver via one global shuffle at the
+  end) makes it STRUCTURALLY IMPOSSIBLE for an operation to ever anchor to
+  a peer's node during generation — exactly the precondition both bugs
+  need. Real, live multi-user editing (a replica typing while seeing
+  peers' very-recent edits — "immediate delivery") reaches it readily
+  (measured 22-95%, config-dependent, pre-fix). Fixed by adding a
+  permanent `C7_IMMEDIATE_DELIVERY` config (`packages/testkit/src/fuzz/
+  configs.ts`) alongside a real `deliveryMode` implementation in
+  `runTrial.ts` — the only config in this project capable of reaching this
+  bug class; every future `integrate()` change must be checked against it.
+
+  **Fix**: Case C's blind `break` and Case B's blind group-inheritance
+  advance were both replaced with the SAME rank check Case A already
+  performs for same-window competitors (`compareRank(other, node) < 0`).
+  Case B's fix was hand-traced BEFORE implementation specifically to
+  confirm it does not reintroduce RFC NQ-2's interleaving problem (the
+  entire reason Case B's group-inheritance exists): for a genuine
+  single-author contiguous run, every member shares its anchor's own
+  replica id, so the new check is automatically satisfied whenever the
+  group's anchor already won — it only changes behavior when a chain
+  crosses an authorship/replica boundary, which isn't really "one run" to
+  begin with. Verified against a same-author run swept by a concurrent
+  competitor (contiguity preserved) and a depth-2 chain crossing an
+  authorship boundary (splits at exactly the right point, still
+  converges). Case A was explicitly hunted for a third instance of this
+  bug shape and confirmed architecturally immune — it always performs a
+  direct pairwise rank comparison, never inherits from group membership.
+
+  **The Phase 6 test-build canary was redefined, not retired**: sub-case
+  iii-d's claim being false meant its literal assertion could not be left
+  in place unchanged (either dead or actively misleading). `integrate()`
+  now ends with a general structural sanity check instead — `destIndex`
+  must remain within its own scan window `[leftIndex+1, rightIndex]`,
+  true regardless of which branch decided it, unrelated to the retired
+  claim.
+
+  **Permanent regression fixtures**: `tests/regression/R0008` (the first
+  entry in this corpus to fully satisfy Test Plan §2.3 Rule 3 — a byte-
+  exact 4-operation stream, not a post-hoc seed/log) and `R0009`. Both are
+  marked FIXED but permanently retained per Rule 2 ("entries are never
+  removed") — a corpus entry documents a bug that happened, not an open
+  issue. Full investigation timeline: the Phase 20 completed-phase entry
+  above (documented at length deliberately — this took two intensive
+  rounds of work, including one candidate fix hand-traced and found
+  unsound BEFORE being built, not after).
 
 - **A `MutationObserver`-based "did I cause this write" guard must be
   synchronous (`observer.takeRecords()` in a `finally` block), never a
@@ -3663,7 +4111,7 @@ header reads "Synced" once both windows are live.
 ```bash
 pnpm test              # Vitest, all packages EXCEPT the convergence + property suites, single run
 pnpm test:watch        # Vitest, watch mode
-pnpm test:convergence  # the convergence suite ONLY — C1-C6, 10,000 seeds each, invariants active
+pnpm test:convergence  # the convergence suite ONLY — C1-C7 (C7 added Phase 20), 10,000 seeds each, invariants active
 pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 generated cases each
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
@@ -3731,7 +4179,10 @@ validation runs actually used for most of its repeated-run confidence
 many times, and the honest DoD status this phase is actually shipping
 with).
 
-`pnpm test` currently passes: 308 tests across 37 files (up from 301/36 —
+`pnpm test` currently passes: 321 tests across 38 files (up from 308/37 —
+Phase 20 added `packages/engine/src/block.test.ts` and other new files;
+see the Phase 20 entry above for the full account, including the Engine
+Spec §6.2 sub-case iii-d correction found and fixed during this phase).
 Phase 19 added `packages/engine/src/positionIndex.test.ts`, 7 direct
 `PositionIndex` contract tests; the 10,000-seed reference cross-check
 lives separately in `positionIndex.crosscheck.test.ts`, run via `pnpm
@@ -3829,6 +4280,14 @@ Re-confirmed clean against the Phase 19 `PositionIndex`-backed engine
 (all six configs, 60,000/60,000 seeds, zero divergences) — see the Phase
 19 completed-phase entry.
 
+**Phase 20 update**: a SEVENTH config, `C7_IMMEDIATE_DELIVERY`, is now a
+permanent member of `ALL_CONFIGS` (see the Phase 20 completed-phase entry
+and the "Engine Spec §6.2 sub-case iii-d correction" entry under Key
+Technical Decisions) — the only config capable of reaching the Case B/C
+rank-violation bug class that phase found and fixed. Re-confirmed clean
+(zero divergences, all seven configs) against the merged, corrected
+engine.
+
 `pnpm test:properties` currently PASSES: 5 properties (PROP-1…5, Test
 Plan §2.5) at 10,000 fast-check-generated cases each, plus a sixth,
 independent source-grep test confirming `packages/engine/src` contains
@@ -3860,6 +4319,15 @@ mutants' `find`/`replace` text needed updating to match engine.ts's new
 source (M2, M3, M6, M9 — see the Phase 19 entry for the full account,
 including a genuine pre-existing CRLF-sensitivity bug in
 `loadMutantEngine.ts` found and fixed while re-running this).
+
+**Phase 20 update**: `M3_no_case_c`'s `find`/`replace` anchors and
+`violatedInvariant` citation were updated to match the Engine Spec §6.2
+sub-case iii-d correction's new Case C code shape (the citation changed
+from the now-retired "sub-case iii-d" to "I6, scan-window determinism" —
+see the Phase 20 entry and the Key Technical Decisions correction entry
+for the full account). Re-run result and any change in `M3_no_case_c`'s
+kill/survive status: see the Phase 20 completed-phase entry's own
+mutation-matrix paragraph.
 
 `pnpm test:index` (Phase 19) currently PASSES: 10,000/10,000 seeds, zero
 disagreements between `PositionIndex` and a linear-scan reference oracle

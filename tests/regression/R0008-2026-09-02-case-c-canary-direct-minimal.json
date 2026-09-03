@@ -1,0 +1,97 @@
+{
+  "id": "R0008",
+  "dateFound": "2026-09-02",
+  "commitAtDiscovery": "uncommitted working tree, branch phase-20-block-encoding (Phase 20 / block encoding DoD verification, in progress)",
+  "category": "fuzz-harness-direct-no-network",
+  "oneLineDescription": "Engine's Case C canary (Engine Spec §6.2 sub-case iii-d, Phase 6) fires via ORDINARY, DIRECT Engine.localInsert/localDelete/applyRemote calls — zero network, zero relay, zero browser, a single Node process. This is a DIFFERENT finding from R0001-R0007 (all E2E-CONV, real-network, ultimately attributed to a test-harness delay-injection-layer defect, not the product): this entry reproduces the identical canary assertion with NO injection layer of any kind in the path, and is confirmed IDENTICAL (same rate, same first-failing case) on the ORIGINAL Phase 3 flat-array engine.ts (pre-Phase-19), on post-Phase-19/pre-Phase-20 main, and on this Phase-20 branch — ruling out Phase 19's index and Phase 20's block encoding as the cause. Measured firing rate on a 500-trial randomized multi-replica generator: ~23-24%, not a rare edge case.",
+  "harness": "A standalone, self-contained generator (not testkit's own runTrial.ts/fuzz harness) built while adding Phase 20's snapshotBody.ts DoD test (packages/protocol/src/snapshotBody.test.ts, \"round-trips 500 randomized real Engine states\"): mulberry32(seed), 1-3 real Engine instances (replica ids 1..N), a random number of localInsert (75%, uniform random visible position, value 97+floor(rand()*26)) / localDelete (25%, uniform random visible position, count 1) calls against a uniformly-random-chosen engine each step, broadcasting the resulting Operation via applyRemote to every OTHER engine immediately after each step (fully synchronous, no delay/reorder/duplicate injection — simpler than testkit's own Fisher-Yates-shuffle delivery, which makes this a STRICT SUBSET of what testkit's harness is capable of generating).",
+  "originalTrial": {
+    "seed": 5,
+    "replicaCount": 3,
+    "opCount": 30,
+    "note": "Full 30-op trace and the resulting 21-node structure were captured during investigation; the MINIMAL reproduction below (found via single-op-removal delta-debugging, greedy repeated passes with position-clamping on removal) is the permanent fixture per Rule 3 — the 30-op trace is not separately persisted since the minimal repro below is fully equivalent and far more useful."
+  },
+  "minimalReproduction": {
+    "description": "3 replicas (ids 1, 2, 3). Exactly 4 real Operations, delivered in this order, each broadcast via applyRemote to the other two replicas immediately after being minted. The 4th operation (a local insert on replica 3) throws while integrating.",
+    "replicaIds": [1, 2, 3],
+    "operations": [
+      {
+        "mintedBy": "replica 1 (via engine.localInsert(0, 'p'.codePointAt(0)))",
+        "operation": { "kind": "insert", "id": { "c": 1, "r": 1 }, "value": 112, "originLeft": null, "originRight": null, "bind": false }
+      },
+      {
+        "mintedBy": "replica 2 (via engine.localDelete(0, 1), target resolved to id {c:1,r:1})",
+        "operation": { "kind": "delete", "id": { "c": 2, "r": 2 }, "target": { "c": 1, "r": 1 } }
+      },
+      {
+        "mintedBy": "replica 1 (via engine.localInsert(0, 'i'.codePointAt(0)) -- visible length was 0 at this point, since 'p' had just been tombstoned)",
+        "operation": { "kind": "insert", "id": { "c": 3, "r": 1 }, "value": 105, "originLeft": null, "originRight": null, "bind": false }
+      },
+      {
+        "mintedBy": "replica 3 (via engine.localInsert(1, 't'.codePointAt(0)) -- visible length was 1 (\"i\"), so this anchors immediately after it, at the true visible end)",
+        "operation": { "kind": "insert", "id": { "c": 4, "r": 3 }, "value": 116, "originLeft": { "c": 3, "r": 1 }, "originRight": null, "bind": false },
+        "throws": true
+      }
+    ],
+    "structureImmediatelyBeforeTheThrow": [
+      { "id": "3:1", "value": "i", "originLeft": null, "originRight": null, "deleted": false },
+      { "id": "1:1", "value": "p", "originLeft": null, "originRight": null, "deleted": true, "deletedBy": "2:2" }
+    ],
+    "exactError": "integrate(): Case C reached with candidate 4:3 whose destination would have moved past 1:1 — this disproves Engine Spec §6.2 sub-case iii-d (Test Plan §14.2 MUT-KILL-01)."
+  },
+  "failureType": "engine-canary-crash",
+  "handTrace": {
+    "summary": "Candidate node 4:3 (originLeft=3:1, originRight=null) integrates with leftIndex=0 (position of 3:1), rightIndex=index.size=2 (originRight null). Scan window is exactly position 1: node 1:1 ('p', tombstoned). sameOrigin(candidate.originLeft=3:1, other.originLeft=null) is FALSE (one is null, the other isn't) -> not Case A. otherOriginNode = nodeById(other.originLeft = null) = null (⊥, document-start) -> otherOriginKey is null -> the Case-B membership test (`otherOriginKey !== null && scanned.has(otherOriginKey)`) is unconditionally false whenever a scanned node's OWN originLeft is ⊥ -> falls to Case C. compareRank(other=1:1 [replica 1], node=4:3 [replica 3]) < 0 is TRUE (lower replica id outranks) -> canary fires. Root structural cause: 'p' (1:1) was originally anchored to the WIDE-OPEN window (⊥, ⊥) — nothing before or after it, Engine Spec §4.1's own \"insert at a still-empty document\" shape. After being tombstoned, a LATER, narrower-windowed insert ('i', 3:1, also anchored (⊥, ⊥) by coincidence, since the document was again empty from replica 1's own point of view) landed BEFORE it (same-replica rank tie, Case A's own `compareRank(other,node) < 0` is false for equal ranks, so destIndex never advances past a same-rank same-window predecessor) -- putting a tombstoned, WIDE-OPEN-anchored node inside what is now a much NARROWER window for a THIRD node's own scan, with no path for Case A or Case B to ever recognize the tombstone's real (wide-open, unrelated) anchor.",
+    "whyCaseCApplies": "Case C is defined as 'other's origin lies outside this conflict group entirely.' Node 1:1's own origin (⊥) can never be a member of `scanned` (only real, previously-scanned NODES are ever added to that set — ⊥ itself, a structural boundary rather than a node, is not and cannot be), so ANY node whose originLeft is ⊥ and which is reached mid-scan for a candidate whose own originLeft is NOT ⊥ will always fall through to Case C, regardless of that node's actual rank relative to the candidate."
+  },
+  "convergenceImpact": {
+    "question": "Does the UNMUTATED, real algorithm (Case C's break firing, canary aside -- the canary never changes control flow, it only observes and throws) actually converge to different TEXT across replicas that receive these same 4 operations in different orders, or only different STRUCTURE?",
+    "method": "The same 4 real Operation objects (recorded above) were delivered via applyRemote, in three different orders, to three independent fresh Engine instances: (A) natural order 1,2,3,4 -- using a throwaway scratch copy of engine.ts with ONLY the canary's `throw` statement disabled (never the real repository file) to observe what the real, unmutated `break` produces uninterrupted; (B) reversed order 4,3,2,1 (op4 buffers on originLeft, drains once op3 arrives; op2 buffers on target, drains once op1 arrives); (C) order 3,1,4,2.",
+    "results": {
+      "textConvergence": "IDENTICAL across all three orders: \"it\" in every case. Visible/materialized text convergence HOLDS for this input.",
+      "structuralConvergence": "DOES NOT HOLD. Engine A' (order 1,2,3,4): [3:1 'i', 4:3 't', 1:1 'p'(deleted)] -- i.e. [i, t, p]. Engines B and C (orders 4,3,2,1 and 3,1,4,2): both [1:1 'p'(deleted), 3:1 'i', 4:3 't'] -- i.e. [p, i, t], identical to each other but STRUCTURALLY DIFFERENT from A' (the tombstoned node 'p' sits in a different position relative to the two visible characters, purely as a function of delivery order).",
+      "conclusion": "For THIS EXACT 4-op input alone, text still matched across delivery orders. See followUpOperationImpact below: that turned out NOT to be the end of the story."
+    }
+  },
+  "followUpOperationImpact": {
+    "question": "Starting from the three already-structurally-divergent replicas above (A': [i,t,p]; B/C: [p,i,t], all text=\"it\"), does ONE MORE operation that anchors (as originLeft and/or originRight) to the tombstoned node 1:1 ('p') — delivered to all three — still converge to the same text, or does it finally produce a visible divergence?",
+    "method": "Four variant follow-up InsertOperations (id {c:5,r:9}, distinct marker characters X/Y/Z/W) were each delivered via applyRemote to all three already-divergent replicas (rebuilt fresh each time from the same 4-op histories above, in the same three delivery orders). Where the REAL engine's canary fired on the follow-up itself, the canary-disabled scratch copy was used to observe the completed result (same justification as above: the canary never changes control flow).",
+    "variants": [
+      {
+        "op": "originLeft=1:1(p), originRight=null",
+        "resultPerReplica": { "A'(1,2,3,4)": "\"itX\"", "B(4,3,2,1)": "\"Xit\" (follow-up itself threw the canary on B/C; canary-disabled copy used to complete)", "C(3,1,4,2)": "\"Xit\" (same)" },
+        "converged": false
+      },
+      {
+        "op": "originLeft=null, originRight=1:1(p)",
+        "resultPerReplica": { "A'(1,2,3,4)": "\"itY\"", "B(4,3,2,1)": "\"Yit\"", "C(3,1,4,2)": "\"Yit\"" },
+        "converged": false
+      },
+      {
+        "op": "originLeft=1:1(p), originRight=3:1(i)",
+        "resultPerReplica": { "A'(1,2,3,4)": "\"itZ\"", "B(4,3,2,1)": "\"Zit\"", "C(3,1,4,2)": "\"Zit\"" },
+        "converged": false
+      },
+      {
+        "op": "originLeft=4:3(t), originRight=1:1(p)",
+        "resultPerReplica": { "A'(1,2,3,4)": "\"itW\"", "B(4,3,2,1)": "\"itW\"", "C(3,1,4,2)": "\"itW\"" },
+        "converged": true,
+        "note": "The one variant that converges anchors its originLeft to 4:3 ('t'), which happens to sit in the SAME relative position (rightmost) in both structural variants -- it never actually needs to consult 1:1's own position to place itself. This is not evidence the bug is narrow; it's evidence that whether a GIVEN follow-up op is affected depends on whether its own anchor happens to route through the divergent node, which is exactly the kind of thing that is not under any single user's control in a real multi-user document."
+      }
+    ],
+    "verdict": "YES -- CONFIRMED, REAL, VISIBLE TEXT DIVERGENCE. 3 of 4 tested follow-up variants (any that anchors to the tombstoned node itself, either side) produce genuinely different materialized text on different replicas: \"itX\"/\"Xit\", \"itY\"/\"Yit\", \"itZ\"/\"Zit\" -- not a cosmetic, permanently-invisible structural artifact. The structural divergence documented above is a LIVE, LOADED precondition: it costs nothing on its own (text still matches), but the very next operation that happens to reference the divergently-positioned tombstoned node -- something entirely ordinary (any insert whose neighbor at insertion time was, or is adjacent to, a recently-deleted character) -- can and does break this project's core PRD promise (\"any two replicas... converge to byte-identical document... regardless of network delay, duplication, or reorder\"). This is not an overly-strict assertion catching a benign case; the canary is correctly flagging a genuine, exploitable path to a convergence failure."
+  },
+  "verifiedNotARegression": {
+    "method": "git worktree add against two prior commits, no changes to the working tree: 88b3fec (pre-Phase-19, original flat-array engine.ts) and main@d18d658 (post-Phase-19 index, pre-Phase-20 blocks). The identical 500-trial generator (seed 0..499) was run against both via `tsx`, with no engine.ts modifications.",
+    "results": {
+      "pre-Phase-19 (88b3fec)": "117/500 fired (23.4%), first at trial 5, identical candidate/other ids (30:3 / 10:2 in the original 30-op un-minimized trial) and identical error text.",
+      "main post-Phase-19 pre-Phase-20 (d18d658)": "117/500 fired (23.4%), first at trial 5, byte-identical to pre-Phase-19.",
+      "this Phase-20 branch": "~119/500 fired (~23.8%) on the same generator embedded in snapshotBody.test.ts (the 2-trial difference is fully explained by that test's generator ALSO catching failures during a later snapshot-replay phase these two standalone scripts don't exercise, not by any behavioral difference in Case A/B/C itself)."
+    },
+    "conclusion": "Confirmed NOT a Phase 19 or Phase 20 regression. This is a pre-existing property of the original Phase 3 integrate() algorithm, unchanged since Phase 3, present in every version of this codebase this project has ever shipped."
+  },
+  "unconditionalInProduction": "The canary's `throw` has NO environment gate anywhere in engine.ts (verified: no process.env/NODE_ENV/similar check near it) -- it runs in every build, including a hypothetical production build, not just test builds. Its own comment header calls it a 'test-build canary' but nothing in the code actually restricts it to test builds.",
+  "relatedEntries": ["R0001", "R0002", "R0003", "R0004", "R0005", "R0006", "R0007"],
+  "relatedEntriesNote": "Same underlying assertion (Engine Spec §6.2 sub-case iii-d's canary), but a DIFFERENT and independently significant finding: R0001-R0007 all required a real-network delay-injection layer in the path and were ultimately attributed entirely to a defect in that test-infrastructure layer, not the product (see tests/regression/README.md's FINAL RESOLUTION). This entry reproduces the SAME assertion with NO network, NO relay, NO browser -- a single in-process Node script calling Engine methods directly -- which the FINAL RESOLUTION's own conclusion ('SyncClient, gateway.ts, and Engine show no abnormal behavior... the failure has never once reproduced without an added relay/interception hop') does not account for. This entry is evidence that the underlying Case A/B/C reachability question is real and unresolved at the product level, independent of whatever else was happening in the R0001-R0007 network scenarios.",
+  "status": "FIXED (2026-09-03). Root cause: Engine Spec §6.2 sub-case iii-d, AS LITERALLY WRITTEN in the approved Engine Specification (line 17's 'c.originLeft ≠ ⊥' conjunct), is incorrect -- confirmed via hand-trace against the spec's own pseudocode, not an implementation deviation. Fix (Approach 1, referred to in this project's own history as the R0008 fix): Case C's unconditional break is replaced with the same rank check Case A/B already perform -- see engine.ts's integrate(), the Case C branch comment citing this correction. Verified via exhaustive delivery-order permutation of this entry's minimal repro (with a corrected, non-confounded replica-id assignment -- see R0009's own discoveryNote for why the ORIGINAL replica-id choice above needed no change but a naive 'quick fix' verification attempt built afterward initially was flawed), all 22 adversarial cases, all worked traces (§10.1/§10.3/§10.5/§10.7), all 5 property suites, and a 30,000-trial immediate-delivery fuzz run (5,000 seeds x 6 configs) -- zero failures. This fix ALONE was later found to be INCOMPLETE: validating it surfaced a second, structurally distinct gap in Case B (R0009), fixed as part of the SAME investigation, same day. Both fixes are required together; see R0009 for the second half. Permanently retained in this corpus per Test Plan §2.3 Rule 2 (never removed) even though fixed. Full writeup: CLAUDE.md's \"Engine Spec §6.2 sub-case iii-d correction\" entry."
+}

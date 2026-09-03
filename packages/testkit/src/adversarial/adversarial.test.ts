@@ -515,10 +515,16 @@ describe("Adversarial suite — Engine-derived group (ADV-14…ADV-22)", () => {
       expect(counters[i]).toBe(i + 1); // exactly 1..3000, no gaps — Invariant I0
     }
 
-    // Engine Spec §7.5's block run-length encoding represents one run of
-    // N consecutive (counter, replica) pairs as a single block descriptor
-    // instead of N individual identifiers — a compression ratio of N:1.
-    const compressionRatio = N / 1;
+    // Engine Spec §7.5's block run-length encoding represents one run of N
+    // consecutive (counter, replica) pairs as a single block descriptor
+    // instead of N individual identifiers. As of Phase 20, this is a REAL
+    // measurement against the live engine's own block storage
+    // (`engine.blockCount`, PositionIndex's diagnostic getter) — not the
+    // hardcoded `N / 1` placeholder this test used before block encoding
+    // existed (Phase 6-era: block-aware serialization wasn't built yet, so
+    // this ratio couldn't be measured for real).
+    expect(engine.blockCount).toBe(1);
+    const compressionRatio = N / engine.blockCount;
     expect(compressionRatio).toBeGreaterThan(1000);
   });
 });

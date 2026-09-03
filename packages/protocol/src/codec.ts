@@ -64,7 +64,13 @@ function readAndCheckSeq(reader: ByteReader, direction: "clientOrigin" | "server
 }
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM: true — without it, TextDecoder silently STRIPS a leading U+FEFF as if it were a
+// byte-order mark, corrupting OP_INSERT_RUN's `values` whenever the run's first scalar
+// legitimately IS U+FEFF (a real, valid Unicode scalar value, Engine Spec §2.3). Found while
+// building Phase 20's block-aware SNAPSHOT body encoder (same `String.fromCodePoint`/
+// `TextDecoder` pattern, snapshotBody.ts) — a pre-existing, unrelated-to-Phase-20 bug in this
+// file too, fixed here since the same one-line cause and fix apply identically.
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 // --- per-message-type payload codecs ----------------------------------------
 
