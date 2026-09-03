@@ -55,9 +55,27 @@ export interface HelloMessage {
   readonly documentId: string;
   /** Opaque bytes from a later auth phase (Phase 29) — accepted, never validated, this phase. */
   readonly ticket: Uint8Array;
-  /** 0 for a fresh connection — this phase only handles fresh connections (reconnection/CATCHUP is Phase 23). */
+  /**
+   * 0 for a client's very first-ever connection. As of Phase 22, a
+   * reconnecting/restarting client with durably-persisted queue state
+   * (API Spec §7.9's `meta.lastServerSeq`) reports the last value it
+   * confirmed, read back BEFORE this HELLO is sent — the server does not
+   * yet act on it either way (true CATCHUP/delta-sync is Phase 23), so
+   * this remains observational until then.
+   */
   readonly lastServerSeq: number;
-  /** Origin stamps only. Always empty this phase (fresh connections only). */
+  /**
+   * Origin stamps of every operation this client has queued but not yet
+   * had acknowledged — always empty before Phase 22. As of Phase 22, a
+   * client restored from a durable queue (a prior page load that crashed
+   * or closed mid-edit) reports the full restored set here, per API Spec
+   * §7.9 ("on document open, read before connecting so HELLO.unacked is
+   * complete") — the server still does not act on this field (no
+   * session/replica resumption exists, Phase 8/9's deliberate design; see
+   * `packages/client/src/sync/reconcileOfflineQueue.ts` for how those
+   * operations actually reach the document instead), so it remains
+   * observational, same as `lastServerSeq` above.
+   */
   readonly unacked: readonly Identifier[];
   readonly clientCapabilities: number;
 }
@@ -117,7 +135,18 @@ export interface SnapshotMessage {
   readonly body: Uint8Array;
 }
 
-/** Client's post-handshake acknowledgment (§3.6.8, C→S). `resentCount` is always 0 for a fresh connection this phase — resend/reconciliation is Phase 23. */
+/**
+ * Client's post-handshake acknowledgment (§3.6.8, C→S). `resentCount` is
+ * always 0 through Phase 21. As of Phase 22, a client with a non-empty
+ * durable/in-memory unacked queue reports how many operations it just
+ * RE-MINTED (not literally resent — a fresh SNAPSHOT always carries a new
+ * replica id, so the original identities can never be resent as-is; see
+ * `packages/client/src/sync/reconcileOfflineQueue.ts`) and sent as part of
+ * this same handshake. Server-side CATCHUP/ALREADY_HAVE (§3.6.4-§3.6.7,
+ * Phase 23) is a different mechanism — a delta sync FROM the server — and
+ * remains unbuilt; this field's Phase 22 meaning is purely "how many
+ * client-originated ops accompanied this SYNC_COMPLETE."
+ */
 export interface SyncCompleteMessage {
   readonly kind: "syncComplete";
   readonly lastServerSeq: number;

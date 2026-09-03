@@ -13,7 +13,9 @@
     "test:e2e:build": "node e2e/build-bundle.mjs",
     "test:e2e": "pnpm run test:e2e:build && playwright test",
     "test:e2e:install": "playwright install chromium firefox webkit",
-    "test:e2e:conv": "playwright test --project=convergence"
+    "test:e2e:conv": "playwright test --project=convergence",
+    "test:e2e:durableQueue": "playwright test --project=durableQueue",
+    "test:benchmark": "vitest run --config vitest.benchmark.config.ts"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*",
@@ -29,6 +31,7 @@
     "@types/react-dom": "^18.3.1",
     "@types/ws": "^8.5.12",
     "esbuild": "^0.24.0",
+    "fake-indexeddb": "^6.2.5",
     "fast-check": "^4.9.0",
     "jsdom": "^25.0.1",
     "typescript": "^5.6.3",

@@ -86,6 +86,34 @@ export class SequenceGapTracker {
     }
   }
 
+  /**
+   * Records "the connection is alive," WITHOUT advancing `value`/
+   * `gapOpen` — a received PONG (§3.6.11) proves the socket is genuinely
+   * healthy even though it carries no `seq` of its own and, unlike an OPS
+   * frame, is not evidence about SEQUENCE progress specifically.
+   *
+   * Found necessary (not anticipated in advance) by Phase 22's own DUR-07
+   * e2e test: a real two-client session that is completely idle — nobody
+   * editing anything — for 5+ seconds previously had EVERY connected
+   * client force-close and reconnect, repeatedly, forever, because
+   * `hasStalled()`'s clock only ever advanced on `observe()`
+   * (an inbound OPS frame) — and if nobody edits anything, no OPS frame
+   * ever arrives, regardless of how healthy the connection actually is.
+   * This is the exact same class of false-positive Phase 14's own
+   * redesign of this file fixed for "this client's own excluded
+   * operations" — a real, present cause of forward progress (the
+   * connection being alive) was not recognized as such. `SyncClient`
+   * calls this from its PONG handler (`handleControl`), which already
+   * fires every `PING_INTERVAL_MS` (3s) on any genuinely live connection
+   * — comfortably inside `GAP_RECONNECT_TIMEOUT_MS` (5s), so a real
+   * stall (the server truly stops responding to PING too) still reaches
+   * `hasStalled()` correctly; only the "nothing to say, but still
+   * listening" case no longer does.
+   */
+  markAlive(now: () => number = Date.now): void {
+    this.lastAdvanceAtMsValue = now();
+  }
+
   /** Re-seeds tracking after a fresh SNAPSHOT (a new document state, seq-numbered from scratch as far as this client is concerned) — clears any open gap and resets the stall clock. */
   reset(newLastServerSeq: number, now: () => number = Date.now): void {
     this.lastServerSeq = newLastServerSeq;

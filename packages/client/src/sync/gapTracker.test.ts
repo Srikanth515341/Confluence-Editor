@@ -97,4 +97,36 @@ describe("SequenceGapTracker (API Spec §3.7.5, corrected Phase 14 — see this 
       expect(tracker.hasStalled(() => now)).toBe(false);
     });
   });
+
+  describe("markAlive — a received PONG counts as forward progress too (Phase 22 fix)", () => {
+    it("prevents a false stall during a genuinely idle-but-healthy session (found by Phase 22's own DUR-07 e2e test)", () => {
+      let now = 0;
+      const tracker = new SequenceGapTracker(0, () => now);
+      // Nobody edits anything for well over the stall threshold — but a PONG keeps arriving on
+      // the normal 3s ping cadence, well inside GAP_RECONNECT_TIMEOUT_MS (5s).
+      for (let i = 0; i < 10; i++) {
+        now += 3_000;
+        tracker.markAlive(() => now);
+        expect(tracker.hasStalled(() => now)).toBe(false);
+      }
+    });
+
+    it("does NOT advance value or clear hasGap — markAlive is purely a liveness signal, not sequence progress", () => {
+      const now = 0;
+      const tracker = new SequenceGapTracker(5, () => now);
+      tracker.observe(9, () => now); // opens an informational gap
+      expect(tracker.hasGap).toBe(true);
+      tracker.markAlive(() => now);
+      expect(tracker.value).toBe(9); // unchanged
+      expect(tracker.hasGap).toBe(true); // unchanged — markAlive is not observe()
+    });
+
+    it("a genuine stall (the server truly stops responding, PONGs included) is still detected", () => {
+      let now = 0;
+      const tracker = new SequenceGapTracker(0, () => now);
+      tracker.markAlive(() => now);
+      now = GAP_RECONNECT_TIMEOUT_MS;
+      expect(tracker.hasStalled(() => now)).toBe(true); // no further markAlive/observe calls since t=0
+    });
+  });
 });

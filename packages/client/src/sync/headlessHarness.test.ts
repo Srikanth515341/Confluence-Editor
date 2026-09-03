@@ -54,9 +54,18 @@ describe("Headless SyncClient pair against the real server", () => {
     pair.a.state.subscribe((s) => statesA.push(s));
     pair.b.state.subscribe((s) => statesB.push(s));
 
-    // Some activity before the crash, just to prove there WAS a live session — Phase 8/9's
-    // server has no persistence, so this content does NOT need to (and will not) survive the
-    // restart below; only post-reconnect convergence is asserted.
+    // Some activity before the crash. Through Phase 21, this content did NOT need to (and did
+    // not) survive the restart below — the server has no persistence, and there was no
+    // client-side mechanism to recover it either. As of Phase 22 (API Spec §7.9's durable
+    // queue), this insert is queued as unacked BEFORE it's sent (never acked by the now-dead
+    // server), and `SyncClient.handleSnapshot`'s reconcile step (reconcileOfflineQueue.ts)
+    // RE-MINTS it against the fresh post-reconnect engine and resends it — so it now DOES land
+    // in the final document, under a brand-new identity (the new server assigns a new replica
+    // id; see reconcileOfflineQueue.ts's own header comment for why the content, not the
+    // original operation identity, is the guarantee that matters). Asserted below via the total
+    // character count (51, not 50) rather than by re-deriving the whole workload's expected
+    // string, since exactly where 'x' lands relative to the 50 workload characters is an
+    // implementation detail of reconcile timing, not something this test needs to pin down.
     pair.a.localInsert(0, 0x78); // 'x'
 
     await server!.close();
@@ -83,7 +92,10 @@ describe("Headless SyncClient pair against the real server", () => {
     expect(replicaIdBeforeA).not.toBeNull();
 
     const text = await runConvergenceWorkload(pair, 50);
-    expect(text).toHaveLength(50);
+    // 50 workload characters + the pre-crash 'x', now durably preserved and reconciled through
+    // the reconnect (Phase 22) — see this test's own comment above the pre-crash insert.
+    expect(text).toHaveLength(51);
+    expect(text).toContain("x");
     expect(pair.a.engine?.text()).toBe(pair.b.engine?.text());
 
     pair.a.disconnect();

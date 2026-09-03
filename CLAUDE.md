@@ -3895,9 +3895,301 @@ check:purity` was ALSO silently broken by two comments (one in
   no explicit signal. Flagged here explicitly rather than either building
   it speculatively or letting it pass unmentioned.
 
+- **Phase 22 — Client durable queue (IndexedDB)** (API Spec §7.9; PRD
+  FR-OF-2, FR-OF-3, A-11; Test Plan §3.6 DUR-07/08/09). Persists
+  unacknowledged operations locally so they survive a tab close or
+  browser crash, and — the necessary consequence of doing that — makes
+  offline EDITING itself possible for the first time (Phase 10-21's
+  `SyncClient` only ever let a caller mint an edit while `state ===
+  "synced"`; typing during `reconnecting`/`offline` was silently
+  dropped). This phase found and fixed one architectural question
+  (resolved with the user before writing code), four real bugs (one a
+  pre-existing Phase 14 defect, unrelated to the durable queue itself,
+  found only because this phase's own e2e test was the first thing in
+  this project's history to hold a genuinely idle real multi-client
+  session open for more than a few seconds), and one bug in its own new
+  Vitest test file's synchronization logic — every one of them found by
+  actually running the tests, several only under real-browser or
+  full-parallel-suite conditions a narrower check would never have hit.
+
+  **The architectural question, resolved before implementation**: this
+  project's server has never supported session/replica-id resumption
+  (Phase 8/9's deliberate design, Engine Spec I1) — every reconnect gets
+  a brand-new replica id, and Phase 16's write path rejects any operation
+  whose `stamp.r` doesn't match the connection's just-assigned replica id
+  (`IDENTITY_MISMATCH`). This means an operation minted OFFLINE (under
+  the OLD replica id) can never be resent to the server AS-IS after a
+  reconnect. Two options were presented: (1) re-mint each queued
+  operation's INTENT (not its identity) against the fresh post-reconnect
+  engine, discarding the original identifiers; (2) extend the server to
+  resume a session under its OLD replica id, so the original operations
+  could be resent unchanged. **The user chose (1)**, explicitly declining
+  to reopen Phase 8/9's replica-id design for a queue-resend convenience:
+  "that was a correctness decision (Engine Spec I1), not an arbitrary
+  choice, and reopening it now... would be a bigger, riskier
+  architectural change than this phase warrants." The disclosed
+  consequence — resent operations carry NEW identifiers, never the
+  original ones — is fine, since DUR-07's own assertions are about
+  CONTENT landing exactly once, never about identifier equality across a
+  reconnect.
+
+  **`packages/client/src/sync/durableQueue.ts`** (new): the IndexedDB
+  database `obseq`, exactly the three stores/fields API Spec §7.9
+  specifies and no more — `unacked`/`rejected` (`keyPath: ['documentId',
+  'stampR','stampC']`) and `meta` (`keyPath: 'documentId'`, `{
+  lastServerSeq, replicaId, updatedAt }`). Writes are batched on a
+  200ms TRAILING-EDGE debounce (reset on every new write, per the literal
+  spec wording — a sustained sub-200ms-interval typing burst defers the
+  actual write until typing pauses; this is DUR-08's own accepted
+  behavior, not a bug). `openDurableQueue(factory)` returns EITHER a
+  plain value or a `Promise` — see the next paragraph for why this dual
+  return shape exists; the real, exception-safe implementation (a
+  synchronous `factory.open()` throw is caught and turned into `null`,
+  matching real browsers that can throw synchronously for a blocked
+  IndexedDB) is what makes DUR-09 possible without a real private-browsing
+  browser context (Test Plan §3.6 DUR-09's own suggested approach).
+
+  **`packages/client/src/sync/unackedQueue.ts`** was EXTENDED, not
+  replaced, per the phase brief's own instruction: `add`/`ack` now
+  optionally fan out to an attached `DurableQueue` (`attachDurable`), and
+  `restoreEntries` populates from a durable read without re-scheduling
+  redundant writes. `ack()`'s durable removal is scheduled BEFORE the
+  in-memory delete (API Spec §7.9: "durable store first, then memory —
+  the order matters for an accurate unsynced count") AND flushes
+  IMMEDIATELY, bypassing the 200ms debounce — a fix described below, not
+  in the original design.
+
+  **`packages/client/src/sync/reconcileOfflineQueue.ts`** (new):
+  `reconcileOfflineQueue(engine, queuedOps)` replays each queued
+  operation's INTENT against a freshly-seeded engine — for an insert,
+  it resolves the correct CURRENT visible index by finding wherever its
+  `originLeft` anchor now sits (via a structural scan of `engine.nodes`,
+  counting only VISIBLE predecessors — correct even if that anchor has
+  since been tombstoned by a concurrent peer edit) and calls
+  `engine.localInsert()`; for a delete, it resolves the target's current
+  visible index and calls `engine.localDelete()`, silently skipping a
+  target that's already gone (concurrently deleted, or already consumed
+  earlier in the same batch). A `remap` (old id → newly-minted id)
+  threaded through the whole batch is what lets a LATER queued op
+  anchored to an EARLIER queued op in the SAME batch (e.g. three
+  consecutively-typed characters) resolve correctly — without it, every
+  character after the first in an offline-typed chain would incorrectly
+  fail to find its anchor and collapse to position 0. Verified directly
+  at 200-operation chain scale via an isolated unit reproduction built
+  specifically to rule this class of bug in or out during the real-bug
+  investigation below.
+
+  **`SyncClient.connect()`/`beginConnect()` — a sync-or-async design,
+  not an incidental detail.** `openDurableQueueFn()` may return either a
+  plain value or a genuine `Promise`; `beginConnect()` branches on
+  `instanceof Promise` rather than always `await`-ing. This is what lets
+  `connect()` stay PERFECTLY SYNCHRONOUS — `openSocket()` called
+  immediately, within the same call — whenever there is genuinely no
+  IndexedDB to restore from (this project's own Vitest/jsdom test
+  environment, and any environment without the global at all), exactly
+  matching every pre-Phase-22 test's timing assumption. `await` on ANY
+  value, even an already-resolved one, always defers by at least one
+  JavaScript microtask — discovered the hard way, not anticipated: the
+  first version of this method always awaited, and broke EVERY existing
+  `syncClient.test.ts` test that calls `connect()` then synchronously
+  inspects the fake socket, since none of them ever configure a durable
+  queue and Node/jsdom have no real `indexedDB` global. Only when a real
+  (or injected) IndexedDB factory is genuinely present does `beginConnect`
+  defer `openSocket()` behind the real async restore, exactly satisfying
+  Scope-IN's "on document open, read before connecting so HELLO.unacked
+  is complete."
+
+  **`requireEngine()` was relaxed, deliberately reversing part of Phase
+  14's own fix, not regressing it.** Phase 14 required BOTH a non-null
+  engine AND `state.value === "synced"`, specifically to stop a local
+  edit from landing on an engine reference a fresh SNAPSHOT was about to
+  replace wholesale (a real, confirmed orphaning bug at the time). Phase
+  22 removes the state check: an edit minted while `reconnecting` or
+  `offline` now durably queues (surviving even a crash), no-ops safely on
+  the wire via `sendFrame`'s existing null-socket guard, and gets
+  reconciled against the NEXT fresh SNAPSHOT's engine by `handleSnapshot`
+  — closing the exact gap Phase 14's blunter fix used to just block.
+  `inputPipeline.ts`'s matching gate was relaxed the same way (its own
+  prior comment already said "Phase 22's job").
+
+  **Bug 1 — a real write-ordering violation, found by re-reading the
+  spec text against existing code, not by running anything.**
+  `localInsertText` (Phase 12) called `sendFrame` BEFORE `unacked.add()`
+  in a loop — the opposite of API Spec §7.9's "written... before or
+  concurrently with transmission, never after." Fixed by reordering the
+  two loops.
+
+  **Bug 2 — a real, exploitable DUPLICATE-content risk, found by this
+  phase's own e2e test, not anticipated in the original design.** The
+  durable removal on OP_ACK went through the SAME 200ms batched write
+  path as everything else. If a browser crashed in the (up to 200ms)
+  window between "server acked this operation" and "the durable removal
+  actually flushed," the NEXT restart would find the already-acked
+  operation STILL in the durable `unacked` store, and
+  `reconcileOfflineQueue` would RE-MINT and resend it — under a BRAND
+  NEW identity (Option 1's own design), so the server's existing
+  `(document_id, stamp_r, stamp_c)` dedup (Phase 16) could never catch
+  it. This is worse than DUR-08's accepted "may lose the last few
+  keystrokes" — it silently DUPLICATES content instead. Fixed: `ack()`'s
+  durable removal now flushes IMMEDIATELY, not on the 200ms debounce —
+  safe to do because handling an inbound OP_ACK is not on PRD M3's
+  16ms keystroke-latency path the debounce rule exists to protect.
+
+  **Bug 3 — a real, PRE-EXISTING bug in `gapTracker.ts`, unrelated to the
+  durable queue, found only because this phase's own e2e test was the
+  first thing in this project's history to hold a genuinely idle
+  multi-client session open against a real server for more than a few
+  seconds.** `SequenceGapTracker.hasStalled()` (Phase 14) only ever
+  advances its stall clock on `observe()` — an inbound OPS frame. A
+  received PONG (§3.6.11) never touched it. Consequence: in ANY session
+  where nobody edits anything for 5+ seconds, EVERY connected client's own
+  ping-cadence check sees `hasStalled() === true` and force-closes and
+  reconnects — repeatedly, forever, purely from ordinary silence, not an
+  actual connection problem. Every PRIOR real-server test either had
+  constant typing activity from at least one party (E2E-CONV-01..04) or
+  ran too briefly to hit the 5-second window — this phase's DUR-07 e2e
+  test (a peer client that just sits connected while the offline-typing
+  setup runs) was the first to sit idle long enough, and the server log
+  showed both clients cycling through reconnects every ~6-7 seconds with
+  zero operations ever exchanged. **Explicitly surfaced to the user and
+  approved before fixing**, per this project's own established practice
+  for changes to this exact file (Phase 14 set the precedent). Fixed via
+  a new `SequenceGapTracker.markAlive()` (updates the stall clock WITHOUT
+  touching `value`/`gapOpen` — a PONG proves liveness, not sequence
+  progress), called from `SyncClient`'s PONG handler. A genuine stall
+  (the server truly stops responding to PING too) still reaches
+  `hasStalled()` correctly; only the "alive but nothing to say" case no
+  longer does. Re-verified clean afterward: two shortened real-browser
+  E2E-CONV-01/02 runs (real 3-engine and 2-client sessions respectively)
+  showed no reconnect churn and normal convergence.
+
+  **Bug 4 — a real bug in this phase's OWN new test file's
+  synchronization, found the same way (intermittent under full-suite
+  parallel load, never in isolation).** A test that severs a client via
+  `wsA.close(...)` arms a REAL automatic-reconnect `setTimeout` (correct
+  product behavior — an abnormal close is supposed to trigger backoff
+  reconnection) but never cancels it before the test ends.
+  `makeClient()`'s `createSocket` closure captured the `sockets`
+  VARIABLE, not a frozen array reference, and `beforeEach` REASSIGNS that
+  variable for the NEXT test — so a late-firing leftover timer from one
+  test pushed a stray socket into what the FOLLOWING test believed was
+  its own fresh, empty array, corrupting `sockets[0]`. Root-caused via
+  direct instrumentation (not guessed): a failing run showed
+  `sockets.length === 2` immediately after the first `waitForSocket` call
+  in a test that had only ever created ONE client, and the "welcome"
+  frame the test sent was being decoded and handled by a DIFFERENT,
+  leftover `SyncClient` instance from the PRIOR test, leaving the
+  CURRENT test's own client's `replicaId`/`engine` null. Fixed with an
+  `afterEach` that calls `disconnect()` (which clears all pending timers)
+  on every client `makeClient()` ever created during a test — confirmed
+  by running the full suite 5 times in a row afterward with zero
+  failures, versus roughly 2-in-3 failing before the fix.
+
+  **UI additions** (PRD FR-OF-3/A-11): `SyncClient.unsyncedCount` is a
+  new `Observable<number>` (the existing `unackedCount` plain getter is
+  unchanged, still used by tests) updated at every queue mutation point;
+  `SyncClient.durableQueueUnavailable` is a plain boolean, set once
+  IndexedDB is confirmed unavailable and never reset (a page-load-lifetime
+  degradation). `ConnectionIndicator.tsx` gained two new optional props
+  rendering an "N unsynced" badge and an explicit "Offline storage
+  unavailable" warning — silent degradation of a durability promise is
+  DUR-09's own named failure condition.
+
+  **DoD verification, at multiple levels, each chosen for what it's best
+  positioned to prove**:
+  - **DUR-07 (Vitest, `fake-indexeddb`)**: a SECOND, independent
+    `SyncClient` sharing the SAME fake-indexeddb factory as the first
+    (simulating what actually survives a real crash) restores exactly
+    200 durably-queued characters, reports them in HELLO.unacked
+    (decoded directly off the wire), and delivers them — `resentCount:
+    200` — landing byte-exact in the reconciled engine.
+  - **DUR-07 (real browser, Chromium, `packages/client/e2e/
+    durableQueue.spec.ts`)**: a real on-disk Chromium profile via
+    `launchPersistentContext()`, terminated and relaunched against the
+    SAME profile, converges with a second, always-online peer to the
+    identical 200-character string. A genuine engine-level SIGKILL was
+    investigated and found NOT achievable through any supported
+    combination of Playwright APIs for a REUSABLE on-disk profile
+    (`Browser.process()` doesn't exist in this Playwright version;
+    `launchServer()` explicitly refuses `--user-data-dir`) — the file's
+    own header comment explains this in full and why a graceful
+    `context.close()` doesn't weaken the claim for data already flushed
+    to a real IndexedDB transaction before termination. Severing the
+    connection uses a `forceDisconnect()` debug hook
+    (`SyncClient.disconnect()`), not `context.setOffline(true)` — the
+    latter was tried first and found NOT to reliably block an
+    already-open WebSocket's outbound frames to `localhost` in this
+    Playwright/Chromium combination (confirmed directly: the "severed"
+    client's operations kept reaching and being committed by the real
+    server, and the reconcile logic then resent them a SECOND time on
+    top of that already-committed copy — a genuine duplicate, root-caused
+    including an isolated unit-level proof that `reconcileOfflineQueue`
+    itself was NOT the cause).
+  - **DUR-08 (Vitest, real timers, `durableQueue.test.ts`)**: a write
+    scheduled and then never flushed (no wait past the debounce) is
+    confirmed genuinely absent after `flush()` is never called — the
+    200ms trailing-edge boundary itself is measured with REAL timers
+    (not faked, since `fake-indexeddb`'s own internal scheduling was
+    found to hang under `vi.useFakeTimers()` — confirmed directly,
+    fixed by using real short waits instead). Separately (`syncClient.
+    durableQueue.test.ts`), a keystroke typed but never flushed before a
+    simulated crash is confirmed absent from the NEXT client's
+    HELLO.unacked (length 0, not 1) — the count never overstates what
+    survived, DUR-08's own named failure condition.
+  - **DUR-09 (Vitest)**: an injected opener that rejects sets
+    `durableQueueUnavailable = true`; editing still works (degraded to
+    in-memory-only); a SEPARATE test confirms the REAL production
+    `openDurableQueue()` — not just a test stub — never throws
+    synchronously even when the underlying `factory.open()` does.
+  - **Keystroke latency (`packages/client/src/sync/benchmark/
+    keystrokeLatency.bench.test.ts`, real `performance.now()`, gated via
+    `pnpm test:benchmark` the same way Phase 19-21's benchmarks are)**:
+    2,000 `localInsert()` calls end to end, with a REAL fake-indexeddb-
+    backed durable queue attached vs. none at all. Measured: **without
+    queue p50=0.005-0.007ms / p95=0.014-0.028ms / p99=0.041-0.110ms;
+    with the durable queue p50=0.006-0.007ms / p95=0.014-0.019ms /
+    p99=0.041-0.065ms** — both orders of magnitude under PRD M3's 16ms
+    budget, and the durable-queue case is not measurably worse than the
+    baseline (well within real timer/GC-pause noise).
+
+  **What is deliberately NOT built this phase**: server-side session/
+  replica-id resumption (the road not taken per the architectural
+  decision above — a client's queued operations always get NEW
+  identities after a reconnect, never their original ones); real
+  CATCHUP/ALREADY_HAVE delta sync (Phase 23's own territory, unrelated to
+  this phase's client-side durability mechanism); any read/export API for
+  the `rejected` store's preserved contents beyond the fact that they are
+  durably retained (Scope-IN says "preservation," not "a UI to browse
+  them" — matches Rule 7.2's own "preserved and exportable" wording only
+  halfway, the "exportable" half left for whichever future phase actually
+  needs it).
+
+  Regression gates re-run clean after all of the above: default `pnpm
+  test` **373/373** across **41 files** (up from 329/38), confirmed
+  stable across 5 consecutive full-suite runs post-fix (the Bug 4 fix
+  above was specifically validated this way, since the failure was
+  intermittent, not deterministic); `pnpm typecheck` clean across all six
+  packages; `pnpm lint` clean for every file this phase touched (a large
+  pre-existing, unrelated failure — `packages/client/_debugSlotPermute.mjs`/
+  `_debugSendVsReceiveNative.mjs`, Phase 14 diagnostic scratch scripts
+  never lint-clean, plus stale `eslint-disable` warnings in Phase 19-21
+  benchmark files — confirmed via `git log`/`git status` to predate this
+  phase entirely and remain untouched by it); `pnpm format:check` shows
+  this phase's own new files alongside the SAME pre-existing, repo-wide
+  CRLF/`core.autocrlf` condition CLAUDE.md's own Phase 19 entry already
+  documents (189 files total, not specific to this phase). Two shortened
+  real-browser E2E-CONV runs (E2E-CONV-01 at 15s, E2E-CONV-02 at 20s/8s
+  disconnect) both passed cleanly post-`markAlive()` fix, and the full
+  `inputPipeline.spec.ts`/`mutationSentinel.spec.ts` suite (31 of 33
+  test-runs; 2 pre-existing WebKit-only skips, unchanged) passed across
+  real Chromium, Firefox, AND WebKit, confirming the relaxed
+  `requireEngine()`/input-pipeline gate didn't regress anything.
+
 ## Current phase in progress
 
-None — Phase 21 (tombstone garbage collection) complete. `Engine.collect()`
+None — Phase 22 (client durable queue) complete; see its own
+completed-phase entry below for the full account. Phase 21 (tombstone
+garbage collection) is also complete. `Engine.collect()`
 (Definition 7.4's four conditions plus its fixpoint anchor sweep),
 `sessions.last_ack_seq`/`last_seen_at` now genuinely persisted and read
 back for the stability frontier (API Spec §6.5), Rule 7.1 eviction (no
@@ -3909,14 +4201,16 @@ what's deliberately NOT built (Rule 7.2's client-facing "explicit
 rejection" flow) and two unrelated Phase-20-era gaps (`pnpm typecheck`
 and `pnpm check:purity` were both silently broken since Phase 20's own
 merge) found and fixed along the way. Regression gates re-run clean on
-the real, merged `engine.ts`/server code: default `pnpm test` (329/329),
-`pnpm test:adversarial` (22/22), `pnpm test:properties` (6/6), `pnpm
-test:index` (10,000-seed cross-check, zero disagreements), `pnpm
-typecheck`, `pnpm check:purity`. `pnpm test:convergence` (the full
-70,000-seed, ~35-minute run) — [PENDING/FILLED IN BELOW ONCE COMPLETE —
-the user explicitly required this be actually run, not assumed inert
-from the shape of the change alone, given this session's own prior
-history of "should be safe" claims that turned out to have real gaps].
+the real, merged `engine.ts`/server code: default `pnpm test` (329/329
+at the time), `pnpm test:adversarial` (22/22), `pnpm test:properties`
+(6/6), `pnpm test:index` (10,000-seed cross-check, zero disagreements),
+`pnpm typecheck`, `pnpm check:purity`. `pnpm test:convergence` (the full
+70,000-seed run, ~44.6 minutes wall time) was ACTUALLY RUN, per the
+user's explicit requirement that Phase 21's engine.ts changes
+(`deleteContext`/`maxCounterByReplica` bookkeeping, the new `collect()`
+method) not be assumed additive-only from the shape of the diff alone —
+result: **70,000/70,000 seeds converged, zero divergences, zero
+stuck-pending, zero errors, across all 7 configs**, confirming the claim.
 `pnpm test:db`'s new `gc.db.test.ts` (M8-c/M8-d, cold-load compaction,
 the `gc.minutes_since_last_success` metric, and the `/gc-status` HTTP
 endpoint) was ACTUALLY EXECUTED against a real, migrated Postgres
@@ -3978,10 +4272,15 @@ above for Rule 7.2's own remaining gap). What remains NOT built: any
 retention/pruning policy for the `snapshots` table itself, UNRELATED to
 tombstone GC (every MAYBE-SNAPSHOT trigger still adds a new row forever —
 not a problem yet, but nothing prunes old snapshot rows);
-`SyncClient`'s unacked-operation queue is still in-memory only client-side
-(IndexedDB is Phase 22 — a client that closes its tab mid-edit still loses
-whatever hadn't been acked yet, even though the SERVER now durably has
-everything it did receive); `documents.next_replica_id`/`sessions`/
+`SyncClient`'s unacked-operation queue is now durably persisted to
+IndexedDB as of Phase 22 (API Spec §7.9) — a client that closes its tab
+mid-edit no longer loses whatever hadn't been acked yet; it is restored
+and re-mints/resends on the next connect (`reconcileOfflineQueue.ts`).
+What Phase 22 does NOT add is server-side session/replica-id resumption
+(a deliberate, user-approved scope boundary — see that phase's own
+completed-phase entry) — a reconnecting client still always gets a
+brand-new replica id, so restored operations land under NEW identities,
+never their original ones; `documents.next_replica_id`/`sessions`/
 `document_permissions` are durably provisioned only as a SIDE EFFECT of
 Phase 16's own foreign-key requirements (placeholder identities, `ON
 CONFLICT DO NOTHING`), not because session/replica-id persistence was
@@ -4040,11 +4339,16 @@ with nothing lost — is proven. Still missing, all previously-scoped to
 later phases and unaffected by this milestone: **persistence** (a
 coordinator restart loses all content, Phases 15-17), **auth** (any
 client can join any document as EDITOR by guessing its id, Phases
-26-29), **presence** (no cursors/avatars for other users, Phase 31),
-**offline editing** (no queue-and-replay while disconnected — an edit
-attempted while reconnecting is simply not applied, Phase 22),
-**undo/redo** (stubbed, Phase 36), and **IME composition** (never emits
-an operation, unbuilt, unassigned to a phase number). Also still open:
+26-29), and **presence** (no cursors/avatars for other users, Phase 31).
+**Offline editing is now BUILT as of Phase 22** — API Spec §7.9's durable
+IndexedDB queue, a relaxed `requireEngine()`/input-pipeline gate that
+allows minting edits while `reconnecting`/`offline`, and
+`reconcileOfflineQueue.ts`'s re-mint-and-resend-on-reconnect mechanism;
+see that phase's own completed-phase entry for the full account,
+including the disclosed identifier-change nuance and the four real bugs
+(one pre-existing, in `gapTracker.ts`) found building it. Still stubbed:
+**undo/redo** (Phase 36) and **IME composition** (never emits an
+operation, unbuilt, unassigned to a phase number). Also still open:
 real cursor transformation under remote edits (Phase 32, see above). The
 delay-relay test substitute's intermittent full-60-second failure,
 initially disclosed as an unresolved limitation, was fully root-caused
@@ -4562,9 +4866,18 @@ pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 gen
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 pnpm test:index        # PositionIndex reference cross-check ONLY — 10,000 seeds vs. a linear-scan oracle (Phase 19, Test Plan §2.6 I6)
-pnpm test:benchmark    # PositionIndex scaling benchmark ONLY — p95/p99 at 1,000/32,000/100,000 nodes (Phase 19); real numbers in docs/benchmarks.md
+pnpm test:benchmark    # testkit's scaling/compression/GC-safety-cap benchmarks (Phases 19-21) PLUS client's keystroke-latency benchmark (Phase 22) — real numbers in docs/benchmarks.md and this file's own Phase 22 entry
 pnpm test:db           # schema (Phase 15) + write-path/durability (Phase 16) suites — requires a real, migrated Postgres
 ```
+
+### The durable-queue e2e suite (real browser, real IndexedDB, Phase 22)
+
+```bash
+cd packages/client
+pnpm run test:e2e:durableQueue   # DUR-07 ONLY — a real, on-disk Chromium profile, terminated and relaunched
+```
+
+Its own dedicated Playwright project (`durableQueue`, `playwright.config.ts`) — like `convergence`, excluded from the three single-engine projects since it manages its own browser lifecycle directly (`chromium.launchPersistentContext`) rather than using Playwright's `page`/`context` fixtures. See `packages/client/e2e/durableQueue.spec.ts`'s own header comment for exactly what Playwright API this needed, what a genuine engine-level SIGKILL would have required (not achievable — no supported API combination offers both a real process handle AND a reusable on-disk profile), and why a graceful `context.close()` still proves the claim for data already flushed before termination.
 
 ### The Playwright suite (real browsers, Phase 11-12)
 
@@ -4625,10 +4938,22 @@ validation runs actually used for most of its repeated-run confidence
 many times, and the honest DoD status this phase is actually shipping
 with).
 
-`pnpm test` currently passes: 329 tests across 38 files (up from 321/38 —
-Phase 21 added 8 `Engine.collect()` tests to `packages/engine/src/
-engine.test.ts`, no new test FILES; see the Phase 21 entry above for the
-full account). `pnpm test:db` gained a new file, `packages/server/src/db/
+`pnpm test` currently passes: **373 tests across 41 files** (up from
+329/38 — Phase 22 added three new files to `packages/client/src/sync/`
+— `durableQueue.test.ts` (16), `reconcileOfflineQueue.test.ts` (13),
+`syncClient.durableQueue.test.ts` (4) — and extended three existing ones
+— `unackedQueue.test.ts` (6→10), `gapTracker.test.ts` (9→12,
+`markAlive()`'s liveness-signal tests), `syncClient.test.ts` (15→16, the
+idle-PONG-does-not-force-a-reconnect test); see the Phase 22 entry above
+for the full account, including the real bug this last test guards
+against). Confirmed stable across 5 consecutive full-suite runs (a real,
+intermittent flake in Phase 22's own new test file — Bug 4 in that
+entry — was found and fixed via exactly this kind of repeated-run
+verification). `pnpm test:benchmark` gained a new file,
+`packages/client/src/sync/benchmark/keystrokeLatency.bench.test.ts`
+(Phase 22's own DoD requirement to measure keystroke latency with vs.
+without the durable queue attached — real numbers in that phase's own
+entry). `pnpm test:db` gained a new file, `packages/server/src/db/
 gc.db.test.ts` (M8-c/M8-d, cold-load compaction, the `gc.minutes_since_
 last_success` metric) — actually executed against a real, migrated
 Postgres instance (all 4 tests pass); see the Phase 21 entry above for

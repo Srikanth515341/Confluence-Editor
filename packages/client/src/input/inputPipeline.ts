@@ -256,14 +256,20 @@ function deleteLineBackward(ev: InputEvent, deps: InputPipelineDeps): void {
 export function handleBeforeInput(ev: InputEvent, deps: InputPipelineDeps): void {
   ev.preventDefault();
 
-  if (!deps.sync.engine || deps.sync.state.value !== "synced") {
-    // Not synced yet, OR currently reconnecting (Phase 14 correction): `sync.engine` is
-    // deliberately preserved, never nulled, across a disconnect (SyncClient's own `onClose`
-    // comment) — checking for null alone would let a local edit land on an engine reference a
-    // fresh SNAPSHOT is about to replace wholesale, silently orphaning it (a real, confirmed bug
-    // — see SyncClient.requireEngine's own doc comment for the full account). No offline edit
-    // queue exists this phase (Phase 22's job) — an edit attempted while reconnecting is simply
-    // not applied, exactly like an edit attempted before the very first sync.
+  if (!deps.sync.engine) {
+    // Not synced yet — no engine exists at all (before the very first SNAPSHOT). This is the
+    // ONE case Phase 22 still blocks: there is nothing to mint an operation against yet.
+    //
+    // Phase 14 originally ALSO blocked here whenever `state.value !== "synced"` (i.e. also
+    // during `reconnecting`/`offline`), specifically because a local edit minted against an
+    // engine reference a fresh SNAPSHOT was about to replace wholesale would be silently
+    // orphaned (a real, confirmed bug — see SyncClient.requireEngine's prior doc comment history
+    // for the full account). Phase 22 removes that extra check deliberately: `SyncClient` now
+    // durably queues an edit minted during `reconnecting`/`offline` (API Spec §7.9) and
+    // reconciles it against the NEXT fresh SNAPSHOT's engine (reconcileOfflineQueue.ts) — the
+    // orphaning failure mode this check existed to prevent no longer exists, so blocking real
+    // user typing during a reconnect is no longer necessary and would defeat PRD FR-OF-2's whole
+    // point (offline edits must actually be capturable, not merely durable once captured).
     return;
   }
 
