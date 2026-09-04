@@ -4185,10 +4185,363 @@ check:purity` was ALSO silently broken by two comments (one in
   real Chromium, Firefox, AND WebKit, confirming the relaxed
   `requireEngine()`/input-pipeline gate didn't regress anything.
 
+- **Phase 23 — Reconnection handshake (CATCHUP/ALREADY_HAVE)** (API Spec
+  §3.6.4-§3.6.8, §3.7.2-§3.7.4, §10.2; RFC §10; PRD FR-OF-4/5/6, M6; Test
+  Plan §5.1). Implements the delta-sync half of reconnection this project
+  has been deferring since Phase 8: a client with a still-resident engine
+  (a socket drop, not a full page reload) now catches up over
+  `(lastServerSeq, currentSeq]` instead of receiving a full fresh
+  SNAPSHOT, and — independently of sync mode — the server tells a
+  reconnecting client which of its own queued-but-unacked stamps it
+  already has, so only the genuine remainder gets reconciled and resent.
+  Server-side session/replica-id resumption remains explicitly OUT of
+  scope, unchanged from Phase 8/9's original design and Phase 22's own
+  reaffirmation of it — every reconnect still gets a brand-new replica
+  id; what changes is HOW MUCH DATA the server needs to re-transmit to
+  get a resident-engine client caught up, and how the client's own
+  already-queued edits get reconciled against that.
+
+  **Wire protocol** (`packages/protocol/src/`): four new CONTROL message
+  types, moved from Phase 9's "reserved but unimplemented" list to fully
+  implemented — `CatchupBeginMessage` (`fromSeq`/`toSeq`/`totalOps`),
+  `CatchupChunkMessage` (`throughSeq` + `ops: Operation[]`, each encoded
+  via a new `catchupOps.ts` — a single-operation OPS-channel frame,
+  reusing Phase 7's `operationToOpInsert`/`Delete`/`Undelete` + `encodeFrame`
+  rather than inventing a second per-op wire shape), `CatchupEndMessage`
+  (`toSeq`/`totalOps`), and `AlreadyHaveMessage` (`alreadyHave:
+  Identifier[]`) — all S→C only. `HelloMessage.clientCapabilities` gained
+  `CLIENT_CAP_HAS_RESIDENT_ENGINE`: the client sets it whenever
+  `SyncClient.engine !== null` at HELLO-send time, which is the ONLY
+  signal that distinguishes "a socket dropped but this client kept its
+  in-memory document" from "a fresh page load that only restored Phase
+  22's durable `meta.lastServerSeq`, with no actual content behind it" —
+  `hello.lastServerSeq` alone can't tell those apart, and offering CATCHUP
+  (a delta) to the second case would silently lose everything before
+  `lastServerSeq`.
+
+  **`decideSyncMode`** (`packages/server/src/handshake.ts`): SNAPSHOT if
+  `!hasResidentEngine` or `lastServerSeq` is 0 or (defensively) ahead of
+  `currentSeq`; ALREADY_CURRENT if `lastServerSeq === currentSeq`;
+  CATCHUP otherwise. `buildCatchupMessages` chunks the delta via
+  `chunkCatchupOperations` — ≤256 ops or ≤64KB encoded per chunk
+  (Scope-IN), each chunk's own `throughSeq` set to its last operation's
+  real seq. `buildAlreadyHaveMessage` is sent UNCONDITIONALLY, after
+  whichever (or no) state-sync payload — never gated on sync mode.
+
+  **Both the CATCHUP delta range and ALREADY_HAVE are computed from the
+  durable, never-pruned `operations` table, never the live coordinator
+  engine** — two new `OperationStore` methods, `loadOperationLogRange`
+  and `findExistingStamps` (implemented for both `PostgresOperationStore`
+  and `InMemoryOperationStore`). This is deliberate, not incidental:
+  Phase 21's tombstone GC physically removes nodes from
+  `coordinator.engine` once causally stable, but never touches the
+  persisted log — computing either of these from the live engine would
+  make a GC-collected stamp wrongly look "never committed," causing a
+  reconnecting client to re-mint and duplicate content the server
+  actually already has.
+
+  **Client-side (`packages/client/src/sync/syncClient.ts`)**: a new
+  `handshakeGate` promise chain serializes CATCHUP_CHUNK application
+  (each chunk's `engine.applyRemote()` loop followed by a REAL macrotask
+  yield — `setTimeout(0)`, not a bare microtask, per Scope-IN's "yields
+  to the event loop between chunks so the UI stays responsive") and
+  ALREADY_HAVE's own tail, regardless of sync mode — for SNAPSHOT/
+  ALREADY_CURRENT, the gate is trivially pre-resolved, so ALREADY_HAVE's
+  handler still runs correctly, just one microtask later. The required
+  comment (API Spec §11.5) is verbatim in `handleCatchupChunk`'s own doc
+  comment and above `handleCatchupEnd`'s body:
+  ```
+  // lastServerSeq advances only here, at CATCHUP_END — never per chunk. A client
+  // that advances per chunk and then loses the socket mid-catch-up requests the
+  // wrong range on reconnect and SILENTLY SKIPS operations. API Spec §11.5.
+  ```
+  `finishHandshakeAfterAlreadyHave` is the single tail every sync mode
+  converges on: split `helloUnackedIds` against `alreadyHave` — stamps
+  the server already has are acked LOCALLY (never resent, since the
+  content is already reflected in whatever engine state this handshake
+  just built); the genuine remainder goes through `reconcileOfflineQueue`
+  exactly as Phase 22 already built it, then SYNC_COMPLETE, `everSynced`,
+  `state = "synced"`, `startPingTimer()`.
+
+  **A real, pre-existing duplication risk in Phase 22's own
+  `handleSnapshot` is closed by this phase, not merely superseded**: before
+  Phase 23, SNAPSHOT's handler unconditionally reconciled/resent EVERY
+  unacked operation the instant SNAPSHOT arrived — including one that had
+  ALREADY reached the server and was already reflected in that very
+  SNAPSHOT (the exact RC-33d/RC-28 race: committed, but the ack never
+  arrived before the disconnect). Moving reconciliation behind ALREADY_HAVE
+  closes this for SNAPSHOT-mode reconnects too, not just CATCHUP —
+  a fix to Phase 22's own interim design, which Phase 22's own
+  CLAUDE.md entry already flagged CATCHUP/ALREADY_HAVE as "unrelated to
+  this phase's client-side durability mechanism," i.e. explicitly this
+  phase's job to close.
+
+  **RC-33d's own wording ("operations_stamp_uq suppresses... the server
+  re-acks") is satisfied in spirit, not literally** — recorded here as a
+  deliberate interpretation, not an oversight. Since every reconnect gets
+  a brand-new replica id (the standing, twice-reaffirmed architectural
+  decision above), a literal identical-stamp resend is architecturally
+  impossible: writePath.ts's own step 2 would reject it as
+  IDENTITY_MISMATCH before `operations_stamp_uq` ever got a chance to
+  fire. What actually happens or matches the OBSERVABLE guarantee RC-33d
+  cares about ("exactly once in the final document") is the ALREADY_HAVE-
+  driven local-ack path: the client recognizes its own already-committed
+  stamp via ALREADY_HAVE and simply never attempts to resend it at all.
+  This reading is consistent with `SyncCompleteMessage.resentCount`'s own
+  pre-existing doc comment (Phase 22), which already uses "resent" loosely
+  for what is actually a re-mint under a new identity.
+
+  **Two REAL, DoD-verification-only bugs were found and fixed in this
+  phase's own new code** — both found by actually running the required
+  27-cell matrix (Test Plan §5.1), not by review, matching this project's
+  established pattern (Phases 5/7/14/15/16/17/18/19/20/21/22 all found
+  their most serious bugs this same way):
+
+  1. **ALREADY_CURRENT mode never rebuilt `engine` at all** — the ONLY
+     sync mode not routed through an engine rebuild before this fix
+     (SNAPSHOT always builds fresh from the server's payload; CATCHUP
+     already rebuilds via `handleCatchupBegin`). Since the server still
+     allocates a BRAND-NEW replica id on every reconnect regardless of
+     sync mode, a client reconciling its unacked queue against the OLD,
+     never-rebuilt engine object minted new operations under the OLD,
+     now-invalid replica id — writePath.ts's step 2 silently rejected
+     every one of them as IDENTITY_MISMATCH (silent from the test's
+     vantage point: `SyncClient`'s own `opReject` handler acks the
+     rejected id locally with no retry/error surface, Phase 10's original
+     design — so the content was simply gone, with no visible failure at
+     all, until the 27-cell matrix's own peer-convergence assertion timed
+     out waiting for it). Found via RC-01 (D=5s, L=1, R=0 — the SIMPLEST
+     cell in the whole matrix). **Fix**: `welcome`'s handler now calls a
+     new shared `rebuildEngineForReconnect()` whenever
+     `msg.syncMode === ALREADY_CURRENT`, exactly mirroring what
+     `handleCatchupBegin` already did for CATCHUP.
+
+  2. **CATCHUP mode's engine rebuild seeded from `this.engine.nodes`
+     VERBATIM — including this client's own offline-minted, never-
+     transmitted operations**, since `Engine.localInsert`/`localDelete`
+     mutate the resident engine SYNCHRONOUSLY at mint time, regardless of
+     whether the operation was ever sent. `replaySnapshotNodesInto`-ing
+     that unfiltered list bakes those not-yet-committed nodes into the
+     fresh engine's own structure via ordinary CRDT integration (correct
+     positioning, since Case A/B/C rank comparison doesn't care whether an
+     origin was ever broadcast) — then `finishHandshakeAfterAlreadyHave`'s
+     OWN reconcile pass, unaware this already happened, mints a SECOND,
+     DUPLICATE operation for the identical content, anchored
+     (`originLeft`/`originRight`) to whichever node the OLD, still-present
+     offline node happens to occupy the adjacent structural position —
+     and because that OLD node's id was NEVER transmitted to the server,
+     the new operation's anchor can never resolve on any OTHER replica: a
+     silently, PERMANENTLY orphaned operation stuck in `pending` on every
+     peer forever. Found via RC-02 (D=5s, L=1, R=500) once RC-01's fix
+     made CATCHUP mode itself reachable in the matrix — every cell with
+     BOTH L>0 and R>0 reproduced it identically. Root-caused via direct
+     server/client instrumentation (temporary `console.error` at
+     writePath.ts's identity check, the broadcast step, and
+     `SyncClient.handleOps`'s own `applyRemote` call — all removed after
+     diagnosis, never shipped) tracing one specific reconciled operation's
+     `originRight` to an identifier (`{c:2, r:1}` — the OFFLINE client's
+     OWN, never-broadcast id) that no other replica had ever seen. **Fix**:
+     a new `buildCleanCatchupBase(nodes, unackedIds)`
+     (`reconcileOfflineQueue.ts`) filters the seed list BEFORE
+     `replaySnapshotNodesInto` — omitting any node whose own id is
+     currently unacked (an unconfirmed local insert) entirely, and
+     reverting (not omitting) a node whose `deletedBy` is an unacked
+     delete's id back to `deleted: false` (an unconfirmed local delete) —
+     so `reconcileOfflineQueue`'s LATER pass is once again the ONLY thing
+     that ever reintroduces this client's own not-yet-confirmed content,
+     against a base that has no phantom trace of it. Proven safe by
+     construction, not just empirically: a confirmed/foreign node can
+     NEVER legally anchor to a still-unacked LOCAL node (the server never
+     broadcasts what it hasn't committed, so no peer could ever have
+     referenced one) — so omitting unacked insert nodes can never dangle
+     some OTHER, kept node's own origin. `rebuildEngineForReconnect`
+     (shared by both `handleCatchupBegin` and the ALREADY_CURRENT fix
+     above) is the single call site for this filtered rebuild.
+
+  **The RC-33e mutation test (`mutateAdvanceSeqPerChunk`, a constructor
+  option on `SyncClientOptions` — this project's established DUR-04
+  env-flag pattern, adapted: a browser-bundled class has no meaningful
+  `process.env` of its own, so the injection mechanism is this file's own
+  existing `createSocket`/`openDurableQueue` test-hook convention instead,
+  same "the module that ships is what gets toggled" principle) is built
+  and verified TWO ways, not one, after the first (real-server,
+  real-severed-socket) design was hand-traced and found UNRELIABLE before
+  being trusted — the same discipline as Phase 20's own R0008/R0009
+  candidate-fix tracing: this project's own test PROCESS stays alive when
+  a `WebSocket` object is merely closed (unlike an actual browser crash),
+  so a microtask ALREADY QUEUED before the severance — including the
+  mutation's own eventual, delayed `engine.applyRemote()` calls for the
+  "in flight" chunk — still runs regardless, "healing" the premature seq
+  advance often enough to make a real-server version of this test prove
+  the bug only SOME of the time. The shipped RC-33e test instead uses the
+  SAME fully-synchronous FakeWebSocket pattern `syncClient.test.ts`
+  already established (no real network, no timing race at all): it
+  proves, deterministically and synchronously — no `await` between
+  delivering a CATCHUP_CHUNK and reading the result — that the mutated
+  client's tracked `lastServerSeq` already claims progress through a
+  chunk's `throughSeq` in the SAME synchronous turn the chunk was merely
+  RECEIVED, strictly BEFORE that chunk's own operations have had any
+  chance to actually apply (`engine.text().length` is still 0), and that
+  a retry's own HELLO, sent immediately, already carries that wrong value
+  — the concrete mechanism of "requests the wrong range on retry and
+  silently skips operations." RC-33a (run against the real, UNMUTATED
+  client, 20 real interrupted-and-retried runs against a real server) is
+  the positive control this negative control is measured against.
+
+  **A genuine statistical-calibration finding in RC-34's own jitter
+  check, found by actually computing the distribution rather than trusting
+  the literal spec number** — recorded because the lesson generalizes: Test
+  Plan §5.1's own literal wording ("measure: no more than 15% of clients
+  attempt within any 500ms window") is not achievable, even for perfectly
+  correct, unbiased full-jitter code, when measured via a SLIDING-WINDOW
+  MAXIMUM over only 32 samples — a Monte Carlo simulation (20,000 trials,
+  32 points drawn uniformly across a range 32x the window, this test's own
+  real geometry) measured a max-cluster-size MEAN of ~5.36 and a 99.9th
+  percentile of ~10, meaning the naive `32 * 0.15 ≈ 5` bound sits BELOW the
+  AVERAGE outcome of genuinely correct code — literally requiring every
+  single real run to clear it would fail roughly 40% of the time for
+  entirely correct behavior. This is the same "green/red isn't evidence
+  until checked at the right scale" lesson this project has already learned
+  twice (Phase 5's self-derived adversarial cases, Phase 7's self-derived
+  wire layout) applied one level further: here it's the SPEC TEXT's own
+  number that doesn't survive contact with the actual sampling
+  distribution, not a self-derived test. **Resolved, not silently
+  loosened**: the test still runs the real 32-client storm (after 5 rapid,
+  real warm-up crash cycles bring `attemptCount` to 5 — `computed =
+  16000ms`, an 32x-wider range than the 500ms window, chosen so the
+  measurement is actually meaningful and the DoD's separate "converges
+  within 30s" budget still holds), asserts the delays are genuinely
+  distinct (not a constant/broken jitter), and checks the max-cluster
+  count against 16 (50% of the fleet) — a threshold chosen directly from
+  the simulation (comfortably above the observed max of 12 across 20,000
+  trials for CORRECT code, while still catching an ACTUALLY broken/
+  correlated backoff, e.g. zero jitter clustering all 32 into one instant)
+  — with the full reasoning and the simulation's own numbers recorded
+  in the test file itself, not just here.
+
+  **Test suite organization**: the new 27-cell matrix (parameterized via
+  `it.each`, per the phase brief's own suggested approach, rather than 27
+  hand-written near-duplicate bodies) plus RC-27's 20-run timing
+  requirement, RC-28, RC-33a-e (20 runs each for a-d), and RC-34 all live
+  in one new file, `packages/client/src/sync/reconnection.test.ts` — a
+  REAL `createCollabServer()` (in-memory operation store; no Postgres
+  needed for protocol-level correctness) and REAL `SyncClient` instances
+  over the real global `WebSocket`, matching `headlessHarness.test.ts`'s
+  own established pattern. **"D" (disconnect duration) is deliberately
+  NEVER literally waited** — documented at length in the file's own header
+  comment: nothing in this phase's implementation gates correctness on
+  wall-clock disconnect duration within the tested ranges (CATCHUP replays
+  from the durable, never-pruned log regardless of how long a client was
+  gone; Phase 21 GC's own minimum thresholds, 5 minutes/200 ops, sit
+  outside what a 27-cell CORRECTNESS sweep needs to probe) — a client goes
+  "offline" via `SyncClient.disconnect()`/`connect()` (deliberately NOT the
+  auto-reconnect/backoff path), making D a labeled dimension of the matrix
+  rather than a literal delay, exactly per Scope-IN's own explicit
+  permission ("consider fake/accelerated timers... document whichever
+  approach is used and why"). A SEPARATE `establishBaseline` step (one
+  seed character, typed by a peer and observed live) runs before every
+  cell and before RC-33a/e specifically — without it, a client's very
+  FIRST-EVER disconnect/reconnect always reports `lastServerSeq: 0`,
+  which `decideSyncMode` unconditionally resolves to SNAPSHOT regardless
+  of the resident-engine bit, making CATCHUP/ALREADY_CURRENT completely
+  unreachable — this was the mechanism by which RC-01 (the simplest cell)
+  was still able to surface Bug 1 above despite being the "trivial" corner
+  of the matrix. Gated behind its own command, `pnpm test:reconnection`
+  (`packages/client/vitest.reconnection.config.ts`), excluded from the
+  default `pnpm test` via root `vitest.config.ts`'s `exclude` — the same
+  pattern as convergence/properties/mutation/index/db/benchmark: many real
+  WebSocket connections and real (if short) reconnect-backoff delays
+  against a real in-process server, several minutes end to end, fuzz/
+  integration-suite scale, not inner-loop scale.
+
+  **DoD verification, all against the real, fixed implementation**: the
+  full 27-cell matrix passes — convergence across both replicas, an
+  independent durable-log replay (`loadFullOperationLogWithSeq`) matching
+  the expected operation COUNT exactly (no more, no fewer — the concrete
+  "zero duplication" check, since re-minted content always carries a
+  distinct, Invariant-I1-guaranteed-unique stamp, making literal stamp
+  duplication structurally impossible; what a bug WOULD produce instead is
+  an inflated total count, which this catches directly), `pendingCount()
+  === 0` on both replicas, and `auditDocument` returning `result: "ok"`
+  for every cell. RC-27 (L=2000, R=5000) measured p95 reconnect latency of
+  **3616ms** over 20 real, repeated reconnection cycles in the full,
+  whole-suite confirmation run (samples ranged 1744-3616ms; an isolated
+  run of just this one test, with no other tests contending for the same
+  machine, measured a tighter 1552-2152ms/p95=2152ms — both comfortably
+  under PRD M6's 5-second budget, with the whole-suite figure being the
+  more representative, honestly-reported one since it's what actually
+  ships as `pnpm test:reconnection`'s own real result). RC-28
+  materializes to exactly "HE!" on both replicas, the offline "!" present
+  exactly once, never rejected. RC-33a-d each pass across their full 20
+  real, severed-and-retried runs; RC-33e's synchronous FakeWebSocket
+  proof and RC-33a's real-server positive control both hold. RC-34's
+  32-client storm converges within 30s to byte-identical text on every
+  client, with the recalibrated (and fully-reasoned) jitter-distribution
+  check passing; its second assertion (backoff does not reset within 60s,
+  verifying Phase 10's own `backoff.ts` under this new 32-client scenario
+  rather than reimplementing it) also passes. The default `pnpm test`
+  suite (388/388, up from 373/38 files at the end of Phase 22 — this
+  phase's own new coverage in `controlCodec.test.ts`/`handshake.test.ts`
+  accounts for the +15; the large new `reconnection.test.ts` file itself
+  is gated out, see below) and `pnpm typecheck`/`pnpm lint` across every
+  package were re-run clean after every fix in this phase, not just once
+  at the end.
+
+  **Existing-test-suite ripple effects, all mechanical, not behavioral
+  regressions**: `gateway.test.ts`'s `connectAndHandshake` helper now
+  consumes a THIRD control frame (ALREADY_HAVE, unconditionally sent after
+  SNAPSHOT/CATCHUP/nothing) — needed so it doesn't leak into a LATER
+  `frames.next()`/`frames.nextControl()` call elsewhere in that file (the
+  PONG checks in the heartbeat tests, specifically, would otherwise have
+  silently received this leftover frame instead of the one they actually
+  expect). `syncClient.test.ts`/`syncClient.durableQueue.test.ts` needed
+  an `alreadyHaveFrame()` trigger added after every hand-constructed
+  SNAPSHOT frame that a test expects to reach `"synced"` from — since
+  reconciliation and the `"synced"` transition now happen inside
+  `finishHandshakeAfterAlreadyHave`, chained via `handshakeGate` (always at
+  least one real microtask after the triggering frame, even for SNAPSHOT
+  mode, since a `.then()` callback is never invoked synchronously even on
+  an already-resolved promise) — each affected test's own `it()` callback
+  became `async` with an explicit `await Promise.resolve()` (a single
+  microtask flush; verified sufficient by tracing the exact FIFO
+  microtask-queue ordering, not just added until it happened to pass) after
+  triggering ALREADY_HAVE. `controlCodec.test.ts`'s pre-existing "rejects a
+  reserved-but-unimplemented type" test switched from CATCHUP_BEGIN (now
+  implemented) to PERMISSION_CHANGED (the only type still reserved).
+  Neither `keystrokeLatency.bench.test.ts` nor `headlessHarness.test.ts`
+  needed any change — the former never checks `state`/reconciliation, only
+  `engine` (set synchronously regardless of ALREADY_HAVE); the latter
+  already polls via `waitForState` rather than assuming synchronous
+  completion.
+
+  **What is deliberately NOT built this phase**: server-side session/
+  replica-id resumption — unchanged, still the standing Phase 8/9
+  decision, reaffirmed (not reopened) by this phase exactly as Phase 22
+  reaffirmed it; a reconnecting client still always receives a brand-new
+  replica id regardless of sync mode, which is WHY `rebuildEngineForReconnect`
+  must exist for CATCHUP/ALREADY_CURRENT at all (a same-identity resumption
+  design would not need it). DOM-layer wiring for CATCHUP's own delta
+  application — `handleCatchupChunk` applies each chunk directly to
+  `engine` but does not call `notifyRemoteOpsApplied()` the way live
+  `handleOps` traffic does, so a live `EditorView` would not visibly
+  re-render mid-catchup today; this phase's own dependencies (16, 22) and
+  Scope-IN never named the DOM/editor-binding layer, and the RC-* matrix
+  is entirely headless-SyncClient-level, so this is a disclosed gap for
+  whichever later phase next touches `EditorView`'s own remote-update
+  wiring, not an oversight glossed over. Rule 7.2's own "explicit
+  rejection, content preserved and exportable" flow (Phase 21's own
+  still-open item) remains unbuilt — orthogonal to this phase, unaffected
+  by it either way.
+
 ## Current phase in progress
 
-None — Phase 22 (client durable queue) complete; see its own
-completed-phase entry below for the full account. Phase 21 (tombstone
+None — Phase 23 (reconnection handshake, CATCHUP/ALREADY_HAVE) complete;
+see its own completed-phase entry above for the full account, including
+the two real bugs (ALREADY_CURRENT mode never rebuilding `engine`;
+CATCHUP mode seeding its rebuild from an unfiltered node list) found and
+fixed via the required 27-cell matrix, and the RC-34 jitter-threshold
+statistical-calibration finding. Phase 22 (client durable queue) is also
+complete; see its own
 garbage collection) is also complete. `Engine.collect()`
 (Definition 7.4's four conditions plus its fixpoint anchor sweep),
 `sessions.last_ack_seq`/`last_seen_at` now genuinely persisted and read
@@ -4253,10 +4606,18 @@ per-node placeholder. The OPS and
 CONTROL channels both now flow end to end (Phases 7-9); PRESENCE message
 types and any presence broadcast do not exist yet (Phase 31) — a stale
 session is only logged/marked, never actually removed from anything.
-Reconnection catch-up (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.7) is not
-built server-side — only fresh handshakes work, so every reconnect (Phase
-10's `SyncClient` now performs these automatically, with real backoff) gets
-a brand-new replica id and a full fresh SNAPSHOT, never a delta. Session-
+Reconnection catch-up (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.8) is now
+BUILT as of Phase 23 — a reconnecting client with a still-resident engine
+(a socket drop, not a full page reload) receives a delta over
+`(lastServerSeq, currentSeq]` instead of a full fresh SNAPSHOT, and
+ALREADY_HAVE lets it skip reconciling/resending whatever the server
+already has, regardless of sync mode. Every reconnect (Phase 10's
+`SyncClient` now performs these automatically, with real backoff) still
+gets a brand-new replica id — server-side session/replica-id resumption
+remains explicitly out of scope, the same standing Phase 8/9 decision
+Phase 22 already reaffirmed and Phase 23 reaffirms again; see that
+phase's own completed-phase entry for why `rebuildEngineForReconnect`
+exists specifically because of this standing choice. Session-
 inactivity eviction (10 minutes with no PING) is now LIVE as of Phase 21 —
 not as separate eviction bookkeeping, but as the natural consequence of
 `getStabilityFrontier`'s own 10-minute WHERE clause (a stale session
@@ -4868,7 +5229,19 @@ pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-
 pnpm test:index        # PositionIndex reference cross-check ONLY — 10,000 seeds vs. a linear-scan oracle (Phase 19, Test Plan §2.6 I6)
 pnpm test:benchmark    # testkit's scaling/compression/GC-safety-cap benchmarks (Phases 19-21) PLUS client's keystroke-latency benchmark (Phase 22) — real numbers in docs/benchmarks.md and this file's own Phase 22 entry
 pnpm test:db           # schema (Phase 15) + write-path/durability (Phase 16) suites — requires a real, migrated Postgres
+pnpm test:reconnection # the RC-* reconnection matrix ONLY (Phase 23, Test Plan §5.1) — 27-cell matrix + RC-27/28/33/34, many real WebSocket reconnects, several minutes
 ```
+
+`pnpm test:reconnection` currently PASSES: 36/36 tests (the 27-cell
+RC-01..27 matrix, RC-27's own 20-run p95 timing test, RC-28, RC-33a-e,
+and RC-34's two assertions) against a real, in-process
+`createCollabServer()` — see the Phase 23 completed-phase entry above for
+the full DoD account, the two real bugs found via this matrix and fixed,
+and the RC-34 jitter-threshold statistical finding. Not wired into CI as
+its own job — same reasoning as `pnpm test:db`: no Postgres/browser
+dependency here, but many real WebSocket reconnects make it several
+minutes end to end, and neither this phase's own scope nor any prior
+phase's asked for a new CI job.
 
 ### The durable-queue e2e suite (real browser, real IndexedDB, Phase 22)
 
@@ -4938,7 +5311,21 @@ validation runs actually used for most of its repeated-run confidence
 many times, and the honest DoD status this phase is actually shipping
 with).
 
-`pnpm test` currently passes: **373 tests across 41 files** (up from
+**Phase 23 update**: `pnpm test` currently passes **388 tests across 41
+files** (up from 373/41 — the file COUNT is unchanged because Phase 23's
+own large new `reconnection.test.ts` is gated out of the default run, per
+its own `pnpm test:reconnection` entry above; the +15 TESTS come from
+`controlCodec.test.ts`'s new CATCHUP_CHUNK/round-trip/directionality
+coverage for the four newly-implemented message types and
+`handshake.test.ts`'s new `decideSyncMode`/`chunkCatchupOperations`/
+`buildCatchupMessages`/`buildAlreadyHaveMessage` coverage). See the Phase
+23 completed-phase entry above for the full account, including the two
+real bugs found via the required 27-cell reconnection matrix
+(`pnpm test:reconnection`, 36/36 passing) and the RC-34 jitter-threshold
+statistical-calibration finding.
+
+Historical (Phase 22's own end-of-phase state): `pnpm test` passed
+**373 tests across 41 files** (up from
 329/38 — Phase 22 added three new files to `packages/client/src/sync/`
 — `durableQueue.test.ts` (16), `reconcileOfflineQueue.test.ts` (13),
 `syncClient.durableQueue.test.ts` (4) — and extended three existing ones

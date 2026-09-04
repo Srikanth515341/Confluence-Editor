@@ -22,6 +22,7 @@
     "test:index": "pnpm --filter @collab-editor/engine run test:index",
     "test:benchmark": "pnpm --filter @collab-editor/testkit run test:benchmark && pnpm --filter @collab-editor/client run test:benchmark",
     "test:db": "pnpm --filter @collab-editor/server run test:db",
+    "test:reconnection": "pnpm --filter @collab-editor/client run test:reconnection",
     "check:purity": "node scripts/check-engine-purity.mjs",
     "db:migrate": "pnpm --filter @collab-editor/server run db:migrate",
     "db:migrate:down": "pnpm --filter @collab-editor/server run db:migrate:down",

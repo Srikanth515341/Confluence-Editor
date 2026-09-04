@@ -27,8 +27,12 @@ export {
 } from "./heartbeat.js";
 export {
   assertSnapshotFormAllowed,
+  buildAlreadyHaveMessage,
+  buildCatchupMessages,
   buildSnapshotMessage,
   buildWelcomeMessage,
+  chunkCatchupOperations,
+  decideSyncMode,
 } from "./handshake.js";
 export {
   InMemoryOperationStore,

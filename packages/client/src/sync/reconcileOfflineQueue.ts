@@ -26,8 +26,64 @@ import {
   serializeId,
   type Engine,
   type Identifier,
+  type Node,
   type Operation,
 } from "@collab-editor/engine";
+
+/**
+ * Phase 23 — filters `nodes` (typically a resident `Engine`'s own
+ * `.nodes`, taken as the base for a CATCHUP/ALREADY_CURRENT reconnect's
+ * freshly-rebuilt engine) down to a "clean" base: everything this client
+ * has ALREADY minted offline but never had acknowledged is EXCLUDED, so
+ * `reconcileOfflineQueue` (below) is the ONLY thing that ever reintroduces
+ * that content, fresh, under a new identity.
+ *
+ * Why this is necessary, not merely tidy: unlike SNAPSHOT mode (which
+ * seeds a brand-new engine purely from the SERVER's own structure — never
+ * anything this client minted locally), CATCHUP/ALREADY_CURRENT reconnects
+ * seed from THIS CLIENT'S OWN currently-resident `engine.nodes` — which,
+ * if this client minted anything OFFLINE before reconnecting, ALREADY
+ * contains those not-yet-committed nodes (Engine.localInsert/localDelete
+ * mutate the engine synchronously, at mint time, regardless of whether
+ * the operation was ever transmitted). Seeding the fresh engine from that
+ * UNFILTERED list, then separately reconciling the SAME queued operations
+ * via `reconcileOfflineQueue`, mints a SECOND, duplicate operation for
+ * the same content — and because the ORIGINAL (offline, unacked) node is
+ * still sitting in the fresh engine's own structure, the new reconciled
+ * operation can end up anchored (`originLeft`/`originRight`) to that
+ * ORIGINAL node's id, which was NEVER transmitted to the server and can
+ * NEVER resolve on any other replica — a permanently-stuck, silently
+ * orphaned operation on every peer. Found via the 27-cell RC-* matrix's
+ * own DoD verification (Test Plan §5.1) — every cell with L > 0 and
+ * R > 0 reproduced it.
+ *
+ * For a node whose OWN id is unacked (a not-yet-confirmed local insert),
+ * the node is omitted entirely. For a node that IS kept but was deleted
+ * by an unacked operation (a not-yet-confirmed local delete), it is kept
+ * but reverted to not-deleted — `reconcileOfflineQueue`'s own delete
+ * reconciliation re-derives the correct tombstone against the clean base.
+ * A confirmed/foreign node can never legally anchor to a still-unacked
+ * LOCAL node (the server never broadcasts what it hasn't committed, so no
+ * peer could ever have referenced it) — so omitting unacked insert nodes
+ * can never dangle some OTHER, kept node's own origin.
+ */
+export function buildCleanCatchupBase(
+  nodes: readonly Node[],
+  unackedIds: ReadonlySet<string>,
+): Node[] {
+  const clean: Node[] = [];
+  for (const node of nodes) {
+    if (unackedIds.has(serializeId(node.id))) {
+      continue;
+    }
+    if (node.deleted && node.deletedBy !== null && unackedIds.has(serializeId(node.deletedBy))) {
+      clean.push({ ...node, deleted: false, deletedBy: null });
+    } else {
+      clean.push(node);
+    }
+  }
+  return clean;
+}
 
 /** Structural (not visible) index of the node with `id`, or -1 if no such node exists in `engine.nodes`. */
 function structuralIndexOf(engine: Engine, id: Identifier): number {

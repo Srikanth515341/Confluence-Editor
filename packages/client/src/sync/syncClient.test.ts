@@ -11,6 +11,7 @@ import {
   type ControlMessage,
   type WelcomeMessage,
 } from "@collab-editor/protocol";
+import type { Identifier } from "@collab-editor/engine";
 import { randomUUID } from "node:crypto";
 import { PING_INTERVAL_MS, SyncClient, type WebSocketLike } from "./syncClient.js";
 import { BACKOFF_RESET_AFTER_MS } from "./backoff.js";
@@ -103,6 +104,11 @@ describe("SyncClient — handshake and messaging, against a fake socket", () => 
     return encodeControlFrame({ kind: "snapshot", seq, form: SnapshotForm.STRUCTURE, body });
   }
 
+  /** Phase 23: ALREADY_HAVE always follows the state-sync payload, even with nothing to report — SyncClient only reaches "synced" once this arrives (see syncClient.ts's `handshakeGate`). */
+  function alreadyHaveFrame(alreadyHave: Identifier[] = []): Uint8Array {
+    return encodeControlFrame({ kind: "alreadyHave", alreadyHave });
+  }
+
   it("sends HELLO immediately on open, with the configured documentId", () => {
     client.connect();
     const ws = sockets[0]!;
@@ -118,7 +124,7 @@ describe("SyncClient — handshake and messaging, against a fake socket", () => 
     }
   });
 
-  it("state is 'connecting' for the first attempt, becomes 'synced' after WELCOME+SNAPSHOT, and sends SYNC_COMPLETE", () => {
+  it("state is 'connecting' for the first attempt, becomes 'synced' after WELCOME+SNAPSHOT+ALREADY_HAVE, and sends SYNC_COMPLETE", async () => {
     expect(client.state.value).toBe("offline");
     client.connect();
     expect(client.state.value).toBe("connecting");
@@ -130,6 +136,9 @@ describe("SyncClient — handshake and messaging, against a fake socket", () => 
     expect(client.replicaId).toBe(7);
 
     ws.triggerMessage(snapshotFrame(0));
+    expect(client.state.value).toBe("connecting"); // SNAPSHOT alone isn't synced yet either — ALREADY_HAVE (Phase 23) still pending
+    ws.triggerMessage(alreadyHaveFrame());
+    await Promise.resolve(); // finishHandshakeAfterAlreadyHave runs as a microtask chained onto handshakeGate — see synced()'s own comment in the sequence-gap describe block below
     expect(client.state.value).toBe("synced");
     expect(client.engine?.text()).toBe("");
 
@@ -241,7 +250,20 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     vi.useRealTimers();
   });
 
-  function synced(): FakeWebSocket {
+  /**
+   * Phase 23: `finishHandshakeAfterAlreadyHave` (syncClient.ts) runs as a
+   * `.then()` chained onto `handshakeGate` — even for SNAPSHOT mode, where
+   * that gate is trivially already-resolved, a `.then()` callback is still
+   * only ever run on a LATER microtask, never synchronously (a JS Promise
+   * guarantee, independent of `vi.useFakeTimers()` — fake timers replace
+   * `setTimeout`/`setInterval`, never the native microtask queue). One
+   * `await Promise.resolve()` after triggering ALREADY_HAVE is sufficient
+   * to let it settle before the next assertion: it queues the test's own
+   * continuation as a SECOND microtask, strictly after the already-queued
+   * `finishHandshakeAfterAlreadyHave` callback (FIFO microtask ordering),
+   * so the microtask queue drains that callback first.
+   */
+  async function synced(): Promise<FakeWebSocket> {
     client.connect();
     const ws = sockets[0]!;
     ws.triggerOpen();
@@ -264,6 +286,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
         body: encodeStructureSnapshotBody([]),
       }),
     );
+    ws.triggerMessage(encodeControlFrame({ kind: "alreadyHave", alreadyHave: [] })); // Phase 23 — SyncClient only reaches "synced" once this arrives
+    await Promise.resolve();
     return ws;
   }
 
@@ -279,8 +303,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     });
   }
 
-  it("applies an out-of-order operation anyway, and records a gap (informational) without freezing progress", () => {
-    const ws = synced();
+  it("applies an out-of-order operation anyway, and records a gap (informational) without freezing progress", async () => {
+    const ws = await synced();
     expect(client.hasSequenceGap).toBe(false);
 
     ws.triggerMessage(opInsertFrame(5, 1)); // expected 1, got 5 — a gap
@@ -288,8 +312,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     expect(client.hasSequenceGap).toBe(true);
   });
 
-  it("closes the socket once NO further seq arrives for GAP_RECONNECT_TIMEOUT_MS, re-checked on the ping cadence", () => {
-    const ws = synced();
+  it("closes the socket once NO further seq arrives for GAP_RECONNECT_TIMEOUT_MS, re-checked on the ping cadence", async () => {
+    const ws = await synced();
     ws.triggerMessage(opInsertFrame(5, 1)); // one gap-y frame, then total silence from the server
     expect(ws.closed).toBe(false);
 
@@ -300,8 +324,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     expect(client.state.value).toBe("reconnecting");
   });
 
-  it("Phase 22 fix: a genuinely idle-but-healthy session (regular PONGs, zero OPS traffic) does NOT force a reconnect", () => {
-    const ws = synced();
+  it("Phase 22 fix: a genuinely idle-but-healthy session (regular PONGs, zero OPS traffic) does NOT force a reconnect", async () => {
+    const ws = await synced();
     // Nobody edits anything, ever — but a real server responds to every PING with a PONG, on
     // schedule, every PING_INTERVAL_MS. Before the fix, this alone would eventually trip
     // hasStalled() (PONG never advanced the stall clock) and force a reconnect every ~8s,
@@ -317,8 +341,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     expect(client.state.value).toBe("synced");
   });
 
-  it("this client's own permanently-excluded operations (a real gap that will NEVER close) do NOT trigger a reconnect as long as OTHER traffic keeps arriving", () => {
-    const ws = synced();
+  it("this client's own permanently-excluded operations (a real gap that will NEVER close) do NOT trigger a reconnect as long as OTHER traffic keeps arriving", async () => {
+    const ws = await synced();
     // Simulate a sustained exchange where every OTHER seq is this client's own (never observed) —
     // exactly Test Plan §2.7 E2E-CONV-01's real-world shape, and the actual Phase 14 finding.
     let seq = 1;
@@ -332,8 +356,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     expect(client.state.value).toBe("synced");
   });
 
-  it("a fresh SNAPSHOT after a genuine reconnect clears the gap", () => {
-    const ws = synced();
+  it("a fresh SNAPSHOT after a genuine reconnect clears the gap", async () => {
+    const ws = await synced();
     ws.triggerMessage(opInsertFrame(5, 1));
     expect(client.hasSequenceGap).toBe(true);
 
@@ -360,6 +384,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
         body: encodeStructureSnapshotBody([]),
       }),
     );
+    ws2.triggerMessage(encodeControlFrame({ kind: "alreadyHave", alreadyHave: [] }));
+    await Promise.resolve(); // let finishHandshakeAfterAlreadyHave's chained microtask settle — see synced()'s own comment
 
     expect(client.hasSequenceGap).toBe(false);
     expect(client.state.value).toBe("synced");

@@ -41,6 +41,14 @@ export default defineConfig({
       // timing-sensitive, gated the same way via `pnpm test:benchmark`
       // (packages/testkit/vitest.benchmark.config.ts).
       "**/benchmark/**/*.bench.test.ts",
+      // Phase 23's reconnection-handshake suite (Test Plan §5.1): the
+      // 27-cell RC-* matrix, RC-27's 20-run timing requirement, RC-33's
+      // 4×20 interrupted-handshake runs, RC-34's 32-client storm — many
+      // real WebSocket connections and real (if short) reconnect-backoff
+      // delays against a real in-process server, several minutes end to
+      // end. Gated the same way via `pnpm test:reconnection`
+      // (packages/client/vitest.reconnection.config.ts).
+      "**/reconnection.test.ts",
     ],
     environment: "node",
     globals: false,

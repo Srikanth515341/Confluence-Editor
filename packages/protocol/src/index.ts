@@ -49,8 +49,13 @@ export {
   operationToOpUndelete,
 } from "./expand.js";
 export {
+  type AlreadyHaveMessage,
+  type CatchupBeginMessage,
+  type CatchupChunkMessage,
+  type CatchupEndMessage,
   CLIENT_CAP_ACCEPTS_OP_INSERT_RUN,
   CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT,
+  CLIENT_CAP_HAS_RESIDENT_ENGINE,
   ControlMessageType,
   type ControlMessage,
   type ErrorMessage,
@@ -74,6 +79,7 @@ export {
   decodeControlFrame,
   encodeControlFrame,
 } from "./controlCodec.js";
+export { decodeCatchupOperation, encodeCatchupOperation } from "./catchupOps.js";
 export {
   decodeStructureSnapshotBody,
   decodeTextSnapshotBody,

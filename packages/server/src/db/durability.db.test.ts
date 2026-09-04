@@ -328,6 +328,10 @@ describe("Phase 16 DoD — broadcast latency is unaffected by a slow database", 
       },
       loadFullOperationLog: (id: string) => realStore.loadFullOperationLog(id),
       loadFullOperationLogWithSeq: (id: string) => realStore.loadFullOperationLogWithSeq(id),
+      loadOperationLogRange: (id: string, fromSeqExclusive: bigint, toSeqInclusive: bigint) =>
+        realStore.loadOperationLogRange(id, fromSeqExclusive, toSeqInclusive),
+      findExistingStamps: (id: string, stamps: Parameters<typeof realStore.findExistingStamps>[1]) =>
+        realStore.findExistingStamps(id, stamps),
       writeSnapshot: (input: Parameters<typeof realStore.writeSnapshot>[0]) =>
         realStore.writeSnapshot(input),
       getLatestSnapshot: (id: string) => realStore.getLatestSnapshot(id),

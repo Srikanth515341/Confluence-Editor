@@ -15,6 +15,15 @@ import { Channel, PROTOCOL_VERSION } from "./messages.js";
 import { ByteWriter } from "./bytes.js";
 import { writeVarint } from "./varint.js";
 
+const insertOpArb = fc.record({
+  kind: fc.constant("insert" as const),
+  id: fc.record({ c: fc.integer({ min: 1, max: 5_000_000 }), r: fc.nat({ max: 500 }) }),
+  value: fc.integer({ min: 0x20, max: 0x7e }),
+  originLeft: fc.constant(null),
+  originRight: fc.constant(null),
+  bind: fc.boolean(),
+});
+
 const idArb = fc.record({ c: fc.nat({ max: 5_000_000 }), r: fc.nat({ max: 500 }) });
 const uuidArb = fc.uuid();
 const bytesArb = fc.uint8Array({ maxLength: 40 });
@@ -49,6 +58,30 @@ const snapshotArb: fc.Arbitrary<ControlMessage> = fc.record({
   seq: fc.nat({ max: 5_000_000 }),
   form: fc.constantFrom(SnapshotForm.PLAIN_TEXT, SnapshotForm.STRUCTURE),
   body: bytesArb,
+});
+
+const catchupBeginArb: fc.Arbitrary<ControlMessage> = fc.record({
+  kind: fc.constant("catchupBegin" as const),
+  fromSeq: fc.nat({ max: 5_000_000 }),
+  toSeq: fc.nat({ max: 5_000_000 }),
+  totalOps: fc.nat({ max: 5_000_000 }),
+});
+
+const catchupChunkArb: fc.Arbitrary<ControlMessage> = fc.record({
+  kind: fc.constant("catchupChunk" as const),
+  throughSeq: fc.nat({ max: 5_000_000 }),
+  ops: fc.array(insertOpArb, { maxLength: 10 }),
+});
+
+const catchupEndArb: fc.Arbitrary<ControlMessage> = fc.record({
+  kind: fc.constant("catchupEnd" as const),
+  toSeq: fc.nat({ max: 5_000_000 }),
+  totalOps: fc.nat({ max: 5_000_000 }),
+});
+
+const alreadyHaveArb: fc.Arbitrary<ControlMessage> = fc.record({
+  kind: fc.constant("alreadyHave" as const),
+  alreadyHave: fc.array(idArb, { maxLength: 10 }),
 });
 
 const syncCompleteArb: fc.Arbitrary<ControlMessage> = fc.record({
@@ -93,7 +126,17 @@ const errorArb: fc.Arbitrary<ControlMessage> = fc.record({
 });
 
 const clientOriginArb = fc.oneof(helloArb, syncCompleteArb, pingArb, leaveArb);
-const serverOriginArb = fc.oneof(welcomeArb, snapshotArb, pongArb, goodbyeArb, errorArb);
+const serverOriginArb = fc.oneof(
+  welcomeArb,
+  snapshotArb,
+  catchupBeginArb,
+  catchupChunkArb,
+  catchupEndArb,
+  alreadyHaveArb,
+  pongArb,
+  goodbyeArb,
+  errorArb,
+);
 
 function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
@@ -169,6 +212,50 @@ describe("CONTROL codec — envelope and type numbers (§3.2, §3.6)", () => {
   });
 });
 
+describe("CONTROL codec — CATCHUP_CHUNK carries real operations (Phase 23, API Spec §3.6.5)", () => {
+  it("round-trips a chunk of insert AND delete operations, preserving throughSeq", () => {
+    const bytes = encodeControlFrame({
+      kind: "catchupChunk",
+      throughSeq: 42,
+      ops: [
+        {
+          kind: "insert",
+          id: { c: 5, r: 2 },
+          value: 0x68,
+          originLeft: null,
+          originRight: null,
+          bind: false,
+        },
+        { kind: "delete", id: { c: 6, r: 2 }, target: { c: 5, r: 2 } },
+      ],
+    });
+    const decoded = decodeControlFrame(bytes, { direction: "serverOrigin" });
+    expect(decoded.kind).toBe("catchupChunk");
+    if (decoded.kind === "catchupChunk") {
+      expect(decoded.throughSeq).toBe(42);
+      expect(decoded.ops).toHaveLength(2);
+      expect(decoded.ops[0]).toEqual({
+        kind: "insert",
+        id: { c: 5, r: 2 },
+        value: 0x68,
+        originLeft: null,
+        originRight: null,
+        bind: false,
+      });
+      expect(decoded.ops[1]).toEqual({ kind: "delete", id: { c: 6, r: 2 }, target: { c: 5, r: 2 } });
+    }
+  });
+
+  it("round-trips an empty chunk (0 operations — the degenerate ALREADY_CURRENT-adjacent case)", () => {
+    const bytes = encodeControlFrame({ kind: "catchupChunk", throughSeq: 0, ops: [] });
+    const decoded = decodeControlFrame(bytes, { direction: "serverOrigin" });
+    expect(decoded.kind).toBe("catchupChunk");
+    if (decoded.kind === "catchupChunk") {
+      expect(decoded.ops).toEqual([]);
+    }
+  });
+});
+
 describe("CONTROL codec — directionality (§3.6's C→S / S→C markers)", () => {
   it("rejects a client-origin decode of a server-only message (WELCOME)", () => {
     const bytes = encodeControlFrame({
@@ -180,6 +267,19 @@ describe("CONTROL codec — directionality (§3.6's C→S / S→C markers)", () 
       syncMode: SyncMode.SNAPSHOT,
       participants: [],
     });
+    expect(() => decodeControlFrame(bytes, { direction: "clientOrigin" })).toThrow(
+      ProtocolDecodeError,
+    );
+    try {
+      decodeControlFrame(bytes, { direction: "clientOrigin" });
+      expect.unreachable();
+    } catch (err) {
+      expect((err as ProtocolDecodeError).reason).toBe("MESSAGE_NOT_VALID_FROM_CLIENT");
+    }
+  });
+
+  it("rejects a client-origin decode of a server-only message (ALREADY_HAVE)", () => {
+    const bytes = encodeControlFrame({ kind: "alreadyHave", alreadyHave: [] });
     expect(() => decodeControlFrame(bytes, { direction: "clientOrigin" })).toThrow(
       ProtocolDecodeError,
     );
@@ -211,11 +311,11 @@ describe("CONTROL codec — directionality (§3.6's C→S / S→C markers)", () 
     }
   });
 
-  it("rejects a reserved-but-unimplemented type (CATCHUP_BEGIN) with a specific error, not a crash", () => {
+  it("rejects a reserved-but-unimplemented type (PERMISSION_CHANGED) with a specific error, not a crash", () => {
     const writer = new ByteWriter();
     writer.writeByte(PROTOCOL_VERSION);
     writer.writeByte(Channel.CONTROL);
-    writer.writeByte(ControlMessageType.CATCHUP_BEGIN);
+    writer.writeByte(ControlMessageType.PERMISSION_CHANGED);
     const bytes = writer.toUint8Array();
     expect(() => decodeControlFrame(bytes)).toThrow(ProtocolDecodeError);
     try {
