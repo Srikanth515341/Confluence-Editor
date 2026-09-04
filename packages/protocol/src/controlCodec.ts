@@ -1,11 +1,16 @@
-import type { Identifier } from "@collab-editor/engine";
+import type { Identifier, Operation } from "@collab-editor/engine";
 import { ByteReader, ByteWriter } from "./bytes.js";
 import {
   CLIENT_CAP_ACCEPTS_OP_INSERT_RUN,
   CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT,
+  CLIENT_CAP_HAS_RESIDENT_ENGINE,
   ControlMessageType,
   GoodbyeReason,
   isImplementedControlType,
+  type AlreadyHaveMessage,
+  type CatchupBeginMessage,
+  type CatchupChunkMessage,
+  type CatchupEndMessage,
   type ControlMessage,
   type GoodbyeMessage,
   type HelloMessage,
@@ -21,6 +26,7 @@ import {
   SessionRole,
   SyncMode,
 } from "./controlMessages.js";
+import { decodeCatchupOperation, encodeCatchupOperation } from "./catchupOps.js";
 import { Channel, PROTOCOL_VERSION } from "./messages.js";
 import {
   decodeStamp,
@@ -33,7 +39,7 @@ import {
 import { ProtocolDecodeError } from "./errors.js";
 import { readVarint, writeVarint } from "./varint.js";
 
-export { CLIENT_CAP_ACCEPTS_OP_INSERT_RUN, CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT };
+export { CLIENT_CAP_ACCEPTS_OP_INSERT_RUN, CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT, CLIENT_CAP_HAS_RESIDENT_ENGINE };
 
 export interface DecodeControlFrameOptions {
   readonly direction?: "clientOrigin" | "serverOrigin";
@@ -49,6 +55,10 @@ const CLIENT_ORIGIN_TYPES: ReadonlySet<ControlMessageType> = new Set([
 const SERVER_ORIGIN_TYPES: ReadonlySet<ControlMessageType> = new Set([
   ControlMessageType.WELCOME,
   ControlMessageType.SNAPSHOT,
+  ControlMessageType.CATCHUP_BEGIN,
+  ControlMessageType.CATCHUP_CHUNK,
+  ControlMessageType.CATCHUP_END,
+  ControlMessageType.ALREADY_HAVE,
   ControlMessageType.PONG,
   ControlMessageType.GOODBYE,
   ControlMessageType.ERROR,
@@ -168,6 +178,68 @@ function decodeSnapshotPayload(reader: ByteReader): SnapshotMessage {
   return { kind: "snapshot", seq, form: form as SnapshotForm, body: new Uint8Array(body) };
 }
 
+function encodeCatchupBeginPayload(writer: ByteWriter, msg: CatchupBeginMessage): void {
+  writeVarint(writer, msg.fromSeq);
+  writeVarint(writer, msg.toSeq);
+  writeVarint(writer, msg.totalOps);
+}
+
+function decodeCatchupBeginPayload(reader: ByteReader): CatchupBeginMessage {
+  const fromSeq = readVarint(reader);
+  const toSeq = readVarint(reader);
+  const totalOps = readVarint(reader);
+  return { kind: "catchupBegin", fromSeq, toSeq, totalOps };
+}
+
+function encodeCatchupChunkPayload(writer: ByteWriter, msg: CatchupChunkMessage): void {
+  writeVarint(writer, msg.throughSeq);
+  writeVarint(writer, msg.ops.length);
+  for (const op of msg.ops) {
+    const frame = encodeCatchupOperation(op);
+    writeVarint(writer, frame.length);
+    writer.writeBytes(frame);
+  }
+}
+
+function decodeCatchupChunkPayload(reader: ByteReader): CatchupChunkMessage {
+  const throughSeq = readVarint(reader);
+  const count = readVarint(reader);
+  const ops: Operation[] = [];
+  for (let i = 0; i < count; i++) {
+    const frameLength = readVarint(reader);
+    const frame = reader.readBytes(frameLength);
+    ops.push(decodeCatchupOperation(new Uint8Array(frame)));
+  }
+  return { kind: "catchupChunk", throughSeq, ops };
+}
+
+function encodeCatchupEndPayload(writer: ByteWriter, msg: CatchupEndMessage): void {
+  writeVarint(writer, msg.toSeq);
+  writeVarint(writer, msg.totalOps);
+}
+
+function decodeCatchupEndPayload(reader: ByteReader): CatchupEndMessage {
+  const toSeq = readVarint(reader);
+  const totalOps = readVarint(reader);
+  return { kind: "catchupEnd", toSeq, totalOps };
+}
+
+function encodeAlreadyHavePayload(writer: ByteWriter, msg: AlreadyHaveMessage): void {
+  writeVarint(writer, msg.alreadyHave.length);
+  for (const id of msg.alreadyHave) {
+    encodeStamp(writer, id);
+  }
+}
+
+function decodeAlreadyHavePayload(reader: ByteReader): AlreadyHaveMessage {
+  const count = readVarint(reader);
+  const alreadyHave: Identifier[] = [];
+  for (let i = 0; i < count; i++) {
+    alreadyHave.push(decodeStamp(reader));
+  }
+  return { kind: "alreadyHave", alreadyHave };
+}
+
 function encodeSyncCompletePayload(writer: ByteWriter, msg: SyncCompleteMessage): void {
   writeVarint(writer, msg.lastServerSeq);
   writeVarint(writer, msg.resentCount);
@@ -258,6 +330,14 @@ function messageTypeOf(msg: ControlMessage): ControlMessageType {
       return ControlMessageType.WELCOME;
     case "snapshot":
       return ControlMessageType.SNAPSHOT;
+    case "catchupBegin":
+      return ControlMessageType.CATCHUP_BEGIN;
+    case "catchupChunk":
+      return ControlMessageType.CATCHUP_CHUNK;
+    case "catchupEnd":
+      return ControlMessageType.CATCHUP_END;
+    case "alreadyHave":
+      return ControlMessageType.ALREADY_HAVE;
     case "syncComplete":
       return ControlMessageType.SYNC_COMPLETE;
     case "ping":
@@ -290,6 +370,18 @@ export function encodeControlFrame(msg: ControlMessage): Uint8Array {
     case "snapshot":
       encodeSnapshotPayload(writer, msg);
       break;
+    case "catchupBegin":
+      encodeCatchupBeginPayload(writer, msg);
+      break;
+    case "catchupChunk":
+      encodeCatchupChunkPayload(writer, msg);
+      break;
+    case "catchupEnd":
+      encodeCatchupEndPayload(writer, msg);
+      break;
+    case "alreadyHave":
+      encodeAlreadyHavePayload(writer, msg);
+      break;
     case "syncComplete":
       encodeSyncCompletePayload(writer, msg);
       break;
@@ -317,10 +409,9 @@ export function encodeControlFrame(msg: ControlMessage): Uint8Array {
  * Decodes a complete CONTROL frame. Rejects with {@link ProtocolDecodeError}
  * for: an unsupported protocol version, a non-CONTROL channel byte, a
  * message type on the wrong side of its §3.6 C→S/S→C direction, a
- * reserved-but-unimplemented type (CATCHUP_BEGIN/CHUNK/END, ALREADY_HAVE,
- * PERMISSION_CHANGED — reason `UNIMPLEMENTED_MESSAGE_TYPE`), an
- * unrecognized type, or a frame that runs out of bytes mid-field / has
- * trailing bytes after a valid payload.
+ * reserved-but-unimplemented type (PERMISSION_CHANGED — reason
+ * `UNIMPLEMENTED_MESSAGE_TYPE`), an unrecognized type, or a frame that
+ * runs out of bytes mid-field / has trailing bytes after a valid payload.
  */
 export function decodeControlFrame(
   bytes: Uint8Array,
@@ -379,6 +470,18 @@ export function decodeControlFrame(
       break;
     case ControlMessageType.SNAPSHOT:
       msg = decodeSnapshotPayload(reader);
+      break;
+    case ControlMessageType.CATCHUP_BEGIN:
+      msg = decodeCatchupBeginPayload(reader);
+      break;
+    case ControlMessageType.CATCHUP_CHUNK:
+      msg = decodeCatchupChunkPayload(reader);
+      break;
+    case ControlMessageType.CATCHUP_END:
+      msg = decodeCatchupEndPayload(reader);
+      break;
+    case ControlMessageType.ALREADY_HAVE:
+      msg = decodeAlreadyHavePayload(reader);
       break;
     case ControlMessageType.SYNC_COMPLETE:
       msg = decodeSyncCompletePayload(reader);

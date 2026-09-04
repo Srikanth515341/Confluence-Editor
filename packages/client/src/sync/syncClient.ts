@@ -1,6 +1,8 @@
 import {
   Engine,
+  serializeId,
   type DeleteOperation,
+  type Identifier,
   type InsertOperation,
   type Operation,
 } from "@collab-editor/engine";
@@ -8,13 +10,16 @@ import {
   Channel,
   CLIENT_CAP_ACCEPTS_OP_INSERT_RUN,
   CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT,
+  CLIENT_CAP_HAS_RESIDENT_ENGINE,
   SnapshotForm,
+  SyncMode,
   decodeControlFrame,
   decodeFrame,
   decodeStructureSnapshotBody,
   encodeControlFrame,
   encodeFrame,
   peekChannel,
+  replaySnapshotNodesInto,
   seedEngineFromSnapshot,
   type ControlMessage,
   type OpsMessage,
@@ -23,7 +28,7 @@ import { Backoff, BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { ObservableValue, type ConnectionState, type Observable } from "./connectionState.js";
 import { openDurableQueue, type DurableQueue } from "./durableQueue.js";
 import { SequenceGapTracker } from "./gapTracker.js";
-import { reconcileOfflineQueue } from "./reconcileOfflineQueue.js";
+import { buildCleanCatchupBase, reconcileOfflineQueue } from "./reconcileOfflineQueue.js";
 import { UnackedQueue } from "./unackedQueue.js";
 import { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
 
@@ -67,6 +72,18 @@ function defaultCreateSocket(url: string, protocol: string): WebSocketLike {
   return ws as unknown as WebSocketLike;
 }
 
+/**
+ * A real MACROTASK yield (`setTimeout`, not a bare Promise/microtask) —
+ * Scope-IN's own wording for CATCHUP_CHUNK processing: "the client yields
+ * to the event loop between chunks so the UI stays responsive." A
+ * microtask alone (`Promise.resolve().then(...)`) never actually returns
+ * control to the event loop's timer/render queue; only a macrotask
+ * boundary does.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export interface SyncClientOptions {
   /** Full WebSocket URL up to and including `/v1/rt` (matches `.env.example`'s `VITE_WS_URL` shape) — SyncClient does not append {@link WS_PATH} itself. */
   readonly url: string;
@@ -92,6 +109,22 @@ export interface SyncClientOptions {
    * genuinely no IndexedDB to restore from).
    */
   readonly openDurableQueue?: () => DurableQueue | null | Promise<DurableQueue | null>;
+  /**
+   * Test Plan RC-33e's own required negative control, per the phase brief's
+   * explicit instruction: "build a variant that advances lastServerSeq per
+   * chunk. This test must FAIL against it. Keep it permanently behind an
+   * env flag." A browser-bundled class has no meaningful `process.env` of
+   * its own, so this project's established DUR-04 pattern (an env var read
+   * inside the shipped module, `writePath.ts`) is adapted to this file's
+   * OWN existing test-injection convention instead (`createSocket`,
+   * `openDurableQueue`) — same principle (the module that actually ships
+   * is what gets toggled, never a parallel copy), different mechanism,
+   * because THIS module runs in real browsers where an env var doesn't
+   * exist to read. NEVER set outside `reconnection.test.ts`'s own RC-33e
+   * case. See `handleCatchupChunk`'s doc comment for exactly what this
+   * breaks and why.
+   */
+  readonly mutateAdvanceSeqPerChunk?: boolean;
 }
 
 /**
@@ -149,12 +182,35 @@ export class SyncClient {
   /** PRD A-11: true once we've confirmed IndexedDB is unavailable (open failed/rejected, or the global doesn't exist at all) and this client has degraded to in-memory-only queueing. Never resets back to false — the degradation is for the lifetime of this page load, matching `openDurableQueueFn` only ever being attempted once (see `initDurableQueue`). */
   private durableQueueUnavailableValue = false;
 
+  private readonly mutateAdvanceSeqPerChunk: boolean;
+
+  /**
+   * Serializes SNAPSHOT's/CATCHUP's tail work — chunk application (each
+   * yielding to the event loop, Scope-IN) and ALREADY_HAVE reconciliation —
+   * onto one promise chain, regardless of which state-sync mode this
+   * handshake used. Reset to a trivially-resolved promise at the start of
+   * every handshake (`onOpen`); SNAPSHOT touches it not at all (nothing to
+   * serialize), so ALREADY_HAVE still runs correctly — one microtask later,
+   * never racing anything. CATCHUP's `catchupChunk`/`catchupEnd` handlers
+   * chain their own work onto it; `alreadyHave`'s handler chains onto
+   * WHATEVER is currently at the tail, guaranteeing it only runs after
+   * every chunk received so far (and its own yield) has actually finished
+   * applying — never racing an async chunk-drain still in flight.
+   */
+  private handshakeGate: Promise<void> = Promise.resolve();
+  /** The exact unacked stamps reported in THIS handshake's own HELLO — captured at send time (`onOpen`), consumed once by `handleAlreadyHave`. A local edit minted after HELLO but before ALREADY_HAVE arrives is NOT part of this set; see `onOpen`'s own comment for why that's an accepted, pre-existing edge case, not a Phase 23 regression. */
+  private helloUnackedIds: readonly Identifier[] = [];
+  /** CATCHUP progress bookkeeping (API Spec §3.6.4-§3.6.6) — diagnostic only, not consulted by any correctness logic (`handshakeGate`'s own promise chain is what actually serializes chunk application). */
+  private catchupTotalOps = 0;
+  private catchupReceivedOps = 0;
+
   constructor(opts: SyncClientOptions) {
     this.serverUrl = opts.url;
     this.documentId = opts.documentId;
     this.createSocket = opts.createSocket ?? defaultCreateSocket;
     this.onReconnectScheduled = opts.onReconnectScheduled;
     this.openDurableQueueFn = opts.openDurableQueue ?? openDurableQueue;
+    this.mutateAdvanceSeqPerChunk = opts.mutateAdvanceSeqPerChunk ?? false;
   }
 
   /**
@@ -429,13 +485,25 @@ export class SyncClient {
 
   private onOpen(): void {
     this.armSurvivedTimer();
+    this.handshakeGate = Promise.resolve(); // fresh handshake — see this field's own doc comment
+    // Captured HERE, not read fresh later, because `this.unacked` can legitimately gain entries
+    // AFTER this HELLO is sent but BEFORE ALREADY_HAVE arrives — Phase 22's relaxed
+    // requireEngine() allows minting during "reconnecting". Those later entries are simply not
+    // part of what THIS handshake's ALREADY_HAVE/reconcile step reasons about; they are handled
+    // the ordinary way (sendOperation transmits them directly once the socket is actually open)
+    // and get their own chance to reconcile on the NEXT handshake if this one doesn't reach them.
+    this.helloUnackedIds = this.unacked.ids();
+    const hasResidentEngine = this.engine !== null;
     this.sendControl({
       kind: "hello",
       documentId: this.documentId,
       ticket: new Uint8Array(), // no auth yet (Phase 29) — "accept any bytes" server-side
       lastServerSeq: this.gapTracker.value,
-      unacked: this.unacked.ids(),
-      clientCapabilities: CLIENT_CAP_ACCEPTS_OP_INSERT_RUN | CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT,
+      unacked: this.helloUnackedIds,
+      clientCapabilities:
+        CLIENT_CAP_ACCEPTS_OP_INSERT_RUN |
+        CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT |
+        (hasResidentEngine ? CLIENT_CAP_HAS_RESIDENT_ENGINE : 0),
     });
   }
 
@@ -466,9 +534,31 @@ export class SyncClient {
       case "welcome":
         this.replicaId = msg.replicaId;
         this.sessionId = msg.sessionId;
+        // ALREADY_CURRENT sends no further state-sync payload (no snapshot, no catchupBegin) —
+        // but this client's engine STILL needs rebuilding under the new replica id, from a
+        // clean base (see rebuildEngineForReconnect's own doc comment for why skipping this
+        // was a real, confirmed bug: reconciling offline edits against the OLD engine object
+        // mints them under the OLD, now-invalid replica id, which the server's write path
+        // silently rejects as IDENTITY_MISMATCH). SNAPSHOT/CATCHUP handle their own rebuild
+        // in handleSnapshot/handleCatchupBegin once their own payload arrives.
+        if (msg.syncMode === SyncMode.ALREADY_CURRENT) {
+          this.rebuildEngineForReconnect();
+        }
         break;
       case "snapshot":
         this.handleSnapshot(msg.seq, msg.form, msg.body);
+        break;
+      case "catchupBegin":
+        this.handleCatchupBegin(msg.totalOps);
+        break;
+      case "catchupChunk":
+        this.handleCatchupChunk(msg.throughSeq, msg.ops);
+        break;
+      case "catchupEnd":
+        this.handleCatchupEnd(msg.toSeq);
+        break;
+      case "alreadyHave":
+        this.handleAlreadyHave(msg.alreadyHave);
         break;
       case "pong":
         // Phase 22 fix (found by this phase's own DUR-07 e2e test, unrelated to the durable
@@ -485,6 +575,21 @@ export class SyncClient {
     }
   }
 
+  /**
+   * SNAPSHOT (API Spec §3.6.3): builds a BRAND-NEW engine from the
+   * server's own full structure. As of Phase 23, this method's job stops
+   * at building/seeding the engine and advancing sequence tracking —
+   * reconciling this client's own unacked queue against it now happens
+   * uniformly for every sync mode (SNAPSHOT/CATCHUP/ALREADY_CURRENT) once
+   * ALREADY_HAVE arrives, via `handshakeGate` — see
+   * `finishHandshakeAfterAlreadyHave`. Before Phase 23, this method
+   * unconditionally reconciled/resent EVERY unacked operation the instant
+   * SNAPSHOT arrived; that was a genuine duplication risk this phase
+   * closes (RC-33d/RC-28's own race: an operation that reached the server
+   * and is ALREADY reflected in this very SNAPSHOT would have been
+   * blindly re-minted and resent as a SECOND copy) — see
+   * AlreadyHaveMessage's own doc comment.
+   */
   private handleSnapshot(seq: number, form: SnapshotForm, body: Uint8Array): void {
     if (this.replicaId === null) {
       return; // SNAPSHOT before WELCOME would be a protocol violation from the server — ignore defensively rather than throw
@@ -497,31 +602,184 @@ export class SyncClient {
     } else {
       this.engine = new Engine(this.replicaId);
     }
-    // Phase 22: a fresh SNAPSHOT means a BRAND-NEW replica id (this project's server never
-    // resumes a session — see reconcileOfflineQueue.ts's own header comment) — so whatever this
-    // client had queued as unacked (from a prior connection this page session, OR restored from
-    // IndexedDB after a crash) can never be resent AS-IS; its stamps belong to a replica id the
-    // server will now reject as an identity mismatch. Instead: capture the queued operations,
-    // un-queue them (both memory and durable — they're about to be superseded, not acked),
-    // reconcile each one's INTENT against the freshly-seeded engine (producing brand-new
-    // operations under the new replica id), and send those. This is what makes offline editing
-    // during a "reconnecting" window (Scope-IN) actually reach the document, not just sit
-    // durably inert forever.
-    const queued = this.unacked.values();
-    for (const op of queued) {
-      this.unacked.ack(op.id);
+    this.gapTracker.reset(seq);
+    this.highestAppliedSeq = seq;
+    this.persistMeta();
+    // handshakeGate is left exactly as onOpen() set it (trivially resolved) — SNAPSHOT does no
+    // async chunked work, so ALREADY_HAVE's own handler (chained onto handshakeGate) runs
+    // correctly the moment it arrives, one microtask later.
+  }
+
+  /**
+   * Rebuilds `engine` for a CATCHUP or ALREADY_CURRENT reconnect — a new
+   * replica id always means a new `Engine` instance (`Engine.replicaId` is
+   * fixed at construction) — seeded from THIS CLIENT'S OWN currently-
+   * resident engine (`replaySnapshotNodesInto`, the same function the
+   * server's own warm start and this client's SNAPSHOT path both already
+   * use), never from a server-sent structure payload: the whole point of
+   * CATCHUP/ALREADY_CURRENT is that the server does NOT need to
+   * re-transmit content this client already has.
+   *
+   * The seed is `buildCleanCatchupBase`-filtered, NOT `this.engine.nodes`
+   * verbatim — see that function's own doc comment for the real,
+   * RC-*-matrix-confirmed bug this closes: this client's OWN currently-
+   * resident engine may already contain operations minted OFFLINE that
+   * were never acknowledged (`Engine.localInsert`/`localDelete` mutate
+   * synchronously at mint time, regardless of transmission). Seeding the
+   * fresh engine from that UNFILTERED list, then separately reconciling
+   * the SAME queued operations later (`finishHandshakeAfterAlreadyHave`),
+   * would mint a duplicate anchored to a node that was never transmitted
+   * and can never resolve on any other replica — a silently, permanently
+   * orphaned operation on every peer.
+   */
+  private rebuildEngineForReconnect(): void {
+    if (this.replicaId === null) {
+      return; // WELCOME hasn't arrived yet — unreachable in practice, since only WELCOME's own handler and handleCatchupBegin (itself gated on replicaId) call this
     }
-    this.syncUnsyncedCountObservable(); // covers the (rare) case resent.length === 0 below, where no later sendOperation call would otherwise refresh this
-    const resent = reconcileOfflineQueue(this.engine, queued);
+    const fresh = new Engine(this.replicaId);
+    if (this.engine) {
+      const unackedIds = new Set(this.unacked.values().map((op) => serializeId(op.id)));
+      replaySnapshotNodesInto(fresh, buildCleanCatchupBase(this.engine.nodes, unackedIds));
+    }
+    this.engine = fresh;
+  }
+
+  /**
+   * CATCHUP_BEGIN (API Spec §3.6.4): a delta sync is starting. Rebuilds
+   * `engine` (see {@link rebuildEngineForReconnect}), then `catchupChunk`/
+   * `catchupEnd` apply the missed delta on top.
+   *
+   * The server is only ever expected to offer CATCHUP to a client that
+   * advertised `CLIENT_CAP_HAS_RESIDENT_ENGINE` in HELLO (`decideSyncMode`,
+   * packages/server/src/handshake.ts) — `rebuildEngineForReconnect`'s own
+   * `this.engine === null` branch is unreachable in practice there, kept
+   * only as a defensive fallback rather than a silent crash if that
+   * contract is ever violated.
+   */
+  private handleCatchupBegin(totalOps: number): void {
+    if (this.replicaId === null) {
+      return; // CATCHUP_BEGIN before WELCOME would be a protocol violation from the server — ignore defensively
+    }
+    this.rebuildEngineForReconnect();
+    this.catchupTotalOps = totalOps;
+    this.catchupReceivedOps = 0;
+    this.handshakeGate = Promise.resolve(); // this handshake's own chunk-drain chain starts here
+  }
+
+  /**
+   * CATCHUP_CHUNK (API Spec §3.6.5). Chains this chunk's application onto
+   * `handshakeGate` — applying every operation via `engine.applyRemote()`
+   * (idempotent/causally-buffered regardless of arrival order, same as any
+   * live OPS frame), THEN a real macrotask yield (Scope-IN: "the client
+   * yields to the event loop between chunks so the UI stays responsive"),
+   * before the chain becomes available to the NEXT chunk or to CATCHUP_END/
+   * ALREADY_HAVE's own chained work.
+   *
+   * // lastServerSeq advances only here, at CATCHUP_END — never per chunk. A client
+   * // that advances per chunk and then loses the socket mid-catch-up requests the
+   * // wrong range on reconnect and SILENTLY SKIPS operations. API Spec §11.5.
+   *
+   * `mutateAdvanceSeqPerChunk` (Test Plan RC-33e, permanently gated,
+   * production NEVER sets it) is the deliberately-broken alternative the
+   * comment above warns about: it advances tracked progress the INSTANT a
+   * chunk is RECEIVED — synchronously, in this method, before the chunk's
+   * own operations have actually finished applying via the (necessarily
+   * async, yield-including) chain above. If the socket dies in the window
+   * between "this chunk's progress was optimistically recorded" and "this
+   * chunk's operations actually finished applying" (fully realistic: chunks
+   * can arrive back-to-back in one network read, well before the first
+   * one's own yield resolves), a reconnect's HELLO reports a
+   * `lastServerSeq` further ahead than what this engine actually has —
+   * the server computes the retry's delta range starting AFTER that point,
+   * so this chunk's own operations are never sent again. RC-33e's own job
+   * is to prove this is a REAL, reachable bug, not a hypothetical one.
+   */
+  private handleCatchupChunk(throughSeq: number, ops: readonly Operation[]): void {
+    if (this.mutateAdvanceSeqPerChunk) {
+      this.gapTracker.observe(throughSeq);
+      this.highestAppliedSeq = Math.max(this.highestAppliedSeq, throughSeq);
+      this.persistMeta();
+    }
+    this.handshakeGate = this.handshakeGate
+      .then(() => {
+        const engine = this.engine;
+        if (!engine) {
+          return;
+        }
+        for (const op of ops) {
+          engine.applyRemote(op);
+        }
+        this.catchupReceivedOps += ops.length;
+      })
+      .then(() => yieldToEventLoop());
+  }
+
+  /**
+   * CATCHUP_END (API Spec §3.6.6) — see `handleCatchupChunk`'s own doc
+   * comment for the required, load-bearing comment this implements and
+   * why. Chained onto `handshakeGate` so it only runs once every chunk
+   * received so far has genuinely finished applying, never racing an
+   * in-flight chunk.
+   */
+  private handleCatchupEnd(toSeq: number): void {
+    this.handshakeGate = this.handshakeGate.then(() => {
+      // lastServerSeq advances only here, at CATCHUP_END — never per chunk. A client
+      // that advances per chunk and then loses the socket mid-catch-up requests the
+      // wrong range on reconnect and SILENTLY SKIPS operations. API Spec §11.5.
+      this.gapTracker.observe(toSeq);
+      this.highestAppliedSeq = Math.max(this.highestAppliedSeq, toSeq);
+      this.persistMeta();
+    });
+  }
+
+  /**
+   * ALREADY_HAVE (API Spec §3.6.7) — the tail shared by every sync mode.
+   * Chains onto `handshakeGate` so it runs strictly after SNAPSHOT (trivial,
+   * already resolved) or every CATCHUP chunk received so far (including
+   * CATCHUP_END's own final advance) has completed.
+   */
+  private handleAlreadyHave(alreadyHave: readonly Identifier[]): void {
+    void this.handshakeGate.then(() => this.finishHandshakeAfterAlreadyHave(alreadyHave));
+  }
+
+  /**
+   * Splits THIS handshake's own reported unacked stamps (`helloUnackedIds`)
+   * into two groups against `alreadyHave`: stamps the server already has
+   * durably committed are acknowledged LOCALLY (never reconciled/resent —
+   * their content is already reflected in whatever engine state this
+   * handshake just built); every other stamp still present in `unacked` is
+   * the genuine remainder, reconciled via `reconcileOfflineQueue` exactly
+   * as every sync mode has always done. Then sends SYNC_COMPLETE and
+   * transitions to `synced` — the single tail every sync mode converges on.
+   */
+  private finishHandshakeAfterAlreadyHave(alreadyHave: readonly Identifier[]): void {
+    const engine = this.engine;
+    if (!engine) {
+      return; // defensive — unreachable in practice, since every path that reaches here already set engine
+    }
+    const alreadyHaveSet = new Set(alreadyHave.map((id) => serializeId(id)));
+    const toReconcile: Operation[] = [];
+    for (const id of this.helloUnackedIds) {
+      const op = this.unacked.get(id);
+      if (!op) {
+        continue; // already acked/removed some other way since HELLO was sent
+      }
+      this.unacked.ack(id); // either already-committed (server confirms it via ALREADY_HAVE) or about to be superseded by a freshly-reconciled resend — either way, this exact stamp is done
+      if (!alreadyHaveSet.has(serializeId(id))) {
+        toReconcile.push(op);
+      }
+    }
+    this.syncUnsyncedCountObservable();
+    const resent = reconcileOfflineQueue(engine, toReconcile);
     for (const op of resent) {
       this.sendOperation(op);
     }
 
-    this.gapTracker.reset(seq);
-    this.highestAppliedSeq = seq;
-    this.persistMeta();
-
-    this.sendControl({ kind: "syncComplete", lastServerSeq: seq, resentCount: resent.length });
+    this.sendControl({
+      kind: "syncComplete",
+      lastServerSeq: this.highestAppliedSeq,
+      resentCount: resent.length,
+    });
 
     this.everSynced = true;
     this.stateValue.set("synced");

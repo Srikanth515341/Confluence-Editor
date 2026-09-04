@@ -10,6 +10,7 @@ import {
   encodeFrame,
   SnapshotForm,
   SyncMode,
+  type AlreadyHaveMessage,
   type ControlMessage,
   type OpsMessage,
   type SnapshotMessage,
@@ -110,7 +111,22 @@ function helloBytes(
   });
 }
 
-/** Full HELLO -> WELCOME -> SNAPSHOT exchange against a real server, over a real `ws` connection. */
+/**
+ * Full HELLO -> WELCOME -> SNAPSHOT -> ALREADY_HAVE exchange against a
+ * real server, over a real `ws` connection. Every caller in this file
+ * connects fresh (default `helloBytes` — `lastServerSeq: 0`,
+ * `clientCapabilities: 0`, i.e. no resident-engine bit), so `decideSyncMode`
+ * (Phase 23) always resolves to SNAPSHOT here — this helper stays
+ * SNAPSHOT-specific; a reconnection-focused test exercising CATCHUP lives
+ * in `packages/client/src/sync/reconnection.test.ts` instead, against a
+ * real `SyncClient` rather than hand-built frames. ALREADY_HAVE is always
+ * the third CONTROL frame regardless of syncMode (gateway.ts sends it
+ * unconditionally after whichever state-sync payload applies) and MUST be
+ * consumed here, not left buffered — otherwise a later `frames.next()`/
+ * `frames.nextControl()` call elsewhere in this file (e.g. the PONG checks
+ * in the heartbeat tests below) would silently receive this leftover
+ * frame instead of the one it actually expects.
+ */
 async function connectAndHandshake(
   port: number,
   documentId: string,
@@ -119,6 +135,7 @@ async function connectAndHandshake(
   frames: IncomingFrames;
   welcome: WelcomeMessage;
   snapshot: SnapshotMessage;
+  alreadyHave: AlreadyHaveMessage;
 }> {
   const ws = new WebSocket(wsUrl(port), WS_SUBPROTOCOL);
   await waitForOpen(ws);
@@ -134,8 +151,12 @@ async function connectAndHandshake(
   if (snapshotMsg.kind !== "snapshot") {
     throw new Error(`expected SNAPSHOT, got ${snapshotMsg.kind}`);
   }
+  const alreadyHaveMsg = await frames.nextControl();
+  if (alreadyHaveMsg.kind !== "alreadyHave") {
+    throw new Error(`expected ALREADY_HAVE, got ${alreadyHaveMsg.kind}`);
+  }
 
-  return { ws, frames, welcome: welcomeMsg, snapshot: snapshotMsg };
+  return { ws, frames, welcome: welcomeMsg, snapshot: snapshotMsg, alreadyHave: alreadyHaveMsg };
 }
 
 function sendSyncComplete(ws: WebSocket, lastServerSeq: number): void {

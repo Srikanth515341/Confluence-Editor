@@ -12,6 +12,55 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 23 — reconnection handshake (CATCHUP/ALREADY_HAVE).** A client
+whose socket drops but keeps its in-memory engine now catches up over
+just `(lastServerSeq, currentSeq]` instead of receiving a full fresh
+SNAPSHOT — chunked (≤256 ops/≤64KB per chunk, yielding to the event loop
+between chunks), computed from the durable operation log (never the live,
+GC-pruned engine, so a collected tombstone can never look "never
+committed"). Independently of sync mode, the server also tells a
+reconnecting client which of its own queued-but-unacked stamps it already
+committed (ALREADY_HAVE), so only the genuine remainder gets reconciled
+and resent. The required 27-cell test matrix (Test Plan §5.1, D×L×R)
+found two real, previously-invisible bugs — ALREADY_CURRENT mode never
+rebuilding the client's engine after a reconnect (silently orphaning
+every queued edit under an IDENTITY_MISMATCH rejection with no visible
+failure), and CATCHUP mode seeding its rebuild from an unfiltered node
+list that duplicated offline-minted content and permanently orphaned the
+duplicate on every peer — both fixed and covered by the matrix
+permanently. RC-27 (the worst corner, 2,000 local + 5,000 remote ops)
+reconnects in 3.6s p95 across 20 real runs, well inside PRD M6's 5s
+budget. A deliberate mutation test (a client that advances
+`lastServerSeq` per chunk instead of only at CATCHUP_END) is proven to
+fail, permanently, behind a test-only flag. A genuine statistical
+recalibration was needed for RC-34's 32-client jitter check — the literal
+spec threshold turned out to be below the *average* outcome of correctly
+jittered code at this sample size; the fix is derived from an actual
+Monte Carlo simulation, documented in both the test file and CLAUDE.md.
+Server-side session/replica-id resumption remains explicitly out of
+scope, unchanged since Phase 8/9. See [`CLAUDE.md`](./CLAUDE.md)'s Phase
+23 entry for the full account.
+
+**Phase 22 — client durable queue (IndexedDB).** Unacknowledged
+operations now survive a tab close or browser crash (API Spec §7.9),
+which — as a necessary consequence — makes offline *editing* itself
+possible for the first time: a keystroke typed while `reconnecting` or
+`offline` durably queues instead of being silently dropped, and is
+replayed as a fresh, re-minted operation once the connection is restored
+(this project's server has never supported session/replica-id resumption,
+so a queued edit's original identity can never survive a reconnect — only
+its content does, which is what every DoD assertion actually checks).
+Found and fixed one pre-existing bug unrelated to this phase's own work —
+`gapTracker.ts`'s stall detection had never treated an inbound PONG as
+liveness, so any session with 5+ seconds of silence force-reconnected
+forever, undetected until this phase's own test was the first to hold an
+idle multi-client session open long enough to hit it — plus a real
+write-ordering violation and a real duplicate-content risk in the new
+queue's own ack-flushing path. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 22
+entry for the full account, including the explicit, user-approved
+architectural decision to re-mint queued operations' *intent* rather than
+reopen server-side session resumption.
+
 **Phase 21 — tombstone garbage collection.** `Engine.collect()` (Engine
 Spec §7.4's COLLECT: a node is reclaimed only once it's deleted, its
 delete is causally stable — every currently active replica has observed
@@ -285,7 +334,7 @@ runs this at full scale on a schedule.
 | Mutation testing + nightly CI gate         | ✅ Phase 6 (9/10 mutants killed; MUT-KILL-01 directed search for the 10th)                                 |
 | Binary wire codec (OPS channel)            | ✅ Phase 7 (varints, primitives, envelope, all 7 OPS message types)                                        |
 | WebSocket gateway + Document Coordinator   | ✅ Phase 8 (in-memory)                                                                                     |
-| Sync handshake + heartbeat (fresh conn.)   | ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG; CATCHUP not built)                             |
+| Sync handshake + heartbeat (fresh conn.)   | ✅ Phase 9 (HELLO/WELCOME/SNAPSHOT/SYNC_COMPLETE/PING-PONG)                                                |
 | Client sync layer (SyncClient)             | ✅ Phase 10 (backoff, unacked queue, gap handling; no UI/DOM binding yet)                                  |
 | DOM render model + position mapping        | ✅ Phase 11 (DomWriter, render index, Playwright on real browsers)                                         |
 | Input pipeline (beforeinput → ops)         | ✅ Phase 12 (full inputType table, grapheme/word/line deletion, first React component)                     |
@@ -296,9 +345,12 @@ runs this at full scale on a schedule.
 | Snapshots + snapshot-aware warm start      | ✅ Phase 17 (RFC §13.2 MAYBE-SNAPSHOT, 500 ops/30s, off the hot path; <2s warm start at 50k ops)           |
 | Integrity audit + bisect                   | ✅ Phase 18 (independent log replay vs. live server; real BISECT; scheduled job + admin CLI)               |
 | Indexed position structure (O(log N))      | ✅ **Phase 19** (treap-backed PositionIndex; 0.80x p95 growth over 100x size; M3-c p99 0.030ms)             |
+| Block run-length encoding                  | ✅ Phase 20 (SNAPSHOT wire format; 50,000x compression on sequential typing; found/fixed 2 core algorithm bugs) |
+| Tombstone garbage collection                | ✅ Phase 21 (Engine.collect(), real stability frontier, 60s per-document GC cycle, wall-clock safety cap)   |
+| Offline editing (durable queue + replay)   | ✅ **Phase 22** (IndexedDB-backed unacked queue, API Spec §7.9; survives tab close/crash)                  |
+| Reconnection handshake (CATCHUP/ALREADY_HAVE) | ✅ **Phase 23** (delta sync over the durable log; RC-27 3.6s p95, well under PRD M6's 5s budget)         |
 | Auth, presence                             | ⏳ not started (Phases 26-29, 31)                                                                          |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
-| Offline editing (queue-and-replay)         | ⏳ not started (Phase 22)                                                                                  |
 | Permissions                                | ⏳ not started                                                                                             |
 | Version history                            | ⏳ not started                                                                                             |
 

@@ -87,6 +87,11 @@ function snapshotFrame(seq: number): Uint8Array {
   });
 }
 
+/** Phase 23: ALREADY_HAVE always follows the state-sync payload — SyncClient only reconciles its unacked queue and reaches "synced" once this arrives (see syncClient.ts's `handshakeGate`). Empty here means "the server has none of these stamps yet," i.e. the whole unacked queue is a genuine remainder to reconcile — exactly what these DUR-07/08/09 scenarios (a crash before any ack ever arrived) actually represent. */
+function alreadyHaveFrame(): Uint8Array {
+  return encodeControlFrame({ kind: "alreadyHave", alreadyHave: [] });
+}
+
 /**
  * Polls until `sockets` gains a new entry. A single `setTimeout(0)` is not reliably enough —
  * `beginConnect()`'s async branch (`finishAsyncDurableInit`) chains through fake-indexeddb's
@@ -170,6 +175,8 @@ describe("SyncClient — durable queue integration (Phase 22, DUR-07)", () => {
     wsA.triggerOpen();
     wsA.triggerMessage(welcomeFrame(1));
     wsA.triggerMessage(snapshotFrame(0));
+    wsA.triggerMessage(alreadyHaveFrame());
+    await Promise.resolve(); // finishHandshakeAfterAlreadyHave runs as a microtask chained onto handshakeGate (syncClient.ts)
     expect(clientA.state.value).toBe("synced");
 
     // Sever the connection — the client keeps its engine (Phase 14's "last known state") and,
@@ -205,6 +212,12 @@ describe("SyncClient — durable queue integration (Phase 22, DUR-07)", () => {
 
     wsB.triggerMessage(welcomeFrame(2)); // a brand-new replica id — no session resumption (Phase 8/9)
     wsB.triggerMessage(snapshotFrame(0)); // an empty snapshot — the old (dead) server's state, if any, is gone
+    // None of the 200 durably-queued stamps were ever transmitted to any real server in this
+    // test (clientA minted them entirely offline, after wsA was already severed) — so a real
+    // server's own ALREADY_HAVE would legitimately report none of them as already committed
+    // either, which is exactly what this empty frame simulates.
+    wsB.triggerMessage(alreadyHaveFrame());
+    await Promise.resolve(); // finishHandshakeAfterAlreadyHave runs as a microtask chained onto handshakeGate (syncClient.ts)
 
     // ASSERT all 200 land in the final document, exactly once.
     expect(clientB.engine?.text()).toHaveLength(200);

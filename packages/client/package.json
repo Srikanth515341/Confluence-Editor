@@ -15,7 +15,8 @@
     "test:e2e:install": "playwright install chromium firefox webkit",
     "test:e2e:conv": "playwright test --project=convergence",
     "test:e2e:durableQueue": "playwright test --project=durableQueue",
-    "test:benchmark": "vitest run --config vitest.benchmark.config.ts"
+    "test:benchmark": "vitest run --config vitest.benchmark.config.ts",
+    "test:reconnection": "vitest run --config vitest.reconnection.config.ts"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*",

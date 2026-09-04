@@ -30,7 +30,8 @@
 // already established.
 
 import { randomUUID } from "node:crypto";
-import type { Node, Operation } from "@collab-editor/engine";
+import type { Identifier, Node, Operation } from "@collab-editor/engine";
+import { serializeId } from "@collab-editor/engine";
 import {
   decodeFrame,
   decodeStructureSnapshotBody,
@@ -196,6 +197,38 @@ export interface OperationStore {
   /** Same query as {@link loadFullOperationLog}, but keeping each operation's own `seq` — audit.ts's (Phase 18) bisect and pendingCount()-error reporting both need to name a specific seq, which the seq-stripped version can't provide. */
   loadFullOperationLogWithSeq(documentId: string): Promise<SeqOperation[]>;
 
+  /**
+   * Phase 23 (API Spec §3.6.4-§3.6.5, CATCHUP): operations with
+   * `fromSeqExclusive < seq <= toSeqInclusive`, in ascending seq order —
+   * exactly the delta a reconnecting client with a resident engine needs
+   * to replay on top of its own existing structure. Reads from the SAME
+   * durable, never-pruned `operations` table `loadFullOperationLog` does
+   * (not the live, GC-able in-memory engine — Phase 21's tombstone
+   * collection physically removes nodes from `coordinator.engine` once
+   * causally stable, but never touches this table), so a delta computed
+   * here is correct regardless of how aggressively GC has run in the
+   * meantime.
+   */
+  loadOperationLogRange(
+    documentId: string,
+    fromSeqExclusive: bigint,
+    toSeqInclusive: bigint,
+  ): Promise<SeqOperation[]>;
+
+  /**
+   * Phase 23 (API Spec §3.6.7, ALREADY_HAVE): of `stamps`, the subset that
+   * already has a committed row in `operations` for this document — i.e.
+   * origin stamps the server durably has, regardless of whether their
+   * author ever received the OP_ACK for them (the exact RC-33d/RC-28
+   * race: committed, but the ack was lost when the socket died). Queried
+   * against durable storage, never the live engine's structure, for the
+   * same GC-independence reason as {@link loadOperationLogRange} — a
+   * stamp whose tombstone was already physically collected from
+   * `coordinator.engine` must still be reported as "already have," or a
+   * reconnecting client would wrongly re-mint and duplicate it.
+   */
+  findExistingStamps(documentId: string, stamps: readonly Identifier[]): Promise<Identifier[]>;
+
   /** Persists one snapshot row (API Spec §2.7, Phase 17 §6.4) — see snapshotter.ts for when this is called and why it's never awaited from the write path itself. */
   writeSnapshot(input: WriteSnapshotInput): Promise<void>;
 
@@ -358,6 +391,42 @@ export class PostgresOperationStore implements OperationStore {
       [documentId],
     );
     return rows.map((r) => ({ seq: BigInt(r.seq), op: decodeOperationPayload(r.payload) }));
+  }
+
+  async loadOperationLogRange(
+    documentId: string,
+    fromSeqExclusive: bigint,
+    toSeqInclusive: bigint,
+  ): Promise<SeqOperation[]> {
+    const { rows } = await this.pool.query<{ seq: string; payload: Buffer }>(
+      `SELECT seq, payload FROM operations
+        WHERE document_id = $1 AND seq > $2 AND seq <= $3
+        ORDER BY seq ASC`,
+      [documentId, fromSeqExclusive.toString(), toSeqInclusive.toString()],
+    );
+    return rows.map((r) => ({ seq: BigInt(r.seq), op: decodeOperationPayload(r.payload) }));
+  }
+
+  async findExistingStamps(
+    documentId: string,
+    stamps: readonly Identifier[],
+  ): Promise<Identifier[]> {
+    if (stamps.length === 0) {
+      return [];
+    }
+    // (stamp_r, stamp_c) tuple membership against the caller's own list, via UNNEST — the same
+    // parallel-array technique Phase 15/17's own bulk-insert fixtures already established for
+    // this codebase, applied here to a read instead of a write.
+    const rs = stamps.map((s) => s.r);
+    const cs = stamps.map((s) => s.c);
+    const { rows } = await this.pool.query<{ stamp_r: string; stamp_c: string }>(
+      `SELECT o.stamp_r, o.stamp_c
+         FROM operations o
+         JOIN UNNEST($2::bigint[], $3::bigint[]) AS t(r, c) ON o.stamp_r = t.r AND o.stamp_c = t.c
+        WHERE o.document_id = $1`,
+      [documentId, rs, cs],
+    );
+    return rows.map((r) => ({ r: Number(r.stamp_r), c: Number(r.stamp_c) }));
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
@@ -648,6 +717,33 @@ export class InMemoryOperationStore implements OperationStore {
     // array position (1-indexed) is a reasonable stand-in, since this store's own `ops` array
     // is already append-only and gapless.
     return (this.opsByDocument.get(documentId) ?? []).map((op, i) => ({ seq: BigInt(i + 1), op }));
+  }
+
+  async loadOperationLogRange(
+    documentId: string,
+    fromSeqExclusive: bigint,
+    toSeqInclusive: bigint,
+  ): Promise<SeqOperation[]> {
+    // Same 1-indexed array-position-as-seq convention as loadFullOperationLogWithSeq above —
+    // this store never tracks a real per-operation seq, since nothing durable exists to number.
+    return (this.opsByDocument.get(documentId) ?? [])
+      .map((op, i): SeqOperation => ({ seq: BigInt(i + 1), op }))
+      .filter(({ seq }) => seq > fromSeqExclusive && seq <= toSeqInclusive);
+  }
+
+  async findExistingStamps(
+    documentId: string,
+    stamps: readonly Identifier[],
+  ): Promise<Identifier[]> {
+    const wanted = new Set(stamps.map((s) => serializeId(s)));
+    const present: Identifier[] = [];
+    for (const op of this.opsByDocument.get(documentId) ?? []) {
+      const key = serializeId(op.id);
+      if (wanted.has(key)) {
+        present.push(op.id);
+      }
+    }
+    return present;
   }
 
   async writeSnapshot(_input: WriteSnapshotInput): Promise<void> {

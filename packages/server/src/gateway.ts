@@ -5,6 +5,7 @@ import {
   Channel,
   ProtocolDecodeError,
   SessionRole,
+  SyncMode,
   decodeControlFrame,
   decodeFrame,
   encodeControlFrame,
@@ -17,7 +18,13 @@ import { AckBatcher } from "./ackBatcher.js";
 import type { OperationStore } from "./db/operationStore.js";
 import { DocumentCoordinator, type CoordinatorSession } from "./documentCoordinator.js";
 import { armPresenceStaleTimer, disarmPresenceStaleTimer, onPingReceived } from "./heartbeat.js";
-import { buildSnapshotMessage, buildWelcomeMessage } from "./handshake.js";
+import {
+  buildAlreadyHaveMessage,
+  buildCatchupMessages,
+  buildSnapshotMessage,
+  buildWelcomeMessage,
+  decideSyncMode,
+} from "./handshake.js";
 import { logger } from "./logger.js";
 import { ConnectionSendQueues } from "./sendQueues.js";
 import { processIncomingOperation } from "./writePath.js";
@@ -199,13 +206,34 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           });
         });
 
-      // WELCOME, then SNAPSHOT (API Spec §3.6.1-§3.6.3) — both on CONTROL, in this order,
-      // so the client always sees its own admission before the state it's being admitted to.
+      // WELCOME, then whichever state-sync payload its own syncMode promises, then ALREADY_HAVE
+      // (API Spec §3.6.1-§3.6.3, §3.6.4-§3.6.7, Phase 23) — all on CONTROL, in this order, so the
+      // client always sees its own admission before the state it's being admitted to, and the
+      // state it's being admitted to before being told which of its own queued edits already
+      // landed.
+      const syncMode = decideSyncMode(ctrlMsg, coordinator.currentSeq);
       queues.enqueue(
         "control",
-        encodeControlFrame(buildWelcomeMessage(coordinator, sessionId, replicaId)),
+        encodeControlFrame(buildWelcomeMessage(coordinator, sessionId, replicaId, syncMode)),
       );
-      queues.enqueue("control", encodeControlFrame(buildSnapshotMessage(coordinator)));
+      if (syncMode === SyncMode.SNAPSHOT) {
+        queues.enqueue("control", encodeControlFrame(buildSnapshotMessage(coordinator)));
+      } else if (syncMode === SyncMode.CATCHUP) {
+        const { begin, chunks, end } = await buildCatchupMessages(
+          coordinator,
+          ctrlMsg.lastServerSeq,
+        );
+        queues.enqueue("control", encodeControlFrame(begin));
+        for (const chunk of chunks) {
+          queues.enqueue("control", encodeControlFrame(chunk));
+        }
+        queues.enqueue("control", encodeControlFrame(end));
+      }
+      // ALREADY_CURRENT: nothing to send for state sync — the client's own resident engine is
+      // already caught up.
+
+      const alreadyHave = await buildAlreadyHaveMessage(coordinator, ctrlMsg.unacked);
+      queues.enqueue("control", encodeControlFrame(alreadyHave));
     }
 
     /** PING/SYNC_COMPLETE/LEAVE — the only CONTROL types a client may legally send after handshake (§3.6). */

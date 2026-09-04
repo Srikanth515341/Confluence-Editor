@@ -1,15 +1,14 @@
-import type { Identifier } from "@collab-editor/engine";
+import type { Identifier, Operation } from "@collab-editor/engine";
 
 /**
  * CONTROL channel message types (API Spec §3.6), namespaced within the
  * CONTROL channel (§3.2's `channel` byte = 0x03, Phase 8's `Channel.CONTROL`).
  * Numeric values are taken verbatim from the spec text. CATCHUP_BEGIN/
- * CATCHUP_CHUNK/CATCHUP_END/ALREADY_HAVE (reconnection, Phase 23) and
- * PERMISSION_CHANGED (Phases 26-29) are reserved here — the numeric slot
- * exists so a future frame carrying one of these types is recognized as
- * "a real, still-unimplemented type" rather than "unknown garbage" — but
- * this phase implements none of their payload logic, per the phase
- * brief's explicit instruction.
+ * CATCHUP_CHUNK/CATCHUP_END/ALREADY_HAVE (reconnection, API Spec
+ * §3.6.4-§3.6.8) are implemented as of Phase 23. PERMISSION_CHANGED
+ * (Phases 26-29) is still reserved — the numeric slot exists so a future
+ * frame carrying it is recognized as "a real, still-unimplemented type"
+ * rather than "unknown garbage."
  */
 export enum ControlMessageType {
   HELLO = 0x01,
@@ -28,11 +27,15 @@ export enum ControlMessageType {
   GOODBYE = 0x0e,
 }
 
-/** Message types this phase implements payload encode/decode for. The rest of {@link ControlMessageType} are reserved-but-unimplemented (see its doc comment). */
+/** Message types this phase implements payload encode/decode for. PERMISSION_CHANGED (Phases 26-29) remains reserved-but-unimplemented (see the enum's own doc comment). */
 const IMPLEMENTED_CONTROL_TYPES: ReadonlySet<ControlMessageType> = new Set([
   ControlMessageType.HELLO,
   ControlMessageType.WELCOME,
   ControlMessageType.SNAPSHOT,
+  ControlMessageType.CATCHUP_BEGIN,
+  ControlMessageType.CATCHUP_CHUNK,
+  ControlMessageType.CATCHUP_END,
+  ControlMessageType.ALREADY_HAVE,
   ControlMessageType.SYNC_COMPLETE,
   ControlMessageType.ERROR,
   ControlMessageType.PING,
@@ -48,6 +51,21 @@ export function isImplementedControlType(type: number): type is ControlMessageTy
 /** HELLO's capability bitfield (§3.6.1). */
 export const CLIENT_CAP_ACCEPTS_OP_INSERT_RUN = 0x01;
 export const CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT = 0x02;
+/**
+ * Phase 23 addition: set when this client still holds a live, resident
+ * `Engine` from before the reconnect (a socket drop that never nulled
+ * `SyncClient.engine` — Phase 14's "last known state" design) as opposed to
+ * a brand-new page load with nothing but durably-remembered metadata (Phase
+ * 22's `meta.lastServerSeq`, restored with no actual document content
+ * behind it). The server must never offer `SyncMode.CATCHUP` — a DELTA the
+ * client is expected to apply on top of its own existing structure — to a
+ * client that has no existing structure to apply it to; doing so would
+ * silently lose everything before `lastServerSeq`. This bit is the only
+ * signal that distinguishes those two cases from the server's point of
+ * view (`hello.lastServerSeq` alone cannot: both report a nonzero value).
+ * See `decideSyncMode` (packages/server/src/handshake.ts).
+ */
+export const CLIENT_CAP_HAS_RESIDENT_ENGINE = 0x04;
 
 /** The first frame after the upgrade (§3.6.1, C→S). */
 export interface HelloMessage {
@@ -59,24 +77,33 @@ export interface HelloMessage {
    * 0 for a client's very first-ever connection. As of Phase 22, a
    * reconnecting/restarting client with durably-persisted queue state
    * (API Spec §7.9's `meta.lastServerSeq`) reports the last value it
-   * confirmed, read back BEFORE this HELLO is sent — the server does not
-   * yet act on it either way (true CATCHUP/delta-sync is Phase 23), so
-   * this remains observational until then.
+   * confirmed, read back BEFORE this HELLO is sent. As of Phase 23 the
+   * server ACTS on this: together with `clientCapabilities`'s
+   * `CLIENT_CAP_HAS_RESIDENT_ENGINE` bit, it decides WELCOME's `syncMode`
+   * — SNAPSHOT, CATCHUP (a delta over `(lastServerSeq, currentSeq]`), or
+   * ALREADY_CURRENT (`lastServerSeq === currentSeq`, nothing missed). See
+   * `decideSyncMode` (packages/server/src/handshake.ts).
    */
   readonly lastServerSeq: number;
   /**
    * Origin stamps of every operation this client has queued but not yet
-   * had acknowledged — always empty before Phase 22. As of Phase 22, a
-   * client restored from a durable queue (a prior page load that crashed
-   * or closed mid-edit) reports the full restored set here, per API Spec
-   * §7.9 ("on document open, read before connecting so HELLO.unacked is
-   * complete") — the server still does not act on this field (no
-   * session/replica resumption exists, Phase 8/9's deliberate design; see
-   * `packages/client/src/sync/reconcileOfflineQueue.ts` for how those
-   * operations actually reach the document instead), so it remains
-   * observational, same as `lastServerSeq` above.
+   * had acknowledged — always empty before Phase 22. A client restored
+   * from a durable queue (a prior page load that crashed or closed
+   * mid-edit) reports the full restored set here, per API Spec §7.9 ("on
+   * document open, read before connecting so HELLO.unacked is complete").
+   * As of Phase 23 the server ACTS on this too: it checks which of these
+   * stamps are already durably committed (they reached the server before
+   * the disconnect, just never got acked back) and reports that subset
+   * via ALREADY_HAVE, so the client only needs to reconcile/resend the
+   * genuine remainder — see
+   * `packages/client/src/sync/reconcileOfflineQueue.ts` and
+   * `SyncClient.handleAlreadyHave`. There is still no session/replica
+   * resumption (Phase 8/9's deliberate design) — a stamp the server
+   * already has is acknowledged locally, never literally resent under
+   * its original identity.
    */
   readonly unacked: readonly Identifier[];
+  /** Bitfield of `CLIENT_CAP_*` constants above. */
   readonly clientCapabilities: number;
 }
 
@@ -87,7 +114,17 @@ export enum SessionRole {
   OWNER = 2,
 }
 
-/** §3.6.2's syncMode byte. This phase only ever sends SNAPSHOT — CATCHUP is Phase 23; ALREADY_CURRENT never applies without reconnection support. */
+/**
+ * §3.6.2's syncMode byte — decided per-connection by `decideSyncMode`
+ * (packages/server/src/handshake.ts, Phase 23): SNAPSHOT for a client with
+ * no resident engine (a fresh join, or a fresh page load restoring only
+ * durable metadata) or one whose `lastServerSeq` the server can no longer
+ * make sense of; CATCHUP for a client with a resident engine trailing
+ * behind `currentSeq`, sent as CATCHUP_BEGIN/CATCHUP_CHUNK.../CATCHUP_END
+ * instead of a full SNAPSHOT; ALREADY_CURRENT when `lastServerSeq` already
+ * equals `currentSeq` (nothing to catch up on state-sync-wise — ALREADY_HAVE
+ * for the client's own unacked stamps still follows either way).
+ */
 export enum SyncMode {
   SNAPSHOT = 0,
   CATCHUP = 1,
@@ -133,6 +170,76 @@ export interface SnapshotMessage {
   readonly seq: number;
   readonly form: SnapshotForm;
   readonly body: Uint8Array;
+}
+
+/**
+ * Announces the start of a CATCHUP delta sync (§3.6.4, S→C) — sent instead
+ * of SNAPSHOT when WELCOME's `syncMode === CATCHUP`. `fromSeq` is the
+ * client's own reported `lastServerSeq` (exclusive — the delta covers
+ * `(fromSeq, toSeq]`); `toSeq` is `coordinator.currentSeq` AT THE MOMENT the
+ * delta range was computed (may already be behind `coordinator.currentSeq`
+ * by the time streaming finishes, if concurrent operations commit
+ * meanwhile — those simply arrive afterward via the normal live OPS
+ * broadcast, same as for any already-joined session). `totalOps` is the
+ * total operation count the delta will carry across every following
+ * CATCHUP_CHUNK, for client-side progress/sanity purposes only.
+ */
+export interface CatchupBeginMessage {
+  readonly kind: "catchupBegin";
+  readonly fromSeq: number;
+  readonly toSeq: number;
+  readonly totalOps: number;
+}
+
+/**
+ * One chunk of a CATCHUP delta (§3.6.5, S→C) — mandatory chunking, ≤256
+ * operations or ≤64KB encoded per chunk (Scope-IN). `throughSeq` is the
+ * seq of this chunk's OWN last operation — a safe checkpoint value (seq
+ * numbering can legitimately skip a "spent but rowless" value from a
+ * historically-suppressed duplicate, API Spec §6.3 step 8's own doc
+ * comment, so op count alone can't reconstruct it) — but see
+ * `SyncClient.handleCatchupChunk`'s own comment for why the CORRECT client
+ * never advances its tracked `lastServerSeq` from this field; it exists
+ * on the wire specifically so Test Plan RC-33e's deliberately-mutated
+ * client variant has a well-defined (wrong) value to advance from instead.
+ */
+export interface CatchupChunkMessage {
+  readonly kind: "catchupChunk";
+  readonly throughSeq: number;
+  readonly ops: readonly Operation[];
+}
+
+/**
+ * Ends a CATCHUP delta sync (§3.6.6, S→C). `toSeq` matches
+ * CatchupBeginMessage's own `toSeq` — the ONLY point at which a correct
+ * client may advance its tracked `lastServerSeq` (API Spec §11.5; see the
+ * required comment at `SyncClient.handleCatchupEnd`). `totalOps` echoes
+ * CATCHUP_BEGIN's own count, for a client-side sanity cross-check against
+ * how many operations actually arrived across all chunks.
+ */
+export interface CatchupEndMessage {
+  readonly kind: "catchupEnd";
+  readonly toSeq: number;
+  readonly totalOps: number;
+}
+
+/**
+ * The subset of the client's own HELLO.unacked stamps the server already
+ * has durably committed (§3.6.7, S→C) — always sent, after whichever
+ * state-sync payload (SNAPSHOT, CATCHUP, or nothing for ALREADY_CURRENT)
+ * completes, even when `alreadyHave` is empty. A stamp listed here reached
+ * the server before the disconnect but never got its OP_ACK back (the
+ * exact race RC-33d/RC-28 exercise) — the client acknowledges it locally
+ * rather than reconciling/resending it (which, since every reconnect gets
+ * a brand-new replica id — Phase 8/9's deliberate design, reaffirmed Phase
+ * 22 — would otherwise duplicate content already present under the
+ * original stamp). Every OTHER unacked stamp is the genuine remainder the
+ * client reconciles and sends (Scope-IN: "Client resends only the
+ * remainder").
+ */
+export interface AlreadyHaveMessage {
+  readonly kind: "alreadyHave";
+  readonly alreadyHave: readonly Identifier[];
 }
 
 /**
@@ -210,6 +317,10 @@ export type ControlMessage =
   | HelloMessage
   | WelcomeMessage
   | SnapshotMessage
+  | CatchupBeginMessage
+  | CatchupChunkMessage
+  | CatchupEndMessage
+  | AlreadyHaveMessage
   | SyncCompleteMessage
   | PingMessage
   | PongMessage
