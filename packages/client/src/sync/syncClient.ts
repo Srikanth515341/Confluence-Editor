@@ -11,6 +11,8 @@ import {
   CLIENT_CAP_ACCEPTS_OP_INSERT_RUN,
   CLIENT_CAP_ACCEPTS_STRUCTURE_SNAPSHOT,
   CLIENT_CAP_HAS_RESIDENT_ENGINE,
+  RejectReason,
+  SessionRole,
   SnapshotForm,
   SyncMode,
   decodeControlFrame,
@@ -26,11 +28,31 @@ import {
 } from "@collab-editor/protocol";
 import { Backoff, BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { ObservableValue, type ConnectionState, type Observable } from "./connectionState.js";
-import { openDurableQueue, type DurableQueue } from "./durableQueue.js";
+import { openDurableQueue, type DurableQueue, type RejectedRecord } from "./durableQueue.js";
 import { SequenceGapTracker } from "./gapTracker.js";
+import {
+  OfflineWindowExceededError,
+  OfflineWindowTracker,
+  type OfflineWindowStatus,
+} from "./offlineWindow.js";
 import { buildCleanCatchupBase, reconcileOfflineQueue } from "./reconcileOfflineQueue.js";
 import { UnackedQueue } from "./unackedQueue.js";
-import { operationsToRunMessages, operationToOpsMessage, toOperations } from "./wireHelpers.js";
+import {
+  operationsToRunMessages,
+  operationsToWireMessages,
+  operationToOpsMessage,
+  toOperations,
+} from "./wireHelpers.js";
+
+export { OfflineWindowExceededError, type OfflineWindowStatus } from "./offlineWindow.js";
+
+/** One rejected-and-preserved operation (API Spec §5.5 step 1 — "move to the rejected store, do not delete"). Returned by {@link SyncClient.listRejected}. */
+export interface RejectedEntry {
+  readonly op: Operation;
+  readonly reason: RejectReason;
+  readonly detail: string;
+  readonly rejectedAt: number;
+}
 
 /** API Spec §1.2/§3: WebSocket path and subprotocol — restated here (not imported from `@collab-editor/server`, which a client must never depend on). */
 export const WS_PATH = "/v1/rt";
@@ -166,6 +188,67 @@ export class SyncClient {
     this.unsyncedCountValue.set(this.unacked.size);
   }
 
+  /** API Spec §3.6.2/§5.4: this session's own role, set from WELCOME and updated by PERMISSION_CHANGED (Phase 24, RC-32). `null` before the first WELCOME ever arrives. */
+  private readonly roleValue = new ObservableValue<SessionRole | null>(null);
+  get role(): Observable<SessionRole | null> {
+    return this.roleValue;
+  }
+
+  /** Phase 24, API Spec §5.5/§10.5: how long/how many local ops since this client last left `synced` — see offlineWindow.ts. */
+  private readonly offlineWindow = new OfflineWindowTracker();
+  private readonly offlineWindowStatusValue = new ObservableValue<OfflineWindowStatus>({
+    level: "none",
+    elapsedMs: 0,
+    opsCount: 0,
+  });
+  get offlineWindowStatus(): Observable<OfflineWindowStatus> {
+    return this.offlineWindowStatusValue;
+  }
+  private refreshOfflineWindowStatus(): void {
+    this.offlineWindowStatusValue.set(this.offlineWindow.status(Date.now()));
+  }
+  /**
+   * Every operation this client has ever SENT, bounded (see below) — NOT the same as
+   * `unacked` (which drops an entry the moment it's acked). Phase 24: a LATE OP_REJECT
+   * (the offline-window sweep, `OFFLINE_WINDOW_EXCEEDED`) can arrive well after the SAME
+   * operation was already acked — API Spec §6.3's ack-implies-durability design (Phase 16)
+   * acks an operation the instant it's durably COMMITTED, independent of whether it ever
+   * actually integrates into the live structure; an operation anchored to a node this server
+   * has since garbage-collected (Phase 21) gets acked almost immediately (genuinely durable,
+   * just permanently un-integratable) and only learns its true fate ~30s later, via this
+   * sweep. Without this second, longer-lived memory, `handleOpsMessage`'s "opReject" case
+   * would have nothing left to preserve for an already-acked stamp. Bounded (not unbounded) to
+   * avoid a real memory leak over a long-running session — 10,000 entries comfortably covers
+   * this phase's own DoD scenarios (RC-30's 2,100 operations, RC-32's 400) with headroom; a
+   * bound this size, not exhaustively tuned, is a disclosed, reasonable choice, the same
+   * latitude this project has taken for other not-fully-measured constants.
+   */
+  private readonly recentlySentOps = new Map<string, Operation>();
+  private static readonly RECENTLY_SENT_CAP = 10_000;
+  private rememberSentOp(op: Operation): void {
+    const key = serializeId(op.id);
+    this.recentlySentOps.set(key, op);
+    if (this.recentlySentOps.size > SyncClient.RECENTLY_SENT_CAP) {
+      const oldestKey = this.recentlySentOps.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.recentlySentOps.delete(oldestKey);
+      }
+    }
+  }
+
+  /**
+   * Every currently-preserved rejection (API Spec §5.5 step 1 — "move to the rejected store,
+   * do not delete"). Populated ONLY via a genuine OP_REJECT (`handleOpsMessage`'s "opReject"
+   * case) or restored from the durable `rejected` store at startup; cleared ONLY by
+   * {@link discardRejected}'s own explicit call — nothing else in this file ever clears it.
+   */
+  private readonly rejectedOps = new Map<string, RejectedEntry>();
+  private readonly rejectedCountValue = new ObservableValue<number>(0);
+  /** PRD FR-PM-8: "states unambiguously which operations were saved and which were not" — the count half of that signal (`unsyncedCount` above is the "not yet known either way" half). */
+  get rejectedCount(): Observable<number> {
+    return this.rejectedCountValue;
+  }
+
   private readonly backoff = new Backoff();
   private survivedTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -229,7 +312,36 @@ export class SyncClient {
    */
   seedForTesting(engine: Engine): void {
     this.engine = engine;
-    this.stateValue.set("synced");
+    this.setState("synced");
+  }
+
+  /**
+   * Every `stateValue.set(...)` call in this class goes through here (Phase 24), rather than
+   * directly, so the offline-window tracker's arm/disarm exactly mirrors "am I currently
+   * synced" (offlineWindow.ts's own `noteSynced`/`noteNotSynced` are idempotent, so a
+   * transition between two non-synced states, e.g. one failed reconnect attempt followed by
+   * another, correctly does NOT reset the window).
+   *
+   * Deliberately NO periodic timer keeps `offlineWindowStatus` ticking over purely from wall-
+   * clock time while idle (offline, but not typing) — it is refreshed here (every state
+   * transition) and after every accepted local mint (`assertOfflineWindowNotExceeded`'s own
+   * call site). A genuinely idle offline client (armed, never typing) will not see the
+   * REACTIVE value cross the 8/10-minute marks until its NEXT edit attempt or state change —
+   * an accepted, disclosed simplification, not an oversight: every DoD scenario this phase
+   * builds against (RC-30) involves CONTINUOUS operations, so a mint-triggered refresh alone
+   * is always sufficient there, and a `setInterval` that lives for as long as "not synced" (an
+   * UNBOUNDED span — `offline` has no automatic path back) is exactly the shape of leaked-timer
+   * bug this project has been burned by twice before (Phase 9's `Gateway.close()`, Phase 22's
+   * Bug 4) — not worth the risk for a purely cosmetic idle-tick.
+   */
+  private setState(next: ConnectionState): void {
+    this.stateValue.set(next);
+    if (next === "synced") {
+      this.offlineWindow.noteSynced();
+    } else {
+      this.offlineWindow.noteNotSynced(Date.now());
+    }
+    this.refreshOfflineWindowStatus();
   }
 
   /**
@@ -248,7 +360,7 @@ export class SyncClient {
    */
   connect(): void {
     this.explicitlyOffline = false;
-    this.stateValue.set(this.everSynced ? "reconnecting" : "connecting");
+    this.setState(this.everSynced ? "reconnecting" : "connecting");
     this.beginConnect();
   }
 
@@ -306,6 +418,14 @@ export class SyncClient {
       this.durableQueueUnavailableValue = true; // PRD A-11 — degrade to in-memory, warn
     } else {
       try {
+        // Deliberately just these TWO reads, gating `openSocket()` below — both directly
+        // determine what THIS handshake's own HELLO must say (API Spec §7.9: "read before
+        // connecting so HELLO.unacked is complete"). `loadRejected` (Phase 24) is fetched
+        // SEPARATELY, below, and does NOT gate the socket open: nothing on the handshake path
+        // depends on it, and folding a THIRD real IndexedDB transaction into this same
+        // Promise.all measurably slowed real startup enough to flip a genuine DUR-08 timing
+        // race in this project's own test suite (a debounced flush that must NOT fire before
+        // the next client's HELLO is inspected) — found by that suite, not anticipated.
         const [restoredOps, meta] = await Promise.all([
           durable.loadUnacked(this.documentId),
           durable.loadMeta(this.documentId),
@@ -320,6 +440,13 @@ export class SyncClient {
           this.gapTracker.reset(meta.lastServerSeq);
           this.highestAppliedSeq = meta.lastServerSeq;
         }
+        // Fire-and-forget: a page reload's preserved-rejections history (Rule 7.2's own
+        // "preserved" requirement, not a handshake-critical value) can arrive a little later
+        // without consequence — `listRejected()`/`rejectedCount` simply update once it resolves.
+        durable
+          .loadRejected(this.documentId)
+          .then((restoredRejected) => this.restoreRejected(restoredRejected))
+          .catch(() => {});
       } catch {
         // A read failure after a successful open degrades the same way an open failure would —
         // there is no partial-durability story worth building for this phase (DUR-09 is about
@@ -334,29 +461,53 @@ export class SyncClient {
   disconnect(): void {
     this.explicitlyOffline = true;
     this.clearAllTimers();
-    this.stateValue.set("offline");
+    this.setState("offline");
     this.ws?.close();
     this.ws = null;
   }
 
-  /** Mints and sends a local insert, exactly mirroring `Engine.localInsert`'s signature. Throws if not currently synced — there is no offline queue-and-replay in this phase (Phase 22's IndexedDB queue is what that becomes). */
+  /**
+   * Scope-IN (Phase 24): "stops accepting new edits into the durable queue at the bound"
+   * (10 minutes OR 2,000 operations since this client last left `synced`, whichever comes
+   * first — Test Plan RC-30/RC-31, offlineWindow.ts). Checked and THROWN before `engine` is
+   * ever touched, not after minting: minting first and only refusing to send/queue afterward
+   * would leave the LOCAL engine (and anything rendering from it, e.g. a live `EditorView`)
+   * reflecting content that was never durably captured — strictly worse for the user than a
+   * clearly-signaled refusal up front, and it would leave `engine` and the durable queue
+   * mutually inconsistent. `inputPipeline.ts` catches this specific error and no-ops (same
+   * shape as its pre-existing "no engine yet" guard) rather than letting it escape a DOM event
+   * handler uncaught.
+   */
+  private assertOfflineWindowNotExceeded(): void {
+    if (!this.offlineWindow.canAccept(Date.now())) {
+      throw new OfflineWindowExceededError();
+    }
+  }
+
+  /** Mints and sends a local insert, exactly mirroring `Engine.localInsert`'s signature. Throws if not currently synced — there is no offline queue-and-replay in this phase (Phase 22's IndexedDB queue is what that becomes) — or if the offline window has been exceeded (Phase 24, see `assertOfflineWindowNotExceeded`). */
   localInsert(visibleIndex: number, value: number, bind?: boolean): InsertOperation {
     const engine = this.requireEngine();
+    this.assertOfflineWindowNotExceeded();
     const op =
       bind === undefined
         ? engine.localInsert(visibleIndex, value)
         : engine.localInsert(visibleIndex, value, bind);
+    this.offlineWindow.noteOperationAccepted();
+    this.refreshOfflineWindowStatus();
     this.sendOperation(op);
     return op;
   }
 
-  /** Mints and sends local deletes, mirroring `Engine.localDelete`. */
+  /** Mints and sends local deletes, mirroring `Engine.localDelete`. Same offline-window gate as {@link localInsert} — see `assertOfflineWindowNotExceeded`. */
   localDelete(visibleIndex: number, count: number): readonly DeleteOperation[] {
     const engine = this.requireEngine();
+    this.assertOfflineWindowNotExceeded();
     const ops = engine.localDelete(visibleIndex, count);
     for (const op of ops) {
+      this.offlineWindow.noteOperationAccepted();
       this.sendOperation(op);
     }
+    this.refreshOfflineWindowStatus();
     return ops;
   }
 
@@ -371,9 +522,17 @@ export class SyncClient {
    * 2,000-character equivalence test already verified `expandInsertRun`
    * reconstructs correctly on the receiving side — only the WIRE
    * representation is batched here, not the engine's own integration.
+   *
+   * Same offline-window gate as {@link localInsert}/{@link localDelete} — Phase 24, see
+   * `assertOfflineWindowNotExceeded`. Checked ONCE, before minting anything: a large paste
+   * that would straddle the cap boundary is refused IN FULL, never partially applied — a
+   * simpler, disclosed rule than splitting one call across the boundary, and consistent with
+   * "the client stops accepting new edits AT the bound" reading the cap as gating whole edits,
+   * not partial ones.
    */
   localInsertText(visibleIndex: number, text: string): readonly InsertOperation[] {
     const engine = this.requireEngine();
+    this.assertOfflineWindowNotExceeded();
     const ops: InsertOperation[] = [];
     let at = visibleIndex;
     for (const ch of text) {
@@ -382,7 +541,9 @@ export class SyncClient {
       const codePoint = ch.codePointAt(0)!;
       ops.push(engine.localInsert(at, codePoint));
       at += 1;
+      this.offlineWindow.noteOperationAccepted();
     }
+    this.refreshOfflineWindowStatus();
     // API Spec §7.9: "written in applyLocal before or concurrently with transmission, never
     // after" — the durable-queue add (via unacked.add, which schedules the IndexedDB write)
     // must happen BEFORE sendFrame below, not after. A crash between these two loops (in the
@@ -390,6 +551,7 @@ export class SyncClient {
     // exactly the inconsistency this ordering rule exists to prevent.
     for (const op of ops) {
       this.unacked.add(op);
+      this.rememberSentOp(op);
     }
     this.syncUnsyncedCountObservable();
     for (const msg of operationsToRunMessages(ops)) {
@@ -459,6 +621,7 @@ export class SyncClient {
 
   private sendOperation(op: Operation): void {
     this.unacked.add(op);
+    this.rememberSentOp(op);
     this.syncUnsyncedCountObservable();
     this.sendFrame(encodeFrame(operationToOpsMessage(op)));
   }
@@ -477,9 +640,34 @@ export class SyncClient {
   private openSocket(): void {
     const ws = this.createSocket(`${this.serverUrl}`, WS_SUBPROTOCOL);
     this.ws = ws;
-    ws.onopen = () => this.onOpen();
-    ws.onmessage = (ev: { data: unknown }) => this.onMessage(ev);
-    ws.onclose = (ev: { code: number; reason: string }) => this.onClose(ev);
+    // Stale-socket guard (same pattern as the Phase 22 Bug 4 leftover-timer fix): `disconnect()`
+    // closes the old socket and reassigns `this.ws` SYNCHRONOUSLY, without waiting for that old
+    // socket's own asynchronous 'close' event — so a real reconnect (a fresh `connect()` right
+    // after) can already be on a NEW socket by the time the OLD socket's delayed open/message/
+    // close event actually fires. Without this `ws !== this.ws` check, that late event still ran
+    // unconditionally against whatever `this.ws` CURRENTLY is: a stale `onclose` in particular
+    // would find `explicitlyOffline` already flipped back to `false` by the new `connect()`,
+    // misread itself as an unexpected drop of the CURRENT connection, and call
+    // `scheduleReconnect()` — opening a THIRD socket and reassigning `this.ws` to it while it's
+    // still CONNECTING. Any send racing against that reassignment then throws a real
+    // InvalidStateError (readyState CONNECTING is the ONLY state `WebSocket.send()` throws for,
+    // per the WHATWG spec — CLOSING/CLOSED are silent no-ops). This was the actual, previously
+    // undiagnosed mechanism behind `reconnection.test.ts`'s RC-27 flake (measured 60-80% under
+    // its own rapid repeated disconnect/reconnect cycling, on both this branch and unmodified
+    // Phase 23 — confirmed pre-existing, not a regression) that CLAUDE.md had previously
+    // (incorrectly) attributed to vague "PING/PONG timing under load."
+    ws.onopen = () => {
+      if (ws !== this.ws) return;
+      this.onOpen();
+    };
+    ws.onmessage = (ev: { data: unknown }) => {
+      if (ws !== this.ws) return;
+      this.onMessage(ev);
+    };
+    ws.onclose = (ev: { code: number; reason: string }) => {
+      if (ws !== this.ws) return;
+      this.onClose(ev);
+    };
     ws.onerror = () => {}; // 'close' always follows for WebSocket; nothing separate to do
   }
 
@@ -534,6 +722,7 @@ export class SyncClient {
       case "welcome":
         this.replicaId = msg.replicaId;
         this.sessionId = msg.sessionId;
+        this.roleValue.set(msg.role);
         // ALREADY_CURRENT sends no further state-sync payload (no snapshot, no catchupBegin) —
         // but this client's engine STILL needs rebuilding under the new replica id, from a
         // clean base (see rebuildEngineForReconnect's own doc comment for why skipping this
@@ -566,6 +755,14 @@ export class SyncClient {
         // edited — see gapTracker.ts's `markAlive()` doc comment for the full account of the
         // false-positive "stalled" reconnect this closes.
         this.gapTracker.markAlive();
+        break;
+      case "permissionChanged":
+        // API Spec §5.4/§5.5, Phase 24 (RC-32) — a real, if minimal, notification: this
+        // session's role has changed. Deliberately does NOT itself reject/discard anything
+        // client-side — the server's own write path (writePath.ts's `authorize` step) is what
+        // actually rejects any operation this session sends while its role disallows mutation;
+        // this only keeps `role` accurate for a UI (or a future client-side pre-check) to read.
+        this.roleValue.set(msg.role);
         break;
       case "goodbye":
       case "error":
@@ -771,8 +968,19 @@ export class SyncClient {
     }
     this.syncUnsyncedCountObservable();
     const resent = reconcileOfflineQueue(engine, toReconcile);
+    // Coalesced (Phase 24), not one sendOperation() per op: a reconnection reconciliation can
+    // be large (Test Plan RC-32: 400 operations), and this is what lets the server's own
+    // rejection of the whole batch (e.g. PERMISSION_DENIED) arrive back as ONE OP_REJECT — see
+    // operationsToWireMessages's own doc comment. Each op is still tracked INDIVIDUALLY in
+    // `unacked`/`recentlySentOps`, exactly as sendOperation would — only the WIRE representation
+    // is batched, matching localInsertText's own established add-then-coalesced-send split.
     for (const op of resent) {
-      this.sendOperation(op);
+      this.unacked.add(op);
+      this.rememberSentOp(op);
+    }
+    this.syncUnsyncedCountObservable();
+    for (const msg of operationsToWireMessages(resent)) {
+      this.sendFrame(encodeFrame(msg));
     }
 
     this.sendControl({
@@ -782,7 +990,7 @@ export class SyncClient {
     });
 
     this.everSynced = true;
-    this.stateValue.set("synced");
+    this.setState("synced");
     this.startPingTimer();
   }
 
@@ -804,8 +1012,11 @@ export class SyncClient {
    * their own — they are batch acknowledgment/rejection frames, not
    * operations to apply — so they are handled separately from the five
    * bidirectional OPS types here, before any code assumes every OPS
-   * message has a `.seq`. No live server sends either yet (Phase 16), so
-   * this path is exercised by unit tests with synthetic frames this phase.
+   * message has a `.seq`. The server has sent real OP_REJECTs since Phase
+   * 16 (IDENTITY_MISMATCH/RATE_LIMITED) and, as of Phase 24, also
+   * PERMISSION_DENIED (writePath.ts's real `authorize` check) and
+   * OFFLINE_WINDOW_EXCEEDED (the server's own offline-window sweep,
+   * offlineWindowScheduler.ts).
    */
   private handleOpsMessage(msg: OpsMessage): void {
     switch (msg.kind) {
@@ -815,29 +1026,93 @@ export class SyncClient {
         }
         this.syncUnsyncedCountObservable();
         break;
-      case "opReject":
+      case "opReject": {
+        // Preserve, never destroy. PRD §2.1: one destroyed paragraph costs more than a
+        // hundred smooth sessions earn, and a user who cannot retrieve their text will
+        // not trust the product again. API Spec §5.5.
+        //
         // No retry/error-surface logic this phase — a rejected operation is simply given up on
-        // (unchanged since Phase 10). Phase 22 adds durable PRESERVATION (API Spec §7.9's
-        // `rejected` store, "preservation of rejected operations") — the op is no longer
-        // silently discarded, just no longer actively retried.
+        // (unchanged since Phase 10) — but as of Phase 22/24 it is never silently discarded
+        // either: `preserveRejected` below moves it into the `rejected` store (durable AND
+        // in-memory), reachable afterward via `listRejected()`/`exportLocalText()`, and cleared
+        // only by an explicit `discardRejected()` call this file never makes on its own.
+        //
+        // `this.unacked.get(...)` alone is not always enough to recover the operation's own
+        // content: API Spec §6.3's ack-implies-durability design (Phase 16) can ack an
+        // operation the instant it's durably committed, well BEFORE a LATE rejection (Phase
+        // 24's offline-window sweep, ~30s later) ever arrives — by then `unacked` has already
+        // deleted it. `recentlySentOps` (see its own doc comment) is the fallback that still
+        // has it.
         for (const rejected of msg.rejects) {
-          const op = this.unacked.get(rejected.rejectedId);
-          this.unacked.ack(rejected.rejectedId);
-          if (op && this.durableQueue) {
-            this.durableQueue.scheduleWriteRejected({
-              documentId: this.documentId,
-              op,
-              reason: rejected.reason,
-              detail: msg.detail,
-              rejectedAt: Date.now(),
-            });
+          const op =
+            this.unacked.get(rejected.rejectedId) ??
+            this.recentlySentOps.get(serializeId(rejected.rejectedId));
+          this.unacked.ack(rejected.rejectedId); // harmless no-op if this stamp was never (or is no longer) in `unacked`
+          if (op) {
+            this.preserveRejected(op, rejected.reason, msg.detail);
           }
         }
         this.syncUnsyncedCountObservable();
         break;
+      }
       default:
         this.handleOps(msg.seq, toOperations(msg));
         break;
+    }
+  }
+
+  /** Populates `rejectedOps` from a durable restore (a prior page load's preserved rejections, read back before this client even opens a socket) — a page reload is exactly the scenario Rule 7.2's "preserved" requirement exists for, not only a same-session late OP_REJECT. */
+  private restoreRejected(records: readonly RejectedRecord[]): void {
+    for (const record of records) {
+      this.rejectedOps.set(serializeId(record.op.id), {
+        op: record.op,
+        reason: record.reason,
+        detail: record.detail,
+        rejectedAt: record.rejectedAt,
+      });
+    }
+    this.rejectedCountValue.set(this.rejectedOps.size);
+  }
+
+  /** API Spec §5.5 step 1 ("move to the rejected store, do not delete") + step 3 ("show which operations saved and which did not") — the shared tail every `opReject` entry goes through, regardless of reason code. */
+  private preserveRejected(op: Operation, reason: RejectReason, detail: string): void {
+    const key = serializeId(op.id);
+    this.rejectedOps.set(key, { op, reason, detail, rejectedAt: Date.now() });
+    this.rejectedCountValue.set(this.rejectedOps.size);
+    if (this.durableQueue) {
+      this.durableQueue.scheduleWriteRejected({
+        documentId: this.documentId,
+        op,
+        reason,
+        detail,
+        rejectedAt: Date.now(),
+      });
+    }
+  }
+
+  /** Every rejected operation currently preserved (API Spec §5.5 step 1/3). Never populated except via a genuine OP_REJECT (or restored from the durable store at startup); never cleared except by {@link discardRejected}'s own explicit call. */
+  listRejected(): RejectedEntry[] {
+    return Array.from(this.rejectedOps.values());
+  }
+
+  /** API Spec §5.5 step 4 — "Offer Export unsaved changes: a plain-text download of engine.materialize()." A plain-text snapshot of this client's OWN current local document state. Never throws — an empty string before the first SNAPSHOT is a valid, if uninteresting, export. */
+  exportLocalText(): string {
+    return this.engine?.text() ?? "";
+  }
+
+  /**
+   * API Spec §5.5 step 5 — "discard local-only state only after an explicit user action."
+   * Clears the preserved-rejected record, in-memory AND durable. Nothing in this file EVER
+   * calls this on its own — it exists solely to be called in direct response to a caller's own
+   * explicit request (e.g. a real "Discard" button click, wired by a future UI phase). Does
+   * NOT touch `engine`/`unacked` — discarding a REJECTION record is not the same as discarding
+   * the document itself, which this method never does.
+   */
+  discardRejected(): void {
+    this.rejectedOps.clear();
+    this.rejectedCountValue.set(0);
+    if (this.durableQueue) {
+      void this.durableQueue.clearRejected(this.documentId).catch(() => {});
     }
   }
 
@@ -902,10 +1177,10 @@ export class SyncClient {
     // reconnect fully replaces it via a new SNAPSHOT; there's no reason to blank out readable
     // state in between for a caller (or future UI) that only wants to keep displaying it.
     if (this.explicitlyOffline) {
-      this.stateValue.set("offline");
+      this.setState("offline");
       return;
     }
-    this.stateValue.set("reconnecting");
+    this.setState("reconnecting");
     this.scheduleReconnect();
   }
 

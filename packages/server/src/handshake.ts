@@ -34,19 +34,28 @@ export function assertSnapshotFormAllowed(form: SnapshotForm, role: SessionRole)
   }
 }
 
-/** Builds the WELCOME message for a session that just joined `coordinator` (API Spec §3.6.2). `syncMode` is decided by {@link decideSyncMode} — see that function for the SNAPSHOT/CATCHUP/ALREADY_CURRENT decision itself. */
+/**
+ * Builds the WELCOME message for a session that just joined `coordinator` (API Spec §3.6.2).
+ * `syncMode` is decided by {@link decideSyncMode} — see that function for the SNAPSHOT/
+ * CATCHUP/ALREADY_CURRENT decision itself. `role` defaults to EDITOR — real roles/auth are
+ * still Phase 26-29; the only way this phase (24) ever passes anything else is
+ * `DocumentCoordinator.testOnlyQueueRoleOverride`'s own consuming call site in gateway.ts
+ * (Test Plan RC-32). "Viewers may read": a VIEWER role does not change `syncMode` or gate
+ * CATCHUP/SNAPSHOT delivery in any way — only writePath.ts's `authorize` step (Phase 24) acts
+ * on it, for OPS traffic specifically.
+ */
 export function buildWelcomeMessage(
   coordinator: DocumentCoordinator,
   sessionId: string,
   replicaId: number,
   syncMode: SyncMode,
+  role: SessionRole = SessionRole.EDITOR,
 ): WelcomeMessage {
   return {
     kind: "welcome",
     sessionId,
     replicaId,
-    // Hardcoded EDITOR for every session this phase — real roles/auth are Phase 26-29.
-    role: SessionRole.EDITOR,
+    role,
     serverSeq: Number(coordinator.currentSeq),
     syncMode,
     participants: coordinator.listParticipants(),

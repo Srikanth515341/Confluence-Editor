@@ -537,3 +537,62 @@ describe("Engine — collect() garbage collection (Phase 21, Engine Spec §7.3/�
     });
   });
 });
+
+describe("Engine — hasIdentifier() / rejectPending() (Phase 24, Engine Spec §7.6 Rule 7.2)", () => {
+  it("hasIdentifier() is true for a live node and false for one that was never applied", () => {
+    const engine = new Engine(1);
+    const id = { c: 1, r: 1 };
+    engine.applyRemote({ kind: "insert", id, value: 97, originLeft: null, originRight: null, bind: false });
+    expect(engine.hasIdentifier(id)).toBe(true);
+    expect(engine.hasIdentifier({ c: 999, r: 999 })).toBe(false);
+  });
+
+  it("hasIdentifier() is false for a node collect() has physically removed", () => {
+    const engine = new Engine(1);
+    const id = { c: 1, r: 1 };
+    engine.applyRemote({ kind: "insert", id, value: 97, originLeft: null, originRight: null, bind: false });
+    engine.applyRemote(
+      { kind: "delete", id: { c: 2, r: 2 }, target: id },
+      { seq: 1n, atMs: 0 },
+    );
+    expect(engine.hasIdentifier(id)).toBe(true); // tombstoned, but still structurally present
+    engine.collect(10n, { nowMs: 10_000, maxAgeMs: 0, maxOpsPerReplica: 0 });
+    expect(engine.hasIdentifier(id)).toBe(false); // physically gone
+  });
+
+  it("rejectPending() removes a matching operation from pending and returns true", () => {
+    const engine = new Engine(1);
+    // Anchored to an id this engine has never seen -- buffers into pending (Engine Spec §4.2).
+    const stuck = {
+      kind: "insert" as const,
+      id: { c: 1, r: 2 },
+      value: 97,
+      originLeft: { c: 1, r: 99 },
+      originRight: null,
+      bind: false,
+    };
+    engine.applyRemote(stuck);
+    expect(engine.pending).toHaveLength(1);
+    expect(engine.rejectPending(stuck.id)).toBe(true);
+    expect(engine.pending).toHaveLength(0);
+  });
+
+  it("rejectPending() returns false, and touches nothing, for an id not currently pending", () => {
+    const engine = new Engine(1);
+    expect(engine.rejectPending({ c: 1, r: 2 })).toBe(false);
+    expect(engine.pending).toHaveLength(0);
+  });
+
+  it("rejectPending() matches by the OPERATION's own id, never the target it references -- two different pending deletes of the same target are independently evictable", () => {
+    const engine = new Engine(1);
+    const target = { c: 1, r: 99 }; // never applied -- both deletes below stay pending
+    const del1 = { kind: "delete" as const, id: { c: 1, r: 2 }, target };
+    const del2 = { kind: "delete" as const, id: { c: 1, r: 3 }, target };
+    engine.applyRemote(del1);
+    engine.applyRemote(del2);
+    expect(engine.pending).toHaveLength(2);
+    expect(engine.rejectPending(del1.id)).toBe(true);
+    expect(engine.pending).toHaveLength(1);
+    expect(engine.pending[0]).toBe(del2);
+  });
+});

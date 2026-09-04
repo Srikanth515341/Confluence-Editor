@@ -160,6 +160,13 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       }
 
       const replicaId = coordinator.allocateReplicaId();
+      // Phase 24, Test Plan RC-32 — TEST-ONLY: consumes a one-shot role override queued via
+      // `DocumentCoordinator.testOnlyQueueRoleOverride`, standing in for a real, persisted
+      // permission lookup that doesn't exist until Phases 26-30. `null` (every real
+      // connection, every test that doesn't call it) means the ordinary hardcoded EDITOR
+      // default. See that method's own doc comment for the full reasoning.
+      const roleOverride = coordinator.consumeTestOnlyRoleOverride();
+      const role = roleOverride ?? SessionRole.EDITOR;
       const session: CoordinatorSession = {
         sessionId,
         replicaId,
@@ -167,8 +174,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         ackBatcher: new AckBatcher((entries) => {
           queues.enqueue("ops", encodeFrame({ kind: "opAck", acks: entries }));
         }),
-        // Hardcoded EDITOR for every session this phase — matches buildWelcomeMessage's role (real roles/auth are Phase 26-29).
-        role: SessionRole.EDITOR,
+        role,
         // Placeholder identity — real users don't exist until Phase 26.
         userId: randomUUID(),
         displayName: `Guest ${replicaId}`,
@@ -214,7 +220,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       const syncMode = decideSyncMode(ctrlMsg, coordinator.currentSeq);
       queues.enqueue(
         "control",
-        encodeControlFrame(buildWelcomeMessage(coordinator, sessionId, replicaId, syncMode)),
+        encodeControlFrame(buildWelcomeMessage(coordinator, sessionId, replicaId, syncMode, role)),
       );
       if (syncMode === SyncMode.SNAPSHOT) {
         queues.enqueue("control", encodeControlFrame(buildSnapshotMessage(coordinator)));
@@ -234,6 +240,18 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
 
       const alreadyHave = await buildAlreadyHaveMessage(coordinator, ctrlMsg.unacked);
       queues.enqueue("control", encodeControlFrame(alreadyHave));
+
+      // Phase 24, Test Plan RC-32: PERMISSION_CHANGED is sent AFTER the rest of the handshake
+      // completes — RC-32's own assertion order lists "HELLO succeeds, CATCHUP delivered"
+      // before "PERMISSION_CHANGED received." Only sent when a test-only override was actually
+      // queued for THIS join (never for an ordinary, real connection, which always gets the
+      // hardcoded EDITOR default and no notification at all).
+      if (roleOverride !== null) {
+        queues.enqueue(
+          "control",
+          encodeControlFrame({ kind: "permissionChanged", role: roleOverride }),
+        );
+      }
     }
 
     /** PING/SYNC_COMPLETE/LEAVE — the only CONTROL types a client may legally send after handshake (§3.6). */

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { Engine, type InsertOperation } from "@collab-editor/engine";
-import { operationsToRunMessages } from "./wireHelpers.js";
+import { Engine, type InsertOperation, type Operation } from "@collab-editor/engine";
+import { operationsToRunMessages, operationsToWireMessages } from "./wireHelpers.js";
 
 /** Mints `text.length` sequential local inserts against a fresh engine, starting at position 0 — exactly the shape `SyncClient.localInsertText` produces (chained originLeft, shared originRight, Phase 7's own equivalence check). */
 function sequentialInserts(text: string): InsertOperation[] {
@@ -62,5 +62,61 @@ describe("operationsToRunMessages — API Spec §3.5.2 wire coalescing", () => {
 
   it("an empty operation list produces no messages", () => {
     expect(operationsToRunMessages([])).toEqual([]);
+  });
+});
+
+describe("operationsToWireMessages — Phase 24 mixed insert/delete coalescing (RC-32: '400 operations ... in one response')", () => {
+  it("coalesces a long run of consecutive inserts into ONE OP_INSERT_RUN, matching operationsToRunMessages exactly", () => {
+    const ops: Operation[] = sequentialInserts("a".repeat(400));
+    const messages = operationsToWireMessages(ops);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.kind).toBe("opInsertRun");
+    if (messages[0]!.kind === "opInsertRun") {
+      expect(messages[0]!.values).toHaveLength(400);
+    }
+  });
+
+  it("coalesces a run of consecutive deletes (same replica, consecutive id.c) into ONE OP_DELETE_BATCH", () => {
+    const engine = new Engine(1);
+    for (const ch of "abcde") {
+      engine.localInsert(0, ch.codePointAt(0)!);
+    }
+    // localDelete(0, 5) mints 5 deletes with consecutive counters from this ONE engine.
+    const ops = engine.localDelete(0, 5);
+    const messages = operationsToWireMessages(ops);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toEqual({
+      kind: "opDeleteBatch",
+      seq: 0,
+      by: 1,
+      atFirst: ops[0]!.id.c,
+      targets: ops.map((op) => op.target),
+    });
+  });
+
+  it("a lone delete never becomes a batch (API Spec §3.5.4 requires n >= 2)", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, 0x61);
+    const ops = engine.localDelete(0, 1);
+    const messages = operationsToWireMessages(ops);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.kind).toBe("opDelete");
+  });
+
+  it("splits into separate groups at an insert/delete kind boundary", () => {
+    const engine = new Engine(1);
+    const insertOps: Operation[] = [
+      engine.localInsert(0, 0x61),
+      engine.localInsert(1, 0x62),
+    ];
+    const deleteOps = engine.localDelete(0, 2);
+    const ops: Operation[] = [...insertOps, ...deleteOps];
+    const messages = operationsToWireMessages(ops);
+    // One coalesced insert run, then one coalesced delete batch -- exactly 2 messages, not 4.
+    expect(messages.map((m) => m.kind)).toEqual(["opInsertRun", "opDeleteBatch"]);
+  });
+
+  it("an empty operation list produces no messages", () => {
+    expect(operationsToWireMessages([])).toEqual([]);
   });
 });

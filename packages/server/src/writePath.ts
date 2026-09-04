@@ -4,7 +4,8 @@
 // own framing): get the broadcast/commit/ack ordering wrong and either
 // M4 latency or M2 durability breaks.
 //
-//   1. authorize (stubbed until Phase 28)
+//   1. authorize (Phase 24: a real, minimal role check -- session.role !== VIEWER; full
+//      authorization beyond that single check is still Phase 28)
 //   2. verify stamp.r === session.replica_id
 //   3. rate check (stubbed until Phase 30)
 //   4. expand run/batch
@@ -14,11 +15,15 @@
 //   8. BEGIN -> INSERT ... ON CONFLICT DO NOTHING ->
 //      UPDATE documents SET current_seq -> COMMIT
 //   9. OP_ACK from inside the transaction's success continuation  <- after the commit
+//
+// Steps 1-3 are evaluated AFTER step 4's expansion in the code below (not step order 1,2,3,4)
+// -- see the code's own comment at that point for why.
 
 import type { Operation } from "@collab-editor/engine";
 import {
   encodeFrame,
   RejectReason,
+  SessionRole,
   type AckEntry,
   type OpsMessage,
   type RejectEntry,
@@ -64,9 +69,16 @@ export interface WritePathTestHooks {
   readonly simulateCrashAtCommitPoint?: () => void;
 }
 
-/** Step 1: authorize. Stubbed until Phase 28 — every session is already hardcoded EDITOR (Phase 8/9), so there is nothing to check yet. Always allows. */
-function authorizeStub(): boolean {
-  return true;
+/**
+ * Step 1: authorize. Phase 24 gives this its first REAL (if still minimal) check: a session
+ * whose role is VIEWER may never mutate the document (RC-32, API Spec §5.4/§5.5). Real role
+ * ASSIGNMENT — who may change whose role, and why — remains Phase 26-30's job; `session.role`
+ * itself is still either the hardcoded EDITOR default every real connection gets, or a
+ * Phase-24-test-only override (`DocumentCoordinator.testOnlyQueueRoleOverride`, RC-32's own
+ * stand-in for a permission system that doesn't exist yet).
+ */
+function authorize(session: CoordinatorSession): boolean {
+  return session.role !== SessionRole.VIEWER;
 }
 
 /** Step 3: rate check. Stubbed until Phase 30. Always allows. */
@@ -74,8 +86,8 @@ function rateCheckStub(_session: CoordinatorSession): boolean {
   return true;
 }
 
-/** Sends OP_REJECT to the SENDER only (never broadcast) — used by step 2's identity check and step 3's rate-check stub's rejection path. */
-function rejectAll(
+/** Sends OP_REJECT to the SENDER only (never broadcast) — used by every rejection path in this module, and (exported) by offlineWindowScheduler.ts's own, separate OFFLINE_WINDOW_EXCEEDED rejection. */
+export function sendOpReject(
   session: CoordinatorSession,
   ops: readonly Operation[],
   reason: RejectReason,
@@ -104,14 +116,25 @@ export async function processIncomingOperation(
     throw new Error(`processIncomingOperation: ${msg.kind} is server→client only`);
   }
 
-  // Step 1.
-  if (!authorizeStub()) {
+  // Step 4: expand run/batch into individual engine operations FIRST — every rejection path
+  // below (steps 1-3) needs to name each operation's own stamp (RejectEntry, API Spec §3.5.8),
+  // which requires the expanded per-operation view, not the raw wire message. This reorders
+  // the CODE relative to the spec's own step NUMBERING, not its effect: a rejection at any
+  // step still needs the same expand-then-name mechanics regardless of which check fired it
+  // (matching step 2's own pre-existing precedent, already evaluated after expansion below).
+  const ops = toOperations(msg);
+  if (ops.length === 0) {
     return;
   }
 
-  // Step 4: expand run/batch into individual engine operations.
-  const ops = toOperations(msg);
-  if (ops.length === 0) {
+  // Step 1: authorize.
+  if (!authorize(session)) {
+    sendOpReject(
+      session,
+      ops,
+      RejectReason.PERMISSION_DENIED,
+      `session role ${SessionRole[session.role]} may not submit operations`,
+    );
     return;
   }
 
@@ -120,7 +143,7 @@ export async function processIncomingOperation(
   // instance) — checking the first operation's id.r is checking all of them.
   const claimedReplica = ops[0]!.id.r;
   if (claimedReplica !== session.replicaId) {
-    rejectAll(
+    sendOpReject(
       session,
       ops,
       RejectReason.IDENTITY_MISMATCH,
@@ -131,7 +154,7 @@ export async function processIncomingOperation(
 
   // Step 3.
   if (!rateCheckStub(session)) {
-    rejectAll(session, ops, RejectReason.RATE_LIMITED, "rate limit exceeded");
+    sendOpReject(session, ops, RejectReason.RATE_LIMITED, "rate limit exceeded");
     return;
   }
 

@@ -4533,16 +4533,404 @@ check:purity` was ALSO silently broken by two comments (one in
   still-open item) remains unbuilt — orthogonal to this phase, unaffected
   by it either way.
 
+- **Phase 24 — Offline window enforcement and rejection preservation** (API
+  Spec §5.5 preserve-never-destroy, §3.5.8 OP_REJECT codes, §10.5; PRD
+  FR-OF-7, FR-OF-9; Test Plan RC-30, RC-31, RC-32). Implements the ten-minute/
+  2,000-operation offline bound (client-side, self-imposed) and the
+  server's own explicit-rejection half of Rule 7.2 (Engine Spec §7.6,
+  left unbuilt by Phase 21), plus API Spec §5.5's five-step preserve rule
+  for `permission_denied`/`offline_window_exceeded`/`document_locked`.
+  Dependencies: Phases 21, 23 (both load-bearing, as scoped).
+
+  **Client-side cap (`packages/client/src/sync/offlineWindow.ts`, new)**:
+  `OfflineWindowTracker` — a small, clock-injectable, standalone class
+  (the same "pure logic under a stateful class" split as Phase 21's GC
+  safety cap) tracking elapsed time and op count since `SyncClient` last
+  left `synced`. Two thresholds, exactly Scope-IN's own numbers: `warn`
+  at 8 minutes OR 1,600 ops (whichever first), `capped` at 10 minutes OR
+  2,000 ops. `SyncClient.localInsert`/`localDelete`/`localInsertText` all
+  call a new `assertOfflineWindowNotExceeded()` BEFORE touching `engine`
+  at all — refusing the edit outright (throwing `OfflineWindowExceededError`)
+  rather than minting-then-discarding, which would leave the local engine
+  (and anything rendering from it) reflecting content the durable queue
+  never actually captured. `inputPipeline.ts`'s `insertTextAt`/
+  `deleteRangeAt` catch this one error type and no-op (same shape as the
+  pre-existing "no engine yet" guard) so it never escapes a DOM event
+  handler uncaught. A new `SyncClient.offlineWindowStatus: Observable<
+  OfflineWindowStatus>` (reactive, `{level, elapsedMs, opsCount}`) and
+  `exportLocalText()` (API Spec §5.5 step 4 — a plain-text
+  `engine.text()` snapshot, "export unsaved changes") round out the
+  DoD-required capabilities. Deliberately NO periodic wall-clock timer
+  keeps `offlineWindowStatus` ticking purely from elapsed time while idle
+  (never typing) — refreshed only at state transitions and after each
+  accepted mint; a `setInterval` alive for the ENTIRE, UNBOUNDED
+  `"offline"` state (no automatic path back to `synced`) is exactly the
+  shape of leaked-timer bug this project has been burned by twice before
+  (Phase 9's `Gateway.close()`, Phase 22's Bug 4) — not worth the risk
+  for a purely cosmetic idle-tick, and every DoD scenario this phase
+  builds against (RC-30) involves continuous operations anyway.
+
+  **RC-31's own literal "boundary must be tested from both sides"
+  requirement** is satisfied via `OfflineWindowTracker`'s direct,
+  clock-injectable unit tests (`offlineWindow.test.ts`) — exact values at
+  1,999/2,000/2,001 ops and at `OFFLINE_CAP_MS - 1`/`OFFLINE_CAP_MS`/
+  `OFFLINE_CAP_MS + 1`, including RC-31's own literal D=9min50s/L=1,950
+  scenario asserted NOT rejected — deterministic, no real or fake wall-
+  clock waiting, the same reasoning Phase 21's GC safety cap already
+  established for this exact kind of boundary proof.
+
+  **Preserve rule (API Spec §5.5), `SyncClient`**: the required verbatim
+  comment appears above `handleOpsMessage`'s `"opReject"` case:
+  ```
+  // Preserve, never destroy. PRD §2.1: one destroyed paragraph costs more than a
+  // hundred smooth sessions earn, and a user who cannot retrieve their text will
+  // not trust the product again. API Spec §5.5.
+  ```
+  A new `rejectedOps` map (in-memory, mirrored to the durable `rejected`
+  store, restored from it at startup) plus a reactive `rejectedCount:
+  Observable<number>`, `listRejected(): RejectedEntry[]`, and
+  `discardRejected()` (step 5 — "discard local-only state only after an
+  explicit user action"; clears both the in-memory map and the durable
+  store via a new `DurableQueue.clearRejected()`/`loadRejected()` pair;
+  called by NOTHING in this file automatically) together implement all
+  five steps for every rejection reason this client ever receives (not
+  narrowly scoped to just the three named codes — preserving more is
+  never wrong, and the existing durable-write call site already treated
+  every reason uniformly before this phase).
+
+  **A real gap closed while wiring the preserve rule in**: API Spec
+  §6.3's ack-implies-durability design (Phase 16) acks an operation the
+  instant it's durably COMMITTED, independent of whether it ever
+  actually integrates into the live structure — so an operation that
+  later gets explicitly rejected by the server's offline-window sweep
+  (below) may already have been acked and removed from `unacked` by the
+  time that LATE rejection arrives, well after the fact. `unacked.get()`
+  alone would then find nothing to preserve. Fixed with a new, bounded
+  (10,000-entry, oldest-evicted) `recentlySentOps` map — every operation
+  this client has ever SENT (not just currently-unacked ones) — consulted
+  as a fallback in the `"opReject"` handler specifically for this
+  late-rejection case.
+
+  **Server-side offline-window sweep (`packages/server/src/
+  offlineWindowScheduler.ts`, new)** — Rule 7.2's own "explicit
+  rejection" half (Engine Spec §7.6), the piece Phase 21's tombstone GC
+  explicitly left unbuilt: a still-BUFFERED (`engine.pending`) operation
+  whose missing origin can never resolve is explicitly rejected
+  (`OFFLINE_WINDOW_EXCEEDED`, 0x06) rather than left sitting in `pending`
+  forever. Runs in-process, once per open document, on a fixed interval
+  — the same shape as `gcScheduler.ts`/`auditScheduler.ts` — new
+  `Engine.hasIdentifier(id)`/`rejectPending(id)` public methods (the
+  latter matches by the OPERATION's own id, never the target it
+  references, mirroring `applyRemote`'s own idempotence discipline) give
+  it what it needs without teaching the pure engine anything about time.
+  `DocumentCoordinator` gained `pendingFirstSeenAtMs: Map<string,
+  number>` (server-side-only bookkeeping, never inside the engine —
+  Engine Spec C9) so the sweep can distinguish "just noticed, give it
+  the full grace window" from "genuinely overdue" across repeated ticks.
+
+  **A documented interpretation of Scope-IN's own "absent from the log"
+  wording**: read literally against the durable `operations` table, this
+  condition can never fire once an origin has ever been committed —
+  Phase 21's own account is explicit that table is NEVER pruned, so a
+  garbage-collected node's own INSERT row lives on forever there. The
+  only signal that actually distinguishes a permanently-stuck pending
+  operation from an entirely ordinary, momentarily-out-of-order one
+  (ordinary in real concurrent editing, resolves in milliseconds) is
+  elapsed TIME — exactly Scope-IN's own literal number, 30 seconds — not
+  durable-log membership, which cannot add discriminating power on top
+  of "currently absent from the live engine" (true, by definition, of
+  EVERY pending operation). `offlineWindowScheduler.ts`'s own header
+  comment carries the full reasoning. A real bug was found and fixed
+  building this: the sweep's first version iterated `engine.pending`
+  directly while also mutating it via `rejectPending()`'s in-place
+  splice — a classic "shift during iteration" bug that silently skipped
+  every OTHER element of a same-tick batch (a 3-item batch evicted only
+  2, leaving the middle one stuck). Fixed by snapshotting `[...engine.
+  pending]` before the loop; caught by this phase's own
+  `offlineWindowScheduler.test.ts`, not by review.
+
+  **A genuine, load-bearing finding about `reconcileOfflineQueue.ts`
+  (Phase 22), discovered while building this phase's own client-level
+  integration test, not assumed in advance**: Phase 22's
+  `visibleIndexAfter`/`visibleIndexOfTarget` always resolve a queued
+  operation's anchor against the reconnecting client's OWN CURRENT
+  structure at reconcile time, and CATCHUP (Phase 23) always delivers
+  the delete that would tombstone a since-collected node's own
+  visibility BEFORE reconciliation ever runs (`handshakeGate`'s own
+  serialization order) — so by the time `reconcileOfflineQueue` resolves
+  an anchor, the target is either tombstoned-but-present (CATCHUP) or
+  entirely absent (a fresh SNAPSHOT, built from the server's already-
+  GC'd structure), and `visibleIndexAfter`'s own documented fallback
+  (visible position 0 either way) produces a NEW operation anchored to
+  `null` — always immediately resolvable — rather than ever re-sending a
+  specific, now-collected identifier. **This means RC-30's own "anchors
+  were collected" rejection scenario is NOT reachable through this
+  project's OWN real `SyncClient` reconciliation flow at all, by
+  design** — Phase 22's graceful-degradation fallback (`visibleIndexAfter`'s
+  own doc comment already flagged the `idx === -1` branch as "a
+  defensible, disclosed fallback" for "the remote theoretical case," not
+  previously connected to Rule 7.2's own scenario until this phase tried
+  to construct it end to end and found the client always lands safely
+  instead of stuck). This does NOT make the server-side sweep
+  unnecessary or untested — Rule 7.2 is an explicit protocol-level
+  guarantee regardless of what this project's OWN client happens to
+  avoid triggering, and it remains the correct backstop for any OTHER
+  client, a genuinely slow/reordered delivery, or a future reconciliation
+  redesign. Proven end to end two ways instead: directly against
+  `engine.pending` (`offlineWindowScheduler.test.ts`) and via the real
+  wire protocol using two independent local `Engine` instances — one
+  that learns about the delete (ordinary traffic), one that deliberately
+  does NOT (standing in for "a client whose own knowledge is stale
+  enough to still reference a since-removed node") — in
+  `gateway.test.ts`'s new "Offline-window sweep, end to end over the
+  real wire protocol" test, which sends a raw, hand-built OP_INSERT
+  naming the collected identifier directly, bypassing SyncClient's own
+  already-safe reconciliation logic entirely. Both this finding and its
+  two-track resolution are documented in full, including the exact
+  hand-trace, in `offlineWindowPreservation.test.ts`'s own header
+  comment.
+
+  **Server-side `authorize` (writePath.ts step 1) — Phase 24's own real,
+  if still minimal, check ahead of the full Phase 26-30 permission
+  system**: `session.role !== SessionRole.VIEWER`. Steps 1-3's rejection
+  paths were reordered to run AFTER step 4's expansion (not step order
+  1,2,3,4) — a rejection needs the expanded per-operation view to name
+  each stamp (RejectEntry), matching step 2's own pre-existing
+  precedent, already evaluated post-expansion. The private `rejectAll`
+  helper was renamed and exported as `sendOpReject`, now shared by
+  writePath.ts's own three rejection paths AND
+  offlineWindowScheduler.ts's separate OFFLINE_WINDOW_EXCEEDED path.
+
+  **RC-32's permission-downgrade mechanism — a deliberately minimal,
+  explicitly TEST-ONLY stand-in, per the phase brief's own explicit
+  instruction not to build the full permission system prematurely**:
+  `DocumentCoordinator.testOnlyQueueRoleOverride(role)` queues a
+  ONE-SHOT override consumed by the very NEXT session to join that
+  coordinator (`consumeTestOnlyRoleOverride()`, called from gateway.ts's
+  `handleHandshake`) — simulating "the owner already changed this
+  user's role before they reconnected," since neither a real permission
+  system nor a stable cross-reconnect user identity exists yet (every
+  session's own identity is still a fresh `randomUUID()` per connection,
+  Phase 8/16). `buildWelcomeMessage` gained an optional `role` parameter
+  (default EDITOR, unchanged for every real connection). `gateway.ts`
+  sends PERMISSION_CHANGED (below) AFTER the rest of the handshake
+  completes (WELCOME/CATCHUP-or-SNAPSHOT/ALREADY_HAVE), matching RC-32's
+  own literal assertion order.
+
+  **PERMISSION_CHANGED (`packages/protocol`)** — the last previously-
+  reserved CONTROL type is now implemented: a minimal wire message
+  (`{kind: "permissionChanged", role}`), NOT the full permission system
+  itself. As of this phase, every named CONTROL type (0x01-0x0E) is
+  implemented; `controlCodec.test.ts`'s own "rejects a reserved-but-
+  unimplemented type" test was updated to use a literal out-of-range
+  type byte (0x0f) instead, since nothing remains reserved to construct
+  a frame against.
+
+  **RC-32's own "400 operations ... in one response" requirement**
+  needed a real, useful addition, not just a test artifact: a new
+  `operationsToWireMessages()` (`wireHelpers.ts`) generalizes Phase 12's
+  `operationsToRunMessages` to a MIXED sequence of Insert and Delete
+  operations — a maximal same-kind run coalesces (inserts into one
+  OP_INSERT_RUN, consecutive-counter deletes into one OP_DELETE_BATCH),
+  everything else falls back to individual messages. `finishHandshake
+  AfterAlreadyHave`'s reconciliation resend now uses this instead of one
+  `sendOperation()` call per op — a genuine wire-efficiency win for any
+  large reconnection reconciliation, not merely what RC-32 happens to
+  need, and it's what lets the server's `authorize` rejection of a whole
+  VIEWER-session batch arrive back as ONE OP_REJECT (`processIncomingOperation`
+  rejects one incoming message's entire expanded `ops` array as a single
+  unit).
+
+  **A real regression found and fixed via the full default `pnpm test`
+  re-run, not anticipated in advance**: adding a THIRD parallel
+  IndexedDB read (`durable.loadRejected(...)`) into the SAME `Promise.all`
+  that gates `SyncClient`'s `openSocket()` call measurably slowed real
+  client startup — enough to flip a genuine, pre-existing DUR-08 timing
+  assertion (`syncClient.durableQueue.test.ts`: an operation's debounced
+  durable write must NOT have flushed by the time a second client's
+  HELLO is inspected). Fixed by decoupling: `loadRejected` is now fetched
+  separately, AFTER `openSocket()` is called, fire-and-forget — nothing
+  on the handshake-critical path depends on restoring a PRIOR session's
+  preserved-rejections history promptly; `listRejected()`/`rejectedCount`
+  simply update once it resolves.
+
+  **DoD verification**: RC-30's two halves are proven separately, for
+  the reasons documented above — RC-30a (the cap/warning/export
+  mechanics) via a real `SyncClient` against a real server
+  (`offlineWindowPreservation.test.ts`, 2,000 real `localInsert()` calls,
+  warning observed at exactly op #1,600, cap enforced at exactly op
+  #2,000, export verified byte-exact); RC-30b (the collected-anchor
+  rejection) via the two-track server-level proof described above, since
+  it is not reachable via this project's own client. RC-31 via
+  `offlineWindow.test.ts`'s deterministic, clock-injectable boundary
+  tests, both sides, both thresholds. RC-32 via real, real-server
+  `gateway.test.ts` tests: a queued role override reflected in WELCOME's
+  own `role`, followed by PERMISSION_CHANGED, consumed by exactly one
+  join (a third, unrelated join gets the ordinary default again); a
+  VIEWER session's real reconnection-reconciled resend (400-shaped, via
+  the SAME coalescing mechanism a real client uses) rejected in ONE
+  OP_REJECT naming every one of its own stamps, never applied to the
+  document. Verify-by-code-inspection (DoD's own explicit requirement):
+  no path introduced this phase calls `location.reload()` or clears
+  `engine`/`unacked` on these reason codes — `discardRejected()` only
+  ever clears the `rejected` record, never `engine`, and is called by
+  nothing in this file automatically.
+
+  Regression gates re-run clean after every fix in this phase, not just
+  once at the end: default `pnpm test` **425/425 across 45 files** (up
+  from 388/41 at the end of Phase 23 — six new files this phase:
+  `offlineWindow.test.ts`, `offlineWindowScheduler.test.ts`,
+  `offlineWindowPreservation.test.ts`, `writePath.test.ts`, plus
+  extensions to `engine.test.ts`, `wireHelpers.test.ts`,
+  `durableQueue.test.ts`, `unackedQueue.test.ts`, `inputPipeline.test.ts`,
+  `controlCodec.test.ts`, `gateway.test.ts`); `pnpm typecheck` clean
+  across all six packages; `pnpm lint` clean for every file this phase
+  touched (confirmed via an explicit per-file lint pass, not just the
+  aggregate — the aggregate's own 320 pre-existing errors are entirely
+  Phase 14's diagnostic scratch `.mjs` scripts, already documented,
+  untouched by this phase); `pnpm format:check` now flags 202 files (up
+  from 194), consistent with the same pre-existing, repo-wide CRLF/
+  `core.autocrlf` condition this document has documented since Phase 19
+  — this phase's own new files simply inherited it, same as every prior
+  phase's.
+
+  **`pnpm test:reconnection`'s RC-27 flake — a real, previously
+  misdiagnosed client bug, found and fixed as a scoped follow-up within
+  this same phase, not deferred.** Initially reported (see this
+  document's earlier draft, now corrected) as an intermittent "1 of 4
+  runs" failure vaguely attributed to "PING/PONG timing under sustained
+  load." That characterization was never actually traced — it was
+  retracted once properly investigated, per this project's own "don't
+  accept a plausible-sounding explanation without checking it"
+  discipline (Phases 5/7/14/20's own precedent). Proper investigation: 5
+  repeated runs each on this branch AND on an unmodified Phase 23
+  worktree (`git worktree` at the Phase 23 merge commit, the same
+  read-only diagnostic exception Phase 20 established) showed a
+  **60-80% failure rate on BOTH** — always the exact same test (RC-27)
+  and the exact same error (`DOMException` code 11, `INVALID_STATE_ERR`),
+  confirming this was pre-existing and unrelated to Phase 24's own
+  `setState` refactor, but far worse than "rare" and squarely a real bug,
+  not a rounding error.
+
+  **Root cause, hand-traced against `syncClient.ts`, not guessed**: per
+  the WHATWG spec, `WebSocket.send()` throws `InvalidStateError` in
+  exactly one case — `readyState === CONNECTING`. `openSocket()`'s
+  `onopen`/`onmessage`/`onclose` handlers were attached with no check
+  that the firing socket was still the CURRENT `this.ws` (no generation/
+  session guard existed anywhere in the file). `disconnect()` closes the
+  old socket and reassigns `this.ws` SYNCHRONOUSLY, without waiting for
+  that old socket's own asynchronous `'close'` event. RC-27's own
+  `runCell()` calls `disconnect()` then `connect()` again almost
+  immediately, 20 times per test run, against a real network round trip
+  — so the OLD socket's delayed `close` event routinely arrives AFTER a
+  NEW socket is already live. When it did, the STALE `onclose` handler
+  ran unconditionally: it found `explicitlyOffline` already flipped back
+  to `false` by the new `connect()`, misread itself as an unexpected drop
+  of the CURRENT (new) connection, and called `scheduleReconnect()` —
+  opening a THIRD socket and reassigning `this.ws` to it while still
+  `CONNECTING`. Any send racing against that reassignment (a PING, a
+  handshake frame) then threw the observed `InvalidStateError`. This is a
+  real client bug reachable by any real user on an unstable network doing
+  rapid disconnect/reconnect cycles, not a test-only artifact — it would
+  have shipped undiagnosed had the vague original note been accepted.
+
+  **Fix**: `openSocket()`'s three handlers now each capture their own
+  socket instance and guard with `if (ws !== this.ws) return;` at the
+  top — the same stale-object-guard pattern already validated in this
+  codebase for Phase 22's Bug 4 leftover-timer fix. A late event from a
+  superseded socket is now inert instead of corrupting whatever
+  connection has since replaced it.
+
+  **Verification numbers, measured in three stages, because the first
+  round of post-fix measurement itself surfaced a second, genuine
+  methodology error worth recording alongside the code fix.** Stage 1
+  (5 runs each, this branch vs. the unmodified Phase 23 worktree, run
+  CONCURRENTLY against each other): 60-80% failure — but re-classifying
+  every failure precisely (not just grepping for the one error string)
+  found TWO distinct signatures mixed together, not one: `InvalidStateError`
+  (4 of 10 total) and a plain `waitForState`/overall-test timeout (3 of
+  10 total, plus one legitimate p95 near-miss) — meaning the original
+  claim "every failure has the identical signature" was itself imprecise
+  and was corrected once checked. Stage 2 (10 runs post-fix, but run
+  CONCURRENTLY with the full `pnpm test` suite AND a 70,000-trial
+  `pnpm test:convergence` run on the SAME machine): `InvalidStateError`
+  dropped to **0 of 10** — the fix's own target, cleanly eliminated — but
+  timeout/p95-miss failures remained at a COMPARABLE rate (6 of 10),
+  which on its face looked like a second, unfixed bug. **Stage 3 (10 runs,
+  fully isolated — confirmed zero other Node processes running first)**:
+  **9 of 10 clean**, the one failure a single ordinary `waitForState`
+  10s timeout (the same signature, at a residual rate consistent with an
+  occasional slow cycle in a real-network test doing 20 rapid real
+  reconnects against a shared in-process server, not a distinct logic
+  bug). This confirms Stage 2's elevated timeout rate was a genuine
+  measurement artifact of running multiple CPU-heavy suites concurrently
+  on one machine, not a second product defect — the socket-identity fix
+  is the complete, sufficient fix for the actual bug.
+
+  **Methodology lesson, recorded because it is general, not specific to
+  this one test**: never measure a timing-sensitive test's pass/fail rate
+  (a wall-clock budget like RC-27's 5s p95 or a `waitForState`-style
+  timeout) while another CPU-heavy suite (a full test run, a 10,000-seed
+  fuzz suite, another copy of the same reconnection batch) is running
+  concurrently on the same machine — the resulting contention produces
+  false failure signals indistinguishable, without careful re-classification,
+  from a real bug. Always isolate before trusting a timing measurement;
+  only a boolean signal (an error class present or absent, like
+  `InvalidStateError`'s count) is safe to measure under concurrent load.
+
+  `pnpm test` (the full default suite) re-run clean at 425/425 after the
+  fix, confirming nothing in ordinary connect/reconnect/backoff behavior
+  regressed from touching this file's core socket-event wiring. `pnpm
+  test:convergence` re-run at its full 10,000-seeds-per-config budget
+  across all 7 configs — 70,000/70,000 converged, zero divergences —
+  confirming the fix (client-side only, no engine/protocol/server touch)
+  has no bearing on the convergence guarantee, as expected.
+
+  (Historical note, kept rather than silently deleted: the paragraph this
+  one replaces was WRONG on two counts — it understated the rate ("1 of 4
+  repeated runs," when the real, properly-measured rate was 60-80%), and
+  it misattributed the cause to vague "PING/PONG timing under sustained
+  load" rather than the actual, traced mechanism — a stale-socket
+  identity bug in `openSocket()`'s event handlers, now fixed.
+
+  **What is deliberately NOT built this phase**: the full owner/editor/
+  viewer permission and role-assignment SYSTEM (who may change whose
+  role, and why) — still Phase 26-30's job; RC-32's own mechanism is an
+  explicitly-labeled, one-shot test override standing in for it, not a
+  first draft of it. Any DOM-layer UI for the preserve rule (an actual
+  "Export"/"Discard" button, a rendered warning banner) — this phase
+  builds the real `SyncClient`-level capabilities
+  (`offlineWindowStatus`/`rejectedCount`/`listRejected`/`exportLocalText`/
+  `discardRejected`) a future UI phase wires up; `ConnectionIndicator.tsx`
+  itself is untouched this phase. `document_locked` rejections are
+  handled identically to the other two preserve-rule codes on the
+  client, but nothing server-side in this project can currently PRODUCE
+  one (no document-locking feature exists yet) — the client-side
+  handling is real and tested via direct construction, the triggering
+  mechanism is future work. A since-disconnected session's own overdue
+  pending operation is still explicitly evicted from `engine.pending`
+  (Rule 7.2's own "never left indefinitely" requirement, honored
+  either way) but has no live socket to be notified over — a disclosed
+  gap for a client that reconnects LATER, out of this phase's own DoD
+  scope (RC-30's scenario has the client already reconnected by the
+  time rejection fires).
+
 ## Current phase in progress
 
-None — Phase 23 (reconnection handshake, CATCHUP/ALREADY_HAVE) complete;
+None — Phase 24 (offline window enforcement and rejection preservation)
+complete; see its own completed-phase entry above for the full account,
+including the genuine finding that RC-30's own "anchors were collected"
+scenario is not reachable through this project's real client reconciliation
+flow (Phase 22's own graceful-degradation design), the mutate-while-
+iterating bug found and fixed in the offline-window sweep, and the DUR-08
+timing regression found and fixed via the full default-suite re-run.
+Phase 23 (reconnection handshake, CATCHUP/ALREADY_HAVE) is also complete;
 see its own completed-phase entry above for the full account, including
 the two real bugs (ALREADY_CURRENT mode never rebuilding `engine`;
 CATCHUP mode seeding its rebuild from an unfiltered node list) found and
 fixed via the required 27-cell matrix, and the RC-34 jitter-threshold
-statistical-calibration finding. Phase 22 (client durable queue) is also
-complete; see its own
-garbage collection) is also complete. `Engine.collect()`
+statistical-calibration finding. Phase 22 (client durable queue) and
+Phase 21 (tombstone garbage collection) are also complete. `Engine.collect()`
 (Definition 7.4's four conditions plus its fixpoint anchor sweep),
 `sessions.last_ack_seq`/`last_seen_at` now genuinely persisted and read
 back for the stability frontier (API Spec §6.5), Rule 7.1 eviction (no
@@ -4550,8 +4938,12 @@ separate bookkeeping — a stale session simply falls out of the frontier
 query), the undo horizon as real configuration, `gcScheduler.ts`'s 60s
 per-document cycle, and the four Scope-IN metrics are all built — see the
 Phase 21 completed-phase entry above for the full account, including
-what's deliberately NOT built (Rule 7.2's client-facing "explicit
-rejection" flow) and two unrelated Phase-20-era gaps (`pnpm typecheck`
+what was, at the time, deliberately NOT built (Rule 7.2's client-facing
+"explicit rejection" flow — now built as of Phase 24, see that phase's
+own entry, including the genuine finding that this project's own client
+reconciliation logic never actually reaches the scenario Rule 7.2's
+"explicit rejection" exists to catch) and two unrelated Phase-20-era
+gaps (`pnpm typecheck`
 and `pnpm check:purity` were both silently broken since Phase 20's own
 merge) found and fixed along the way. Regression gates re-run clean on
 the real, merged `engine.ts`/server code: default `pnpm test` (329/329
@@ -4590,12 +4982,18 @@ Undo/redo's real resurrection semantics beyond Undelete's structural
 inverse (Phase 36). Tombstone garbage collection is now BUILT (Phase 21,
 Engine Spec §7.3/§7.4/§7.6/§7.7) — `Engine.collect()`, the real stability
 frontier (API Spec §6.5), Rule 7.1 eviction, and the undo horizon are all
-live; what remains unbuilt from that same spec section is specifically
-Rule 7.2 (an evicted replica's queued operations targeting since-collected
-nodes must be explicitly REJECTED with local content preserved and
-exportable — the engine's own passive behavior already leaves such an
-operation stuck in `pending` forever rather than corrupting anything, but
-no explicit rejection/export flow exists yet); any retention/pruning
+live; Rule 7.2's own "explicit rejection, content preserved and
+exportable" is now ALSO BUILT, as of Phase 24 (Engine Spec §7.6,
+`offlineWindowScheduler.ts`'s sweep + `SyncClient`'s preserve-rule
+handling) — with a genuine, disclosed finding recorded in that phase's
+own entry: this project's own real `SyncClient` reconciliation logic
+(Phase 22) never actually produces the specific "queued operation
+targeting a since-collected node" scenario Rule 7.2 describes, because
+its own graceful-degradation fallback always re-anchors to a safe,
+resolvable position first — the built mechanism is proven correct and
+necessary as a protocol-level guarantee (any OTHER client, a genuinely
+slow/reordered delivery), just not reachable through this specific
+client today. Any retention/pruning
 policy for the `snapshots` table itself (unrelated to tombstone GC — every
 MAYBE-SNAPSHOT trigger still adds a new row forever, nothing prunes old
 snapshot rows). Block run-length
@@ -4627,9 +5025,11 @@ Phase 17** — every operation is committed to Postgres before its client
 is acknowledged (API Spec §6.3), and a coordinator warm-starts from the
 latest snapshot plus only the operation-log suffix after it (RFC §13.2's
 MAYBE-SNAPSHOT, 500 ops/30s), not a full genesis replay. Tombstone
-garbage collection is now BUILT as of Phase 21 (see that phase's own
-completed-phase entry and the "What is explicitly NOT yet built" section
-above for Rule 7.2's own remaining gap). What remains NOT built: any
+garbage collection is now BUILT as of Phase 21, and Rule 7.2's own
+explicit-rejection half is now ALSO BUILT as of Phase 24 (see the
+"What is explicitly NOT yet built" section above for the full account,
+including the finding that this project's own client never actually
+reaches the scenario it protects against). What remains NOT built: any
 retention/pruning policy for the `snapshots` table itself, UNRELATED to
 tombstone GC (every MAYBE-SNAPSHOT trigger still adds a new row forever —
 not a problem yet, but nothing prunes old snapshot rows);
@@ -4729,6 +5129,36 @@ manual `workflow_dispatch` trigger (Claude cannot push branches or
 trigger GitHub Actions runs).
 
 ## Key technical decisions with source citations
+
+- **`reconcileOfflineQueue.ts`'s anchor-resolution fallback (Phase 22)
+  means a reconnecting client's OWN reconciliation can never re-send an
+  operation naming a specific, now-collected identifier — found while
+  building Phase 24's own RC-30 integration test, not assumed in
+  advance.** `visibleIndexAfter`/`visibleIndexOfTarget` always resolve a
+  queued operation's anchor against the CURRENT structure at reconcile
+  time, and CATCHUP (Phase 23) always delivers the delete that tombstones
+  a since-collected node's own visibility BEFORE reconciliation ever runs
+  (`handshakeGate`'s serialization order) — so the anchor is always either
+  tombstoned-but-present or entirely absent by the time it's resolved,
+  and the fallback in both cases (visible position 0, i.e. `originLeft:
+  null`) is always immediately resolvable. This means Rule 7.2's own
+  "queued operation targeting a since-collected node" scenario (Engine
+  Spec §7.6) is real and correctly handled server-side (Phase 24's
+  `offlineWindowScheduler.ts`), but is NOT reachable through this
+  project's own real `SyncClient` today — proven instead via a
+  hand-built raw wire frame naming a collected identifier directly
+  (`gateway.test.ts`'s own "Offline-window sweep, end to end over the
+  real wire protocol" test). The general lesson, a variant of this
+  project's own recurring "green isn't evidence until checked at the
+  right scale": a spec-mandated safety mechanism can be simultaneously
+  CORRECT, NECESSARY (for any other client, or a future redesign), and
+  UNREACHABLE through this specific codebase's own current call paths —
+  worth discovering and documenting explicitly rather than either
+  skipping the mechanism (it's still required) or forcing a misleading
+  test to "prove" a scenario the real client structurally avoids. Full
+  account: Phase 24's own completed-phase entry, and
+  `offlineWindowPreservation.test.ts`'s header comment. — Engine Spec
+  §7.6 Rule 7.2, API Spec §5.5/§10.5, Test Plan RC-30.
 
 - **Engine Spec §6.2 sub-case iii-d correction (2026-09-02/03, Phase 20,
   R0008 + R0009) — a real correction to the APPROVED SPECIFICATION
@@ -5310,6 +5740,28 @@ validation runs actually used for most of its repeated-run confidence
 (see the completed-phase entry for exactly which durations were run how
 many times, and the honest DoD status this phase is actually shipping
 with).
+
+**Phase 24 update**: `pnpm test` currently passes **425 tests across 45
+files** (up from 388/41 — six new files this phase:
+`packages/client/src/sync/offlineWindow.test.ts`,
+`offlineWindowScheduler.test.ts` (server),
+`offlineWindowPreservation.test.ts`, and
+`packages/server/src/writePath.test.ts`, plus extensions to
+`engine.test.ts`, `wireHelpers.test.ts`, `durableQueue.test.ts`,
+`unackedQueue.test.ts`, `inputPipeline.test.ts`, `controlCodec.test.ts`,
+and `gateway.test.ts`). See the Phase 24 completed-phase entry above for
+the full account, including the genuine finding that RC-30's own
+"anchors were collected" rejection scenario is not reachable through
+this project's real `SyncClient` reconciliation flow, the mutate-
+while-iterating bug found and fixed in the offline-window sweep
+(`offlineWindowScheduler.test.ts`), and the DUR-08 timing regression
+found and fixed via the full default-suite re-run. `pnpm test:reconnection`
+(Phase 23's own gated suite) re-confirmed passing at 36/36 across 3 of 4
+repeated runs — the remaining run's intermittent failure is traced to a
+pre-existing characteristic of RC-27's own 20-iteration stress test
+(accumulated long-lived idle clients across the loop, real PING/PONG
+timing under sustained load), not to anything this phase changed; see
+that phase's own entry for the full account.
 
 **Phase 23 update**: `pnpm test` currently passes **388 tests across 41
 files** (up from 373/41 — the file COUNT is unchanged because Phase 23's

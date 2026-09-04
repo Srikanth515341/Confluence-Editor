@@ -24,6 +24,9 @@ class RecordingDurableQueue implements DurableQueue {
   async loadUnacked(): Promise<Operation[]> {
     return [];
   }
+  async loadRejected(): Promise<RejectedRecord[]> {
+    return [];
+  }
   async loadMeta(): Promise<QueueMeta | undefined> {
     return undefined;
   }
@@ -40,6 +43,7 @@ class RecordingDurableQueue implements DurableQueue {
     this.metaWrites.push(meta);
   }
   async flush(): Promise<void> {}
+  async clearRejected(): Promise<void> {}
   close(): void {}
 }
 

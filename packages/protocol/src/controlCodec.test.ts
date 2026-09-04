@@ -118,6 +118,11 @@ const goodbyeArb: fc.Arbitrary<ControlMessage> = fc.record({
   retryAfterMs: fc.nat({ max: 5_000_000 }),
 });
 
+const permissionChangedArb: fc.Arbitrary<ControlMessage> = fc.record({
+  kind: fc.constant("permissionChanged" as const),
+  role: fc.constantFrom(SessionRole.VIEWER, SessionRole.EDITOR, SessionRole.OWNER),
+});
+
 const errorArb: fc.Arbitrary<ControlMessage> = fc.record({
   kind: fc.constant("error" as const),
   code: fc.nat({ max: 0xff }),
@@ -136,6 +141,7 @@ const serverOriginArb = fc.oneof(
   pongArb,
   goodbyeArb,
   errorArb,
+  permissionChangedArb,
 );
 
 function sortKeysDeep(value: unknown): unknown {
@@ -166,7 +172,7 @@ describe("CONTROL codec — round-trip (API Spec §3.6)", () => {
     );
   });
 
-  it("decode(encode(msg)) === msg for 5,000 generated server-origin messages (WELCOME/SNAPSHOT/PONG/GOODBYE/ERROR)", () => {
+  it("decode(encode(msg)) === msg for 5,000 generated server-origin messages (WELCOME/SNAPSHOT/PONG/GOODBYE/ERROR/PERMISSION_CHANGED)", () => {
     fc.assert(
       fc.property(serverOriginArb, (msg) =>
         sameMessage(
@@ -311,11 +317,16 @@ describe("CONTROL codec — directionality (§3.6's C→S / S→C markers)", () 
     }
   });
 
-  it("rejects a reserved-but-unimplemented type (PERMISSION_CHANGED) with a specific error, not a crash", () => {
+  it("rejects an out-of-range/unimplemented message type with a specific error, not a crash", () => {
+    // Phase 24 implements the last previously-reserved type (PERMISSION_CHANGED) — as of this
+    // phase every named CONTROL type (0x01-0x0E) is implemented, so nothing remains
+    // "reserved-but-unimplemented" to construct a frame against. This test now uses a literal
+    // out-of-range type byte (0x0f, one past GOODBYE, never assigned by the spec) to exercise
+    // the SAME "unimplemented/unknown" rejection path `isImplementedControlType` still guards.
     const writer = new ByteWriter();
     writer.writeByte(PROTOCOL_VERSION);
     writer.writeByte(Channel.CONTROL);
-    writer.writeByte(ControlMessageType.PERMISSION_CHANGED);
+    writer.writeByte(0x0f);
     const bytes = writer.toUint8Array();
     expect(() => decodeControlFrame(bytes)).toThrow(ProtocolDecodeError);
     try {

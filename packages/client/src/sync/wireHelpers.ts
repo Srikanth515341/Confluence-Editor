@@ -1,4 +1,4 @@
-import type { InsertOperation, Operation } from "@collab-editor/engine";
+import type { DeleteOperation, InsertOperation, Operation } from "@collab-editor/engine";
 import {
   expandDeleteBatch,
   expandInsertRun,
@@ -88,6 +88,83 @@ export function operationsToRunMessages(ops: readonly InsertOperation[]): OpsMes
       messages.push(runMsg);
     } else {
       messages.push(operationToOpInsert(first, 0));
+    }
+    i = j;
+  }
+  return messages;
+}
+
+/**
+ * Phase 24 — coalesces a MIXED sequence of freshly re-minted Operations (Insert AND Delete
+ * both, as produced by `reconcileOfflineQueue.ts`'s reconnection replay) into as few OPS
+ * messages as possible: a maximal run of ≥2 consecutive INSERTs (same `bind`) becomes one
+ * OP_INSERT_RUN (delegates to {@link operationsToRunMessages}); a maximal run of ≥2
+ * consecutive DELETEs from one replica becomes one OP_DELETE_BATCH (API Spec §3.5.4 — n≥2,
+ * consecutive `id.c`, exactly what consecutive `Engine.localDelete()` calls under one engine
+ * produce by construction, Invariant I0); everything else (singletons, or a kind boundary)
+ * falls back to individual OP_INSERT/OP_DELETE messages.
+ *
+ * This is what lets a large reconnection reconciliation (Test Plan RC-32: 400 operations)
+ * reach the server as ONE (or a small few) wire frame(s) instead of hundreds — which in turn
+ * is what lets a server-side rejection of the WHOLE batch (e.g. PERMISSION_DENIED) arrive back
+ * at the client as ONE OP_REJECT response, per RC-32's own "in one response" requirement:
+ * `processIncomingOperation` (server, writePath.ts) rejects one incoming message's entire
+ * expanded `ops` array as a single unit, so fewer incoming messages means fewer, larger
+ * OP_REJECT batches.
+ */
+export function operationsToWireMessages(ops: readonly Operation[]): OpsMessage[] {
+  const messages: OpsMessage[] = [];
+  let i = 0;
+  while (i < ops.length) {
+    const kind = ops[i]!.kind;
+    let j = i + 1;
+    while (j < ops.length && ops[j]!.kind === kind) {
+      j += 1;
+    }
+    const group = ops.slice(i, j);
+    if (kind === "insert") {
+      messages.push(...operationsToRunMessages(group as InsertOperation[]));
+    } else if (kind === "delete") {
+      messages.push(...deleteOperationsToMessages(group as DeleteOperation[]));
+    } else {
+      // "undelete" — never produced by this client's own local mint paths (localInsert/
+      // localDelete only, Engine Spec §9.3's resurrection semantics are Phase 36) —
+      // reconcileOfflineQueue.ts's own doc comment already establishes this is unreachable via
+      // this client's public API. One OP_UNDELETE per item, defensively, rather than a silent
+      // drop, should that ever change.
+      for (const op of group) {
+        messages.push(operationToOpsMessage(op));
+      }
+    }
+    i = j;
+  }
+  return messages;
+}
+
+/** The DELETE half of {@link operationsToWireMessages} — same maximal-run coalescing shape as {@link operationsToRunMessages}, but grouping by consecutive `id.c` from one replica (API Spec §3.5.4's OP_DELETE_BATCH contract) instead of by `bind`. */
+function deleteOperationsToMessages(ops: readonly DeleteOperation[]): OpsMessage[] {
+  const messages: OpsMessage[] = [];
+  let i = 0;
+  while (i < ops.length) {
+    let j = i + 1;
+    while (
+      j < ops.length &&
+      ops[j]!.id.r === ops[i]!.id.r &&
+      ops[j]!.id.c === ops[j - 1]!.id.c + 1
+    ) {
+      j += 1;
+    }
+    const group = ops.slice(i, j);
+    if (group.length >= 2) {
+      messages.push({
+        kind: "opDeleteBatch",
+        seq: 0,
+        by: group[0]!.id.r,
+        atFirst: group[0]!.id.c,
+        targets: group.map((op) => op.target),
+      });
+    } else {
+      messages.push(operationToOpDelete(group[0]!, 0));
     }
     i = j;
   }

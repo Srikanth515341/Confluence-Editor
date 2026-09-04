@@ -12,6 +12,37 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 24 — offline window enforcement and rejection preservation.** A
+client offline for too long now warns (8 min / 1,600 ops) and then
+stops accepting edits outright (10 min / 2,000 ops, whichever comes
+first) — refused before ever touching the local engine, so the durable
+queue and what's on screen can never disagree. On the server, a
+still-buffered operation whose causal dependency can never resolve
+(Engine Spec §7.6 Rule 7.2, left unbuilt by Phase 21's tombstone GC) is
+now explicitly rejected — `OFFLINE_WINDOW_EXCEEDED` — rather than left
+stuck forever, and every rejection this client ever receives
+(`permission_denied`, `offline_window_exceeded`, `document_locked`) is
+preserved, never silently discarded: kept in memory and durably, counted
+and listed, exportable as plain text, and cleared only by an explicit
+user action this file never takes on its own. Building the required
+integration test for "an offline edit anchored to a since-collected
+node" surfaced a genuine, non-obvious finding: this project's own
+client-side reconnection logic (Phase 22) always resolves a queued
+edit's anchor against whatever the client currently knows, which
+gracefully degrades to a safe position rather than ever re-sending a
+specific vanished identifier — meaning the server-side rejection
+mechanism, while correct and necessary as a protocol-level guarantee, is
+not reachable through this project's own client today. Proven instead
+via a hand-built raw operation naming a collected identifier directly.
+A minimal, explicitly-labeled permission-downgrade mechanism (a
+one-shot server-side test override, not the real permission system,
+which is still Phase 26-30's job) demonstrates the same preserve rule
+for `permission_denied`: 400 queued operations from a downgraded
+session are rejected in a single response, each naming its own origin
+stamp. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 24 entry for the full
+account, including the mutate-while-iterating bug found and fixed in
+the server's own sweep.
+
 **Phase 23 — reconnection handshake (CATCHUP/ALREADY_HAVE).** A client
 whose socket drops but keeps its in-memory engine now catches up over
 just `(lastServerSeq, currentSeq]` instead of receiving a full fresh
@@ -349,9 +380,10 @@ runs this at full scale on a schedule.
 | Tombstone garbage collection                | ✅ Phase 21 (Engine.collect(), real stability frontier, 60s per-document GC cycle, wall-clock safety cap)   |
 | Offline editing (durable queue + replay)   | ✅ **Phase 22** (IndexedDB-backed unacked queue, API Spec §7.9; survives tab close/crash)                  |
 | Reconnection handshake (CATCHUP/ALREADY_HAVE) | ✅ **Phase 23** (delta sync over the durable log; RC-27 3.6s p95, well under PRD M6's 5s budget)         |
+| Offline window enforcement + rejection preservation | ✅ **Phase 24** (10min/2,000-op client cap; server-side explicit rejection, Engine Spec §7.6 Rule 7.2; API Spec §5.5 preserve-never-destroy for all 3 reason codes) |
 | Auth, presence                             | ⏳ not started (Phases 26-29, 31)                                                                          |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
-| Permissions                                | ⏳ not started                                                                                             |
+| Permissions (real owner/editor/viewer system) | ⏳ not started (Phases 26-30) — Phase 24's role-downgrade DEMO uses a test-only override, not this        |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

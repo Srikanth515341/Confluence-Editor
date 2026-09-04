@@ -356,3 +356,27 @@ describe("inputPipeline — unlisted inputType", () => {
     h.detach();
   });
 });
+
+describe("inputPipeline — offline-window cap (Phase 24, API Spec §5.5/§10.5, RC-30)", () => {
+  it("a keystroke past the offline-window cap is silently swallowed -- preventDefault fires, but neither the engine nor the DOM is touched", () => {
+    const h = makeHarness("ab");
+    h.sync.disconnect(); // arms the offline window (state leaves "synced")
+    // Drive the client's OWN cap (2,000 ops) directly via localInsert -- no DOM/beforeinput
+    // involved for these -- so the harness reaches "capped" without minting through the
+    // pipeline under test.
+    for (let i = 0; i < 2000; i++) {
+      h.sync.localInsert(h.sync.engine!.text().length, 0x78); // 'x'
+    }
+    expect(h.sync.offlineWindowStatus.value.level).toBe("capped");
+    const textBefore = h.sync.engine!.text();
+    const domBefore = h.root.textContent;
+
+    setCaret(h, 1);
+    const event = fireBeforeInput(h, "insertText", { data: "Z" });
+
+    expect(event.defaultPrevented).toBe(true); // Scope-IN: "without exception"
+    expect(h.sync.engine!.text()).toBe(textBefore); // refused BEFORE reaching the engine
+    expect(h.root.textContent).toBe(domBefore); // DOM never mutated -- no divergence for the sentinel to catch
+    h.detach();
+  });
+});

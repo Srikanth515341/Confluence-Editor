@@ -16,6 +16,7 @@ import {
   type HelloMessage,
   type LeaveMessage,
   type ParticipantInfo,
+  type PermissionChangedMessage,
   type PingMessage,
   type PongMessage,
   type SnapshotMessage,
@@ -62,6 +63,7 @@ const SERVER_ORIGIN_TYPES: ReadonlySet<ControlMessageType> = new Set([
   ControlMessageType.PONG,
   ControlMessageType.GOODBYE,
   ControlMessageType.ERROR,
+  ControlMessageType.PERMISSION_CHANGED,
 ]);
 
 function encodeHelloPayload(writer: ByteWriter, msg: HelloMessage): void {
@@ -251,6 +253,21 @@ function decodeSyncCompletePayload(reader: ByteReader): SyncCompleteMessage {
   return { kind: "syncComplete", lastServerSeq, resentCount };
 }
 
+function encodePermissionChangedPayload(writer: ByteWriter, msg: PermissionChangedMessage): void {
+  writer.writeByte(msg.role);
+}
+
+function decodePermissionChangedPayload(reader: ByteReader): PermissionChangedMessage {
+  const role = reader.readByte();
+  if (!KNOWN_ROLES.has(role)) {
+    throw new ProtocolDecodeError(
+      "UNKNOWN_ROLE",
+      `${role} is not one of the 3 defined SessionRole values`,
+    );
+  }
+  return { kind: "permissionChanged", role: role as SessionRole };
+}
+
 function encodePingPayload(writer: ByteWriter, msg: PingMessage): void {
   writeVarint(writer, msg.clientTimeMs);
   writeVarint(writer, msg.lastAppliedSeq);
@@ -340,6 +357,8 @@ function messageTypeOf(msg: ControlMessage): ControlMessageType {
       return ControlMessageType.ALREADY_HAVE;
     case "syncComplete":
       return ControlMessageType.SYNC_COMPLETE;
+    case "permissionChanged":
+      return ControlMessageType.PERMISSION_CHANGED;
     case "ping":
       return ControlMessageType.PING;
     case "pong":
@@ -385,6 +404,9 @@ export function encodeControlFrame(msg: ControlMessage): Uint8Array {
     case "syncComplete":
       encodeSyncCompletePayload(writer, msg);
       break;
+    case "permissionChanged":
+      encodePermissionChangedPayload(writer, msg);
+      break;
     case "ping":
       encodePingPayload(writer, msg);
       break;
@@ -408,10 +430,11 @@ export function encodeControlFrame(msg: ControlMessage): Uint8Array {
 /**
  * Decodes a complete CONTROL frame. Rejects with {@link ProtocolDecodeError}
  * for: an unsupported protocol version, a non-CONTROL channel byte, a
- * message type on the wrong side of its §3.6 C→S/S→C direction, a
- * reserved-but-unimplemented type (PERMISSION_CHANGED — reason
- * `UNIMPLEMENTED_MESSAGE_TYPE`), an unrecognized type, or a frame that
- * runs out of bytes mid-field / has trailing bytes after a valid payload.
+ * message type on the wrong side of its §3.6 C→S/S→C direction, an
+ * unimplemented/unrecognized type byte (reason `UNIMPLEMENTED_MESSAGE_TYPE`
+ * — as of Phase 24 every named CONTROL type is implemented, so this only
+ * fires for a genuinely out-of-range byte), or a frame that runs out of
+ * bytes mid-field / has trailing bytes after a valid payload.
  */
 export function decodeControlFrame(
   bytes: Uint8Array,
@@ -485,6 +508,9 @@ export function decodeControlFrame(
       break;
     case ControlMessageType.SYNC_COMPLETE:
       msg = decodeSyncCompletePayload(reader);
+      break;
+    case ControlMessageType.PERMISSION_CHANGED:
+      msg = decodePermissionChangedPayload(reader);
       break;
     case ControlMessageType.PING:
       msg = decodePingPayload(reader);

@@ -561,6 +561,43 @@ export class Engine {
   }
 
   /**
+   * Whether `id` currently resolves to a live node in this structure (Phase 24, Engine Spec
+   * §7.6). Used only for DIAGNOSTIC purposes by the server's offline-window sweep
+   * (packages/server/src/offlineWindowScheduler.ts) — WHICH origin a stuck operation is
+   * missing, for logging. It is deliberately NOT the mechanism that decides whether a pending
+   * operation gets evicted: every pending operation's missing origin is, by definition,
+   * currently absent from this index (that is exactly what "pending" means, Engine Spec §4.2),
+   * so this check cannot by itself distinguish a merely-slow, still-arriving dependency from a
+   * permanently garbage-collected one (§7.3/§7.6) — only elapsed TIME can (Scope-IN: "buffered
+   * > 30s"). See offlineWindowScheduler.ts's own header comment for the full reasoning.
+   */
+  hasIdentifier(id: Identifier): boolean {
+    return this.index.hasIdentifier(id);
+  }
+
+  /**
+   * Explicitly removes a still-buffered operation from `pending` (Engine Spec §7.6 Rule 7.2:
+   * "an evicted replica's queued operations naming since-collected nodes must be explicitly
+   * REJECTED... never left in P indefinitely"). Phase 21 built {@link collect} but left this
+   * half of Rule 7.2 unbuilt; Phase 24's server-side offline-window sweep is the first and
+   * only caller. Matches by the OPERATION's own id (never the origin/target it references) —
+   * the same identity discipline `applyRemote()`'s idempotence check and `drain()`'s
+   * duplicate-discard already use (Engine Spec §4.5, §6.3): two different operations can
+   * legally reference the same target, so matching on anything but the operation's own id
+   * could evict the wrong one. Returns whether a matching operation was actually found and
+   * removed — `false` is not an error, just means it already drained normally (its dependency
+   * arrived) in the time between the caller's own check and this call.
+   */
+  rejectPending(id: Identifier): boolean {
+    const index = this.pending.findIndex((op) => op.id.c === id.c && op.id.r === id.r);
+    if (index === -1) {
+      return false;
+    }
+    this.pending.splice(index, 1);
+    return true;
+  }
+
+  /**
    * Mints and applies a local insert, returning the operation to broadcast
    * (API Spec §1.4). O(log N) as of Phase 19 — origin lookups go straight
    * through `index.nodeAtVisible()` rather than materializing the whole
