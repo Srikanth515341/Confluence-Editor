@@ -79,11 +79,28 @@ interface RejectedRow {
 export interface DurableQueue {
   loadUnacked(documentId: string): Promise<Operation[]>;
   loadMeta(documentId: string): Promise<QueueMeta | undefined>;
+  /**
+   * Every currently-preserved rejection for `documentId` (API Spec §5.5 step 1 — "move to the
+   * rejected store, do not delete"). Read at startup (`SyncClient`'s own init sequence,
+   * alongside `loadUnacked`/`loadMeta`) so a rejection preserved in a PRIOR page load is still
+   * reported/exportable after a reload — a page reload is exactly the scenario Rule 7.2's
+   * "preserved" requirement exists for, not only a same-session late OP_REJECT.
+   */
+  loadRejected(documentId: string): Promise<RejectedRecord[]>;
   /** Fire-and-forget: enqueues the write into the next batched flush. Never awaited on the keystroke path (PRD M3). */
   scheduleWriteUnacked(op: Operation, documentId: string): void;
   scheduleRemoveUnacked(id: Identifier, documentId: string): void;
   scheduleWriteRejected(record: RejectedRecord): void;
   scheduleWriteMeta(meta: QueueMeta): void;
+  /**
+   * API Spec §5.5 step 5 — "discard local-only state only after an explicit user action."
+   * Deletes every `rejected` row for `documentId`, immediately (not batched through the
+   * trailing-edge debounce — this is an explicit, rare, user-triggered action, not a
+   * keystroke-path write). Never called by any production code path except in direct response
+   * to a caller's own explicit request (`SyncClient.discardRejected`) — see that method's own
+   * doc comment.
+   */
+  clearRejected(documentId: string): Promise<void>;
   /** Forces any pending batch to commit immediately, resolving once done. Not called on any production keystroke path -- exists for tests and for a deliberate flush point (e.g. right before a known-risky moment), which no Phase 22 call site currently needs. */
   flush(): Promise<void>;
   /** Releases the underlying IDBDatabase handle. Production code never calls this (a live tab keeps its queue open for its whole lifetime) -- exists for test cleanup. */
@@ -141,6 +158,19 @@ export class IndexedDbDurableQueue implements DurableQueue {
       .filter((row) => row.documentId === documentId)
       .sort((a, b) => a.stampC - b.stampC) // restore in original local mint order (Invariant I0: one replica's own counter only ever increases)
       .map((row) => row.op);
+  }
+
+  async loadRejected(documentId: string): Promise<RejectedRecord[]> {
+    const rows = await this.getAll<RejectedRow>(STORE_REJECTED);
+    return rows
+      .filter((row) => row.documentId === documentId)
+      .map((row) => ({
+        documentId: row.documentId,
+        op: row.op,
+        reason: row.reason,
+        detail: row.detail,
+        rejectedAt: row.rejectedAt,
+      }));
   }
 
   async loadMeta(documentId: string): Promise<QueueMeta | undefined> {
@@ -235,6 +265,30 @@ export class IndexedDbDurableQueue implements DurableQueue {
             metaStore.put(write.row);
             break;
         }
+      }
+    });
+  }
+
+  async clearRejected(documentId: string): Promise<void> {
+    // Read-then-delete, not a single-shot "delete everything" call: IndexedDB has no
+    // "DELETE WHERE documentId = ?" primitive for a composite-keyed store, and this database
+    // (like `loadUnacked` above) holds rows for however many documents a browser profile has
+    // ever opened — the same "plain getAll() + JS filter, simplicity over a micro-optimization
+    // at this data volume" reasoning as that method.
+    const rows = await this.getAll<RejectedRow>(STORE_REJECTED);
+    const keys = rows
+      .filter((row) => row.documentId === documentId)
+      .map((row) => [row.documentId, row.stampR, row.stampC] as const);
+    if (keys.length === 0) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const tx = this.db.transaction([STORE_REJECTED], "readwrite");
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB clearRejected failed"));
+      tx.oncomplete = () => resolve();
+      const store = tx.objectStore(STORE_REJECTED);
+      for (const key of keys) {
+        store.delete(key as unknown as IDBValidKey);
       }
     });
   }

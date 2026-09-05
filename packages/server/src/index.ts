@@ -44,6 +44,7 @@ export { AckBatcher } from "./ackBatcher.js";
 export {
   isAckBeforeCommitMutationActive,
   processIncomingOperation,
+  sendOpReject,
   type WritePathTestHooks,
 } from "./writePath.js";
 export { auditDocument, replayThrough, type AuditOptions, type AuditResult } from "./audit.js";
@@ -53,7 +54,12 @@ export {
   type AuditScheduler,
 } from "./auditScheduler.js";
 export { startGcScheduler, runOneDocument as runOneGcCycle, type GcScheduler } from "./gcScheduler.js";
-export type { GcConfig } from "./config.js";
+export {
+  startOfflineWindowScheduler,
+  runOneDocument as runOneOfflineWindowSweep,
+  type OfflineWindowScheduler,
+} from "./offlineWindowScheduler.js";
+export type { GcConfig, OfflineWindowConfig } from "./config.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
@@ -62,6 +68,7 @@ import { PostgresOperationStore } from "./db/operationStore.js";
 import { createCollabServer } from "./server.js";
 import { startAuditScheduler } from "./auditScheduler.js";
 import { startGcScheduler } from "./gcScheduler.js";
+import { startOfflineWindowScheduler } from "./offlineWindowScheduler.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
 // or `tsx src/index.ts`, Phase 14's `pnpm --filter @collab-editor/server run
@@ -91,4 +98,6 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   // Phase 21: tombstone garbage collection — same "only the direct-run block starts this"
   // reasoning as the audit scheduler immediately above.
   startGcScheduler(server.gateway, config.gc);
+  // Phase 24: the offline-window sweep (Engine Spec §7.6 Rule 7.2) — same reasoning again.
+  startOfflineWindowScheduler(server.gateway, config.offlineWindow);
 }

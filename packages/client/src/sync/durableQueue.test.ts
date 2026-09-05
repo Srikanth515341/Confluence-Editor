@@ -200,6 +200,69 @@ describe("IndexedDbDurableQueue — rejected store", () => {
     expect(await durable.loadUnacked("doc-1")).toEqual([]);
     durable.close();
   });
+
+  it("loadRejected() reads back exactly what was written, scoped to one documentId", async () => {
+    const { durable } = await openFresh();
+    durable.scheduleWriteRejected({
+      documentId: "doc-1",
+      op: insertOp(1, 1),
+      reason: RejectReason.OFFLINE_WINDOW_EXCEEDED,
+      detail: "anchor collected",
+      rejectedAt: 111,
+    });
+    durable.scheduleWriteRejected({
+      documentId: "doc-2", // a DIFFERENT document — must not leak into doc-1's read
+      op: insertOp(2, 1),
+      reason: RejectReason.PERMISSION_DENIED,
+      detail: "downgraded to viewer",
+      rejectedAt: 222,
+    });
+    await durable.flush();
+    const rejected = await durable.loadRejected("doc-1");
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toBe(RejectReason.OFFLINE_WINDOW_EXCEEDED);
+    expect(rejected[0]?.op).toEqual(insertOp(1, 1));
+    durable.close();
+  });
+
+  it("clearRejected() removes every row for one documentId, immediately (not batched), leaving other documents untouched (API Spec §5.5 step 5)", async () => {
+    const { durable } = await openFresh();
+    durable.scheduleWriteRejected({
+      documentId: "doc-1",
+      op: insertOp(1, 1),
+      reason: RejectReason.OFFLINE_WINDOW_EXCEEDED,
+      detail: "",
+      rejectedAt: 1,
+    });
+    durable.scheduleWriteRejected({
+      documentId: "doc-1",
+      op: insertOp(2, 1),
+      reason: RejectReason.OFFLINE_WINDOW_EXCEEDED,
+      detail: "",
+      rejectedAt: 2,
+    });
+    durable.scheduleWriteRejected({
+      documentId: "doc-2",
+      op: insertOp(3, 1),
+      reason: RejectReason.PERMISSION_DENIED,
+      detail: "",
+      rejectedAt: 3,
+    });
+    await durable.flush();
+    expect(await durable.loadRejected("doc-1")).toHaveLength(2);
+
+    await durable.clearRejected("doc-1"); // no flush() needed — this method is not batched at all
+
+    expect(await durable.loadRejected("doc-1")).toEqual([]);
+    expect(await durable.loadRejected("doc-2")).toHaveLength(1); // untouched
+    durable.close();
+  });
+
+  it("clearRejected() on a document with nothing to clear is a safe no-op", async () => {
+    const { durable } = await openFresh();
+    await expect(durable.clearRejected("doc-never-rejected")).resolves.toBeUndefined();
+    durable.close();
+  });
 });
 
 describe("IndexedDbDurableQueue — 200ms trailing-edge batching (API Spec §7.9)", () => {

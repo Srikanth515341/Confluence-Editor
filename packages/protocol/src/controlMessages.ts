@@ -5,10 +5,13 @@ import type { Identifier, Operation } from "@collab-editor/engine";
  * CONTROL channel (§3.2's `channel` byte = 0x03, Phase 8's `Channel.CONTROL`).
  * Numeric values are taken verbatim from the spec text. CATCHUP_BEGIN/
  * CATCHUP_CHUNK/CATCHUP_END/ALREADY_HAVE (reconnection, API Spec
- * §3.6.4-§3.6.8) are implemented as of Phase 23. PERMISSION_CHANGED
- * (Phases 26-29) is still reserved — the numeric slot exists so a future
- * frame carrying it is recognized as "a real, still-unimplemented type"
- * rather than "unknown garbage."
+ * §3.6.4-§3.6.8) are implemented as of Phase 23. PERMISSION_CHANGED is
+ * implemented as of Phase 24 (RC-32, API Spec §5.4) — a minimal wire
+ * message (just the new role), NOT the full owner/editor/viewer
+ * permission/authorization SYSTEM (who may change whose role, and why),
+ * which remains Phase 26-30's job. See documentCoordinator.ts's
+ * `testOnlyQueueRoleOverride` for how a role change is actually driven
+ * this phase, in the explicit absence of that system.
  */
 export enum ControlMessageType {
   HELLO = 0x01,
@@ -27,7 +30,7 @@ export enum ControlMessageType {
   GOODBYE = 0x0e,
 }
 
-/** Message types this phase implements payload encode/decode for. PERMISSION_CHANGED (Phases 26-29) remains reserved-but-unimplemented (see the enum's own doc comment). */
+/** Message types this phase implements payload encode/decode for — as of Phase 24, every CONTROL type the spec text names is implemented; none remain reserved-but-unimplemented. */
 const IMPLEMENTED_CONTROL_TYPES: ReadonlySet<ControlMessageType> = new Set([
   ControlMessageType.HELLO,
   ControlMessageType.WELCOME,
@@ -37,6 +40,7 @@ const IMPLEMENTED_CONTROL_TYPES: ReadonlySet<ControlMessageType> = new Set([
   ControlMessageType.CATCHUP_END,
   ControlMessageType.ALREADY_HAVE,
   ControlMessageType.SYNC_COMPLETE,
+  ControlMessageType.PERMISSION_CHANGED,
   ControlMessageType.ERROR,
   ControlMessageType.PING,
   ControlMessageType.PONG,
@@ -149,6 +153,23 @@ export interface WelcomeMessage {
   readonly serverSeq: number;
   readonly syncMode: SyncMode;
   readonly participants: readonly ParticipantInfo[];
+}
+
+/**
+ * Notifies a session its ROLE has changed (§3.6's "Other CONTROL message types" table; API
+ * Spec §5.4; Phase 24, Test Plan RC-32). A minimal wire message — just the new role — NOT the
+ * full owner/editor/viewer permission SYSTEM (who is allowed to change whose role, and under
+ * what conditions), which remains Phase 26-30's job; this phase only builds the notification
+ * itself and a TEST-ONLY mechanism to trigger it (`DocumentCoordinator.
+ * testOnlyQueueRoleOverride`), simulating "the owner already changed this session's role"
+ * without inventing a persisted identity/permission model under schedule pressure. Sent AFTER
+ * the rest of the handshake (WELCOME/SNAPSHOT-or-CATCHUP/ALREADY_HAVE) completes — RC-32's own
+ * assertion order lists "HELLO succeeds, CATCHUP delivered" before "PERMISSION_CHANGED
+ * received."
+ */
+export interface PermissionChangedMessage {
+  readonly kind: "permissionChanged";
+  readonly role: SessionRole;
 }
 
 /** §3.6.3's form byte. */
@@ -322,6 +343,7 @@ export type ControlMessage =
   | CatchupEndMessage
   | AlreadyHaveMessage
   | SyncCompleteMessage
+  | PermissionChangedMessage
   | PingMessage
   | PongMessage
   | LeaveMessage

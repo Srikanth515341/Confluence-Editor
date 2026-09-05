@@ -31,10 +31,27 @@ export interface GcConfig {
   readonly gcFixpointBudgetMs: number;
 }
 
+/**
+ * Phase 24 (API Spec §5.5/§6.5/§10.5, Test Plan RC-30) — the server-side half of offline
+ * window enforcement: a still-BUFFERED (pending, Engine Spec §4.2) operation this old is
+ * declared permanently unresolvable and explicitly rejected (Engine Spec §7.6 Rule 7.2, left
+ * unbuilt by Phase 21) rather than left in `engine.pending` forever. As CONFIGURATION, not a
+ * hardcoded constant, for the same reason Phase 21's `GcConfig` is: Scope-IN's own number
+ * (30s) is a starting point, not a value this project has independently validated at
+ * production scale.
+ */
+export interface OfflineWindowConfig {
+  /** Scope-IN: "an operation buffered > 30 s ... → OP_REJECT{offline_window_exceeded}". */
+  readonly pendingRejectTimeoutMs: number;
+  /** How often each open document's `engine.pending` is swept for operations past `pendingRejectTimeoutMs`. */
+  readonly sweepIntervalMs: number;
+}
+
 export interface ServerConfig {
   readonly port: number;
   readonly databaseUrl: string;
   readonly gc: GcConfig;
+  readonly offlineWindow: OfflineWindowConfig;
 }
 
 const DEFAULT_PORT = 8080;
@@ -44,6 +61,9 @@ const DEFAULT_GC_INTERVAL_MS = 60 * 1000;
 // Conservative: a single document's GC must never meaningfully stall the event loop for other
 // documents/clients, even under a pathological anchor chain (see GcConfig's own doc comment).
 const DEFAULT_GC_FIXPOINT_BUDGET_MS = 150;
+// Scope-IN's own literal number (Phase 24).
+const DEFAULT_OFFLINE_WINDOW_PENDING_REJECT_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_OFFLINE_WINDOW_SWEEP_INTERVAL_MS = 5 * 1000;
 
 function positiveIntFromEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: number): number {
   const raw = env[key];
@@ -85,5 +105,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       DEFAULT_GC_FIXPOINT_BUDGET_MS,
     ),
   };
-  return { port, databaseUrl, gc };
+  const offlineWindow: OfflineWindowConfig = {
+    pendingRejectTimeoutMs: positiveIntFromEnv(
+      env,
+      "OFFLINE_WINDOW_PENDING_REJECT_TIMEOUT_MS",
+      DEFAULT_OFFLINE_WINDOW_PENDING_REJECT_TIMEOUT_MS,
+    ),
+    sweepIntervalMs: positiveIntFromEnv(
+      env,
+      "OFFLINE_WINDOW_SWEEP_INTERVAL_MS",
+      DEFAULT_OFFLINE_WINDOW_SWEEP_INTERVAL_MS,
+    ),
+  };
+  return { port, databaseUrl, gc, offlineWindow };
 }

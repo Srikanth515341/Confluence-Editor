@@ -145,6 +145,44 @@ export class DocumentCoordinator {
   private readonly sessions = new Map<string, CoordinatorSession>();
   private nextReplicaId = 1;
 
+  /**
+   * Phase 24's offline-window sweep (offlineWindowScheduler.ts): the first time each
+   * still-BUFFERED operation (keyed by its own serialized stamp) was observed sitting in
+   * `engine.pending`, so the sweep can tell "just noticed, give it the full 30s grace period"
+   * apart from "already waited long enough, reject it" across repeated sweep ticks. Lives here
+   * (not in `Engine`, which stays free of wall-clock concerns, Engine Spec C9) — the same
+   * "server supplies the timestamp, the pure engine never reads one" split as
+   * `applyRemote`'s own optional `context` argument.
+   */
+  readonly pendingFirstSeenAtMs = new Map<string, number>();
+
+  /**
+   * TEST-ONLY (Phase 24, Test Plan RC-32) — a ONE-SHOT role override consumed by the very NEXT
+   * session to join this coordinator, standing in for a real, persisted permission lookup that
+   * doesn't exist until Phases 26-30. Simulates "the owner already changed this specific
+   * user's role before they reconnected" — a real permission system would look this up from
+   * durable storage keyed by a stable user identity; neither exists yet (every session's own
+   * identity is a fresh `randomUUID()` minted at connect time, Phase 8/16), so this override is
+   * keyed by nothing more than "the very next join," which is sufficient to drive RC-32's own
+   * scenario (one specific client reconnecting once) without inventing a persistent identity or
+   * a permission model under schedule pressure. NEVER called by production code — see
+   * gateway.ts's own consuming call site (`handleHandshake`) for how a downgrade is actually
+   * communicated (WELCOME's own `role` field, then an explicit PERMISSION_CHANGED) and enforced
+   * (writePath.ts's `authorize` step).
+   */
+  private testOnlyNextRoleOverride: SessionRole | null = null;
+
+  testOnlyQueueRoleOverride(role: SessionRole): void {
+    this.testOnlyNextRoleOverride = role;
+  }
+
+  /** Consumes (and clears) the queued override, if any — called exactly once per join attempt, win or lose, so a role override can never leak into a LATER, unrelated join. */
+  consumeTestOnlyRoleOverride(): SessionRole | null {
+    const role = this.testOnlyNextRoleOverride;
+    this.testOnlyNextRoleOverride = null;
+    return role;
+  }
+
   constructor(
     documentId: string,
     operationStore: OperationStore,
@@ -229,6 +267,16 @@ export class DocumentCoordinator {
 
   getSession(sessionId: string): CoordinatorSession | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  /** Phase 24's offline-window sweep needs to reach a session by the REPLICA id an evicted pending operation names (`op.id.r`), not by session id — a linear scan over the (typically small) set of currently-open sessions for this document. Returns `undefined` if that replica has since disconnected (the sweep still evicts the pending operation either way — see offlineWindowScheduler.ts's own comment on this disclosed gap). */
+  getSessionByReplicaId(replicaId: number): CoordinatorSession | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.replicaId === replicaId) {
+        return session;
+      }
+    }
+    return undefined;
   }
 
   /** Every session in this room except `exceptSessionId` — the ingress path's broadcast target set. */

@@ -65,6 +65,7 @@ export {
   isImplementedControlType,
   type LeaveMessage,
   type ParticipantInfo,
+  type PermissionChangedMessage,
   type PingMessage,
   type PongMessage,
   SessionRole,

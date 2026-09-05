@@ -13,6 +13,7 @@ import {
   type DomWriter,
 } from "../binding/index.js";
 import type { SyncClient } from "../sync/syncClient.js";
+import { OfflineWindowExceededError } from "../sync/offlineWindow.js";
 import type { MutationSentinel } from "../sentinel/index.js";
 import {
   clusterAfter,
@@ -138,7 +139,19 @@ function insertTextAt(deps: InputPipelineDeps, at: number, text: string): void {
   if (text.length === 0) {
     return;
   }
-  deps.sync.localInsertText(at, text);
+  try {
+    deps.sync.localInsertText(at, text);
+  } catch (err) {
+    if (err instanceof OfflineWindowExceededError) {
+      // Scope-IN (Phase 24): "stops accepting new edits" — the keystroke is dropped from the
+      // DOM's own perspective too (never mutated, same as this pipeline's pre-existing "no
+      // engine yet" no-op just above `handleBeforeInput`'s own dispatch table). Surfacing this
+      // to the USER is the reactive `SyncClient.offlineWindowStatus`/`rejectedCount` layer's
+      // job, not a per-keystroke exception out of a DOM event handler.
+      return;
+    }
+    throw err;
+  }
   deps.sentinel.applyPatches(() => {
     deps.domWriter.insertText(at, text, deps.sync.engine?.text());
   });
@@ -149,7 +162,14 @@ function deleteRangeAt(deps: InputPipelineDeps, at: number, count: number): void
   if (count <= 0) {
     return;
   }
-  deps.sync.localDelete(at, count);
+  try {
+    deps.sync.localDelete(at, count);
+  } catch (err) {
+    if (err instanceof OfflineWindowExceededError) {
+      return; // see insertTextAt's own comment for the full reasoning
+    }
+    throw err;
+  }
   deps.sentinel.applyPatches(() => {
     deps.domWriter.deleteRange(at, count, deps.sync.engine?.text());
   });
