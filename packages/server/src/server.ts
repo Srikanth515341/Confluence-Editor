@@ -1,6 +1,8 @@
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { InMemoryOperationStore, type OperationStore } from "./db/operationStore.js";
+import type { DbPool } from "./db/pool.js";
 import type { DocumentCoordinator } from "./documentCoordinator.js";
+import type { AuthConfig } from "./config.js";
 import { createGateway, type Gateway } from "./gateway.js";
 import { createHttpApp } from "./httpApp.js";
 import { logger } from "./logger.js";
@@ -26,6 +28,16 @@ export interface CreateCollabServerDeps {
    * durability instead.
    */
   readonly operationStore?: OperationStore;
+  /**
+   * Phase 26 (API Spec §4.1/§4.2) — REAL Postgres access + config for POST /v1/auth/login,
+   * /refresh, /logout. Optional for the SAME reason `operationStore` is: every pre-Phase-26 test
+   * constructing a server this way (gateway.test.ts, httpApp.test.ts, client's
+   * headlessHarness.test.ts) has no real database and must keep working unchanged — omitting
+   * this simply means the three auth routes are never mounted (see httpApp.ts's own `authDeps`
+   * doc comment). `index.ts`'s direct-run path and this phase's own new `db/auth.db.test.ts`/
+   * `db/authTiming.db.test.ts` are the only real callers that ever supply it.
+   */
+  readonly auth?: { readonly pool: DbPool; readonly authConfig: AuthConfig };
 }
 
 /** Builds the Express app and WebSocket gateway on one shared HTTP server (so HTTP and WS share a single port). Does not start listening — call `listen()`. */
@@ -40,6 +52,10 @@ export function createCollabServer(deps: CreateCollabServerDeps = {}): CollabSer
   const app = createHttpApp({
     getCoordinators: (): ReadonlyMap<string, DocumentCoordinator> =>
       gatewayBox.current?.coordinators ?? new Map(),
+    // `exactOptionalPropertyTypes` means `authDeps: undefined` is NOT the same as omitting the
+    // property — spread only when actually present, so `deps.auth === undefined` (the default,
+    // every pre-Phase-26 caller) genuinely omits the key rather than assigning `undefined` to it.
+    ...(deps.auth ? { authDeps: deps.auth } : {}),
   });
   const httpServer = createHttpServer(app);
   const gateway = createGateway(httpServer, { operationStore });

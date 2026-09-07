@@ -1,9 +1,8 @@
-// Environment config (.env.example's `PORT`/`DATABASE_URL`). JWT_* is also
-// listed in .env.example but belongs to auth (Phases 26-29) — not read
-// anywhere yet. DATABASE_URL is read as of Phase 15, but only by
-// src/db/pool.ts (used by the seed script and by schema.db.test.ts) — no
-// coordinator/gateway code opens a database connection yet; that's the
-// write path, Phases 16-17.
+// Environment config (.env.example's `PORT`/`DATABASE_URL`/`JWT_*`).
+// DATABASE_URL is read as of Phase 15. JWT_ACCESS_SECRET/JWT_REFRESH_SECRET
+// are read as of Phase 26 (API Spec §4.1/§4.2) — both REQUIRED, matching
+// DATABASE_URL's own precedent, since both are already present (with
+// placeholder "replace-me" values) in the tracked .env.example/.env.
 
 /**
  * Phase 21 (Engine Spec §7.4/§7.7, Test Plan M8-c/M8-d) — garbage collection tunables, as
@@ -47,11 +46,51 @@ export interface OfflineWindowConfig {
   readonly sweepIntervalMs: number;
 }
 
+/**
+ * Phase 26 (API Spec §4.1/§4.2, Test Plan §11.1/SEC-11g) — authentication tunables. The two
+ * JWT secrets are the only genuinely REQUIRED-with-no-safe-default values in this whole config
+ * module (alongside `databaseUrl`) — an auto-generated or empty secret would make every access
+ * token forgeable/replayable across restarts, unlike GcConfig/OfflineWindowConfig's own tunables,
+ * where "unvalidated but reasonable" defaults are an acceptable starting point.
+ *
+ * `accessTokenTtlMs` (15 minutes) and the cookie attributes (HttpOnly/Secure/SameSite=Strict/
+ * Path=/v1/auth/refresh) are literal, spec-given numbers/values (API Spec §4.1/§4.2) — NOT
+ * configuration in the same "unvalidated, deployment may need to tune this" sense GcConfig's own
+ * undo horizon is. They're still exposed as fields (rather than inline constants in tokens.ts)
+ * purely so tests can construct a config with a DIFFERENT ttl without needing to wait out a real
+ * 15-minute window, the same reasoning Phase 17's `DocumentCoordinator` constructor-injectable
+ * snapshot thresholds already established for an identical problem.
+ *
+ * `refreshTokenTtlMs` and both rate-limit thresholds ARE genuinely "unvalidated, reasonable
+ * defaults" in the GcConfig sense — neither API Spec §4.1/§4.2 nor Test Plan SEC-11g gives a
+ * literal number for a refresh token's own lifetime or for how many login attempts should be
+ * allowed before rate-limiting kicks in; both are disclosed, defensible starting points, safe to
+ * override in a real deployment without a code change.
+ */
+export interface AuthConfig {
+  readonly jwtAccessSecret: string;
+  readonly jwtRefreshSecret: string;
+  /** API Spec §4.1: "expiresIn: 900" (15 minutes), literal. */
+  readonly accessTokenTtlMs: number;
+  /** Not spec-mandated — a disclosed, reasonable default (30 days), overridable via config. */
+  readonly refreshTokenTtlMs: number;
+  /** Test Plan's own "per-IP... throttling" requirement, exact thresholds unspecified — a disclosed, reasonable default. */
+  readonly loginRateLimitPerIp: RateLimitRule;
+  /** Test Plan's own "per-account... throttling" requirement, exact thresholds unspecified — a disclosed, reasonable default. */
+  readonly loginRateLimitPerAccount: RateLimitRule;
+}
+
+export interface RateLimitRule {
+  readonly max: number;
+  readonly windowMs: number;
+}
+
 export interface ServerConfig {
   readonly port: number;
   readonly databaseUrl: string;
   readonly gc: GcConfig;
   readonly offlineWindow: OfflineWindowConfig;
+  readonly auth: AuthConfig;
 }
 
 const DEFAULT_PORT = 8080;
@@ -64,6 +103,24 @@ const DEFAULT_GC_FIXPOINT_BUDGET_MS = 150;
 // Scope-IN's own literal number (Phase 24).
 const DEFAULT_OFFLINE_WINDOW_PENDING_REJECT_TIMEOUT_MS = 30 * 1000;
 const DEFAULT_OFFLINE_WINDOW_SWEEP_INTERVAL_MS = 5 * 1000;
+
+// Phase 26 — API Spec §4.1's own literal number.
+const DEFAULT_ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+// Not spec-mandated — a disclosed, reasonable default (see AuthConfig's own doc comment).
+const DEFAULT_REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const DEFAULT_LOGIN_RATE_LIMIT_PER_IP_MAX = 20;
+const DEFAULT_LOGIN_RATE_LIMIT_PER_IP_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_MAX = 5;
+const DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_WINDOW_MS = 15 * 60 * 1000;
+
+/** No safe default exists for a secret — see AuthConfig's own doc comment for why these two are the only genuinely required env vars besides `DATABASE_URL`. */
+function requiredStringFromEnv(env: NodeJS.ProcessEnv, key: string): string {
+  const raw = env[key];
+  if (!raw) {
+    throw new Error(`loadConfig: ${key} is required (see .env.example)`);
+  }
+  return raw;
+}
 
 function positiveIntFromEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: number): number {
   const raw = env[key];
@@ -117,5 +174,35 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       DEFAULT_OFFLINE_WINDOW_SWEEP_INTERVAL_MS,
     ),
   };
-  return { port, databaseUrl, gc, offlineWindow };
+  const auth: AuthConfig = {
+    jwtAccessSecret: requiredStringFromEnv(env, "JWT_ACCESS_SECRET"),
+    jwtRefreshSecret: requiredStringFromEnv(env, "JWT_REFRESH_SECRET"),
+    accessTokenTtlMs: positiveIntFromEnv(env, "AUTH_ACCESS_TOKEN_TTL_MS", DEFAULT_ACCESS_TOKEN_TTL_MS),
+    refreshTokenTtlMs: positiveIntFromEnv(
+      env,
+      "AUTH_REFRESH_TOKEN_TTL_MS",
+      DEFAULT_REFRESH_TOKEN_TTL_MS,
+    ),
+    loginRateLimitPerIp: {
+      max: positiveIntFromEnv(env, "AUTH_LOGIN_RATE_LIMIT_PER_IP_MAX", DEFAULT_LOGIN_RATE_LIMIT_PER_IP_MAX),
+      windowMs: positiveIntFromEnv(
+        env,
+        "AUTH_LOGIN_RATE_LIMIT_PER_IP_WINDOW_MS",
+        DEFAULT_LOGIN_RATE_LIMIT_PER_IP_WINDOW_MS,
+      ),
+    },
+    loginRateLimitPerAccount: {
+      max: positiveIntFromEnv(
+        env,
+        "AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT_MAX",
+        DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_MAX,
+      ),
+      windowMs: positiveIntFromEnv(
+        env,
+        "AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT_WINDOW_MS",
+        DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_WINDOW_MS,
+      ),
+    },
+  };
+  return { port, databaseUrl, gc, offlineWindow, auth };
 }
