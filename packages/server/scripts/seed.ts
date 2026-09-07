@@ -2,28 +2,33 @@
 // development"). Idempotent — safe to run repeatedly against the same
 // database (ON CONFLICT DO NOTHING keyed on the fixed seed UUIDs below).
 //
-// password_hash is a literal placeholder string, NOT a real argon2id hash
-// — password hashing doesn't exist until auth (Phases 26-29). The column
-// is NOT NULL per API Spec §2.2, so seeding needs *some* value; this one
-// is deliberately unusable as a real hash so it can never be mistaken for
-// one.
+// password_hash is now (Phase 26) a REAL Argon2id hash of a fixed, published dev-only password
+// — this is the ONE user this project's own seed data is meant to be able to log in as, via the
+// new POST /v1/auth/login (API Spec §4.1). Never used before this phase, since password hashing
+// didn't exist until now; `operationStore.ts`'s own SEPARATE `SYSTEM_USER_PASSWORD_HASH_PLACEHOLDER`
+// (auto-provisioned WS-connection users, unrelated to real login) is untouched by this change —
+// that remains exactly the disclosed, non-loggable-in placeholder it always was.
 
 import { loadConfig } from "../src/config.js";
 import { createPool } from "../src/db/pool.js";
+import { hashPassword } from "../src/passwordHash.js";
 
 const SEED_USER_ID = "00000000-0000-4000-8000-000000000001";
 const SEED_DOCUMENT_ID = "00000000-0000-4000-8000-000000000002";
-const PLACEHOLDER_PASSWORD_HASH = "unset:not-a-real-hash:phase-26-29";
+/** Dev-only, published in this very file — never use this account/password outside local development. */
+export const SEED_USER_EMAIL = "dev@example.com";
+export const SEED_USER_PASSWORD = "dev-password-not-for-production";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const pool = createPool(config.databaseUrl);
   try {
+    const passwordHash = await hashPassword(SEED_USER_PASSWORD);
     await pool.query(
       `INSERT INTO users (id, email, display_name, password_hash)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (id) DO NOTHING`,
-      [SEED_USER_ID, "dev@example.com", "Dev User", PLACEHOLDER_PASSWORD_HASH],
+      [SEED_USER_ID, SEED_USER_EMAIL, "Dev User", passwordHash],
     );
 
     await pool.query(
@@ -48,6 +53,8 @@ async function main(): Promise<void> {
         message: "seed.complete",
         userId: SEED_USER_ID,
         documentId: SEED_DOCUMENT_ID,
+        loginEmail: SEED_USER_EMAIL,
+        loginPassword: SEED_USER_PASSWORD, // dev-only, fixed, published above — never a real secret
       }),
     );
   } finally {

@@ -12,6 +12,48 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 26 — authentication and sessions.** Real user accounts for the
+first time: `POST /v1/auth/login`, `/refresh`, `/logout`, Argon2id
+password hashing, a 15-minute JWT access token, and a refresh token in an
+`HttpOnly; Secure; SameSite=Strict` cookie with full rotation-with-
+family-revocation (reusing an already-rotated refresh token revokes
+every token that login session ever issued, verified end to end — a
+later, otherwise-still-valid token from the same family is confirmed to
+stop working too). SEC-11g's own user-enumeration timing requirement —
+an unknown email and a wrong password must be indistinguishable — is
+verified with a real statistical test, not eyeballing: 1,000 real
+Argon2id samples per case against a real Postgres instance, Welch's
+t = -0.6393, mean difference 1.632ms. Per-IP and per-account login rate
+limiting. The WebSocket gateway's own handshake does NOT yet verify any
+access token — any client can still join any document by guessing its
+id, unchanged from every prior phase; that wiring is Phase 27+'s job.
+See [`CLAUDE.md`](./CLAUDE.md)'s Phase 26 entry for the full account.
+
+**Phase 25 — Milestone M2 adverse-network verification, and a major
+correctness investigation.** DUR-05/06 DoD verification found the core
+convergence algorithm could diverge or throw under completely ordinary
+network conditions — three distinct bugs, found one at a time, in this
+project's own hand-derived scan. Rather than patch a fourth time, the
+engine was rebuilt from scratch on **Fugue** (Weidner & Kleppmann),
+verified against every adversarial case, every property suite, the full
+70,000-seed convergence suite, and a rebuilt mutation matrix. Integrating
+the new engine surfaced six further real bugs, all found and fixed
+(a wire-shape gap, a silently-ignored buffered-operation result, an
+out-of-order-commit race, a replica-id-reuse-after-restart bug, a
+client-side seq-tracking redesign, and a wire-protocol corruption bug).
+The investigation also found and partially mitigated a genuine,
+structurally-confirmed race — a live client's ordinary keystroke can
+anchor to a node the server has already garbage-collected — with the
+full structural fix explicitly deferred to its own future session. Every
+DUR-0x DoD item now passes; M8-a is honestly partial (the true 100,000-op
+memory number is unknown until a deferred O(N²)→O(log N) storage
+redesign lands); M8-e passes cleanly after two rounds of same-day
+follow-up investigation. See [`CLAUDE.md`](./CLAUDE.md)'s own extensive
+Phase 25 sections (the "CRITICAL FINDING" entries, the Fugue migration
+account, and the final Phase 25 report) for the complete, unvarnished
+story — this is the single most consequential investigation in the
+project's history to date.
+
 **Phase 24 — offline window enforcement and rejection preservation.** A
 client offline for too long now warns (8 min / 1,600 ops) and then
 stops accepting edits outright (10 min / 2,000 ops, whichever comes
@@ -276,10 +318,16 @@ packages/testkit     fuzz / mutation / network-fault / load harnesses
 
 ```bash
 pnpm install
-cp .env.example .env   # fill in real values before running the server
+cp .env.example .env   # fill in real values before running the server —
+                        # JWT_ACCESS_SECRET/JWT_REFRESH_SECRET (Phase 26) are
+                        # REQUIRED; the "replace-me" placeholders are fine for
+                        # local dev but must be real secrets in any shared/
+                        # production environment
 docker compose up -d   # starts local Postgres (Phase 15)
-pnpm db:migrate         # creates all eight tables (packages/server/migrations/)
-pnpm db:seed            # optional — one dev user + one dev document
+pnpm db:migrate         # creates all nine tables (packages/server/migrations/)
+pnpm db:seed            # optional — one dev user + one dev document; prints a
+                        # real, working login (email/password) for
+                        # POST /v1/auth/login as of Phase 26
 ```
 
 ## Running checks
@@ -381,9 +429,11 @@ runs this at full scale on a schedule.
 | Offline editing (durable queue + replay)   | ✅ **Phase 22** (IndexedDB-backed unacked queue, API Spec §7.9; survives tab close/crash)                  |
 | Reconnection handshake (CATCHUP/ALREADY_HAVE) | ✅ **Phase 23** (delta sync over the durable log; RC-27 3.6s p95, well under PRD M6's 5s budget)         |
 | Offline window enforcement + rejection preservation | ✅ **Phase 24** (10min/2,000-op client cap; server-side explicit rejection, Engine Spec §7.6 Rule 7.2; API Spec §5.5 preserve-never-destroy for all 3 reason codes) |
-| Auth, presence                             | ⏳ not started (Phases 26-29, 31)                                                                          |
+| Convergence engine — Fugue migration       | ✅ **Phase 25** (three real bugs found in the prior YATA-family scan; rebuilt on Fugue; six further integration bugs found & fixed; adverse-network DoD fully passing) |
+| Authentication (login/refresh/logout)      | ✅ **Phase 26** (Argon2id, JWT access tokens, refresh rotation + family revocation, SEC-11g timing-oracle-free — verified with a real statistical test) |
+| WS gateway authorization + presence        | ⏳ not started (Phase 27+, 31) — Phase 26 built the token PRIMITIVES only; the WS handshake does not verify one yet |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
-| Permissions (real owner/editor/viewer system) | ⏳ not started (Phases 26-30) — Phase 24's role-downgrade DEMO uses a test-only override, not this        |
+| Permissions (real owner/editor/viewer system) | ⏳ not started (Phase 27-30) — Phase 24's role-downgrade DEMO uses a test-only override, not this          |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

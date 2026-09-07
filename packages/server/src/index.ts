@@ -1,7 +1,11 @@
 // Express + WebSocket gateway, Document Coordinator. Persistence is real
 // as of Phase 16 (operations are durably committed before being
 // acknowledged — API Spec §6.3) when run directly, below, via a real
-// `PostgresOperationStore`; auth (Phases 26-29) is still not built.
+// `PostgresOperationStore`. Real user accounts/login (API Spec §4.1/§4.2)
+// are built as of Phase 26 — POST /v1/auth/login, /refresh, /logout; the
+// WebSocket gateway's own handshake does NOT yet verify an access token
+// (that remains Phase 27+ — see gateway.ts's own `testOnlyQueueRoleOverride`
+// citations for the still-standing no-auth-on-the-WS-path stance).
 
 export const SERVER_PACKAGE_NAME = "@collab-editor/server";
 
@@ -68,6 +72,36 @@ export {
   type CrashSite,
 } from "./testOnlyCrashInjection.js";
 export { writeSnapshotNow } from "./snapshotter.js";
+export type { AuthConfig, RateLimitRule } from "./config.js";
+export { hashPassword, verifyPassword, getDummyPasswordHash } from "./passwordHash.js";
+export {
+  accessTokenTtlSeconds,
+  signAccessToken,
+  verifyAccessToken,
+  generateRawRefreshToken,
+  hashRefreshToken,
+  type AccessTokenClaims,
+} from "./tokens.js";
+export { InMemoryRateLimiter } from "./rateLimiter.js";
+export {
+  attemptLogin,
+  issueAccessToken,
+  createRefreshFamily,
+  rotateRefreshToken,
+  revokeRefreshFamilyByRawToken,
+  type IssuedRefreshToken,
+  type RotateRefreshTokenResult,
+} from "./authService.js";
+export {
+  findUserByEmail,
+  findUserById,
+  insertRefreshToken,
+  findRefreshTokenByHash,
+  markRefreshTokenUsed,
+  revokeFamily,
+  type UserRow,
+  type RefreshTokenRow,
+} from "./db/authStore.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
@@ -94,9 +128,15 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const config = loadConfig();
   // Real persistence (Phase 16) — every server test still defaults to
   // InMemoryOperationStore (server.ts's own default); only an actually-run
-  // server ever talks to a real database.
-  const operationStore = new PostgresOperationStore(createPool(config.databaseUrl));
-  const server = createCollabServer({ operationStore });
+  // server ever talks to a real database. ONE pool, shared between the CRDT write path
+  // (via operationStore) and Phase 26's own auth routes — a real server has no reason to open
+  // two separate connection pools to the same database.
+  const pool = createPool(config.databaseUrl);
+  const operationStore = new PostgresOperationStore(pool);
+  const server = createCollabServer({
+    operationStore,
+    auth: { pool, authConfig: config.auth },
+  });
   void server.listen(config.port);
   // Phase 18: the continuously-running production control — audits every currently-open
   // document on a fixed interval. Never started for `createCollabServer()` calls elsewhere

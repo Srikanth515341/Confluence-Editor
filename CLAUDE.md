@@ -4915,6 +4915,174 @@ check:purity` was ALSO silently broken by two comments (one in
   scope (RC-30's scenario has the client already reconnected by the
   time rejection fires).
 
+- **Phase 25 — Milestone M2, DUR-05/06 adverse-network verification, plus a major
+  correctness investigation (the Fugue migration) and six further real bugs.**
+  This phase's own account is unusually large and lives across several
+  dedicated sections of this file rather than one linear bullet — added here
+  purely to register it properly in this list (Test Plan §11/M2's own DoD is
+  now fully closed out; see below), not to duplicate that content. In order:
+  DUR-05/06 DoD verification found `Engine.integrate()` could diverge or
+  throw under completely ordinary network conditions (duplicate/reorder/
+  drop, and eventually even fault-free reconnects) — three distinct bugs in
+  this project's own hand-derived YATA-family scan, found one at a time as
+  each prior patch was itself found insufficient. Given three bugs in the
+  same algorithm family, the engine was rebuilt from scratch on **Fugue**
+  (Weidner & Kleppmann) rather than patched a fourth time — see "🛑 CRITICAL,
+  OPEN, UNRESOLVED FINDING" and "Engine Spec §4.3 replaced by the real YATA
+  algorithm" immediately below and under Key Technical Decisions for the
+  full investigation, verified against all 22 adversarial cases, all 5
+  property suites, the full 70,000-seed convergence suite, and a rebuilt
+  mutation matrix (8/8 killed). Integrating the new engine into
+  `protocol`/`server`/`client` then surfaced six further real, independently
+  fixed bugs — see "✅ PHASE 25 UPDATE (2026-09-06)" for the full account of
+  Bugs 3-8 (the `parent`/`side` wire-shape integration gap; `writePath.ts`
+  silently ignoring a buffered `applyRemote` result; an out-of-order-commit
+  race breaking CATCHUP's own honesty guarantee; a replica-id-reuse-after-
+  restart bug plus its own bigint-string-concatenation bug; the client-side
+  seq-tracking redesign; and a wire-protocol run-coalescing bug that
+  silently corrupted reconciled operations). DUR-05/DUR-06 both PASS
+  cleanly after all of the above (10/10 clean DUR-06 runs). This
+  investigation also found, root-caused, and partially mitigated **Critical
+  Finding #2 / R0012**: a live, continuously-connected client's ORDINARY
+  keystroke can anchor to a node the server has already garbage-collected —
+  see that section's own entry for the full mechanism, the three-option
+  tractability analysis, and Option 2 (client-side revert-and-notify,
+  shipped) vs. Option 1 (a structurally-safe GC/undo-horizon redesign,
+  explicitly deferred — Open Item 9). DUR-02 and DUR-03 both PASS (100%
+  clean, real runs against real Postgres). M8-a is PARTIAL — real numbers
+  recorded at reduced scale (500/4,000 ops); the full 100,000-op number
+  remains genuinely unknown until Open Item 3's O(N²)→O(log N) redesign
+  lands (Fugue's own reference storage layer is quadratic — a real,
+  disclosed, deliberately deferred performance finding, not a correctness
+  one). M8-e initially failed (`pending` stuck nonzero); wiring
+  `offlineWindowScheduler.ts`'s sweep into the soak loop (Open Item 10)
+  fixed that, and a same-day follow-up investigation (forced-GC
+  re-measurement, map-size diagnostics, a realistic-undo-horizon comparison
+  run) resolved a heap-growth smell-test failure the fix's own first re-run
+  surfaced as confirmed unforced-GC noise, not a leak (Open Item 11,
+  resolved) — see `tests/regression/R0013` and `docs/benchmarks.md`'s own
+  "M8-e soak run" section for the full data. **Phase 25's own final status:
+  every DUR-0x item PASS, M8-a PARTIAL (disclosed), M8-e PASS — ready for
+  the v0.2.0-m2 tag**, with Items 2/3/4/6/7/9 (below) as legitimate,
+  separately-scoped, deliberately-deferred future work, none of them
+  blocking this milestone's own closeout.
+
+- **Phase 26 — Authentication and sessions** (API Spec §1.5/§4.1/§4.2, Test
+  Plan §11.1/SEC-11g). Real user accounts and secure token handling, for the
+  first time in this project: `POST /v1/auth/login`, `/refresh`, `/logout`.
+  Argon2id password hashing (`passwordHash.ts`); a 15-minute JWT access
+  token and a 30-day (disclosed default, not spec-mandated)
+  opaque-random-secret refresh token in an `HttpOnly; Secure; SameSite=Strict;
+  Path=/v1/auth/refresh` cookie (`tokens.ts`); refresh-token ROTATION with
+  FAMILY REVOCATION (reusing an already-rotated token revokes every token
+  ever issued from that login, not just the reused one — `authService.ts`'s
+  `rotateRefreshToken`, verified end to end: a token two rotations old is
+  replayed, and a LATER, otherwise-still-valid token from the same family is
+  confirmed to ALSO stop working as a direct consequence); per-IP and
+  per-account login rate limiting (`rateLimiter.ts`, a sliding-window log,
+  disclosed unvalidated-but-reasonable defaults, the same "configuration,
+  not a hardcoded constant" precedent as `GcConfig`/`OfflineWindowConfig`).
+
+  **SEC-11g (the user-enumeration timing oracle) is the phase's own
+  centerpiece requirement, not an afterthought**: `attemptLogin`
+  (`authService.ts`) ALWAYS runs a real Argon2id comparison, resolved to
+  either the real user's own stored hash or one fixed, pre-computed dummy
+  hash (`getDummyPasswordHash()`, `passwordHash.ts`) — the branch on
+  "does this email exist" happens only in WHICH hash gets compared against,
+  never in WHETHER the comparison runs at all. Verified with a REAL
+  statistical test, not eyeballing: 1,000 real samples each of
+  unknown-email and wrong-password login (2,000 real Argon2id calls against
+  a real Postgres instance, interleaved to spread any real-world timing
+  drift evenly across both groups), a genuine Welch's two-sample t-test
+  PLUS the DoD's own explicit "or simply comparing p50/p95/mean" alternative
+  computed as a second, independent check. **Measured, real numbers**:
+  unknown-email mean=125.046ms (p50=112.920ms, p95=177.259ms); wrong-password
+  mean=126.679ms (p50=113.010ms, p95=184.646ms); Welch's t = **-0.6393**
+  (a generous, deliberately-calibrated bound of `|t| < 8` — see this test's
+  own header comment for why a literal significance-cutoff would itself be
+  the wrong bound at n=1,000, the same "a textbook threshold doesn't survive
+  contact with the real sampling distribution at this sample size" lesson
+  RC-34's own jitter-threshold recalibration (Phase 23) already taught this
+  project); mean difference = **1.632ms** (bound: <20ms, vs. the ~130ms full
+  hash cost the bug class this test guards against would actually produce).
+  Genuinely, comfortably indistinguishable.
+
+  **A real, if minor, test-design finding caught during DoD verification**:
+  the first draft of the refresh-rotation test asserted the rotated
+  response's own NEW access token must differ from the ORIGINAL one — this
+  failed on the very first real run, because two JWTs signed with IDENTICAL
+  claims within the SAME wall-clock second are legitimately byte-IDENTICAL
+  (HS256 has no per-call randomness, and a JWT's own `iat` claim has
+  1-second resolution). Not a product bug — access-token uniqueness across
+  calls is not a security property this system relies on (unlike
+  refresh-token uniqueness, which the rotation/revocation model genuinely
+  requires and which IS independently verified). The test's own incorrect
+  assertion was fixed, not the code.
+
+  **No signup/registration endpoint exists** — Scope-IN names only login/
+  refresh/logout, and building one wasn't asked for; every test seeds a
+  real user directly via `hashPassword()` + a raw `INSERT INTO users`,
+  matching this project's own established fixture-seeding convention
+  (Phase 17/18's bulk-insert technique) rather than inventing an unscoped
+  endpoint. `scripts/seed.ts`'s own dev user now gets a REAL Argon2id hash
+  of a fixed, published dev-only password (`dev-password-not-for-production`)
+  instead of Phase 16's placeholder string, so `pnpm db:seed` produces an
+  account this project's own new login endpoint can actually authenticate
+  — a small, disclosed, in-scope improvement, not scope creep;
+  `operationStore.ts`'s own SEPARATE, still-non-loggable-in
+  `SYSTEM_USER_PASSWORD_HASH_PLACEHOLDER` (auto-provisioned WS-connection
+  users) is untouched, exactly as before.
+
+  **A genuine design question resolved by precedent, not by asking**:
+  every one of this project's other database-backed features
+  (`OperationStore`, Phase 16) is injectable, defaulting to something
+  infra-free so `pnpm test` never needs a real Postgres instance. Auth has
+  no meaningful in-memory substitute (a login system IS its own persistence
+  layer), so the SAME pattern is applied one level up instead:
+  `HttpAppDeps`/`CreateCollabServerDeps` gained an OPTIONAL `authDeps`/
+  `auth` field (`{ pool, authConfig }`); when omitted (every pre-Phase-26
+  test), the three auth routes are simply never mounted, exactly mirroring
+  how an unknown document id already 404s rather than crashing. Only
+  `index.ts`'s real direct-run path and this phase's own new
+  `db/auth.db.test.ts`/`db/authTiming.db.test.ts` ever supply it.
+
+  **Explicitly, deliberately NOT built this phase**: the WebSocket
+  gateway's own handshake does NOT verify an access token — a client can
+  still join any document by guessing its id, exactly as before (Phase
+  27+'s job; `gateway.ts`'s own `testOnlyQueueRoleOverride` and the
+  Phase-16-era auto-provisioning behavior are both untouched and still
+  described by their own original CLAUDE.md entries). No real permission
+  system (owner/editor/viewer) — still Phase 26-30's job as a whole; this
+  phase is authentication only, not authorization.
+
+  **DoD verification, all against a real, migrated Postgres instance**:
+  `db/auth.db.test.ts` (12 tests) — login success (200, real JWT, `expiresIn:
+  900`, the exact required cookie attributes verified from the real
+  `Set-Cookie` header); unknown-email and wrong-password login return the
+  IDENTICAL response body; 400 `validation_failed` for missing/empty
+  fields AND for syntactically malformed JSON; refresh rotation (a
+  genuinely new refresh cookie value each time); the family-revocation-on-
+  reuse scenario described above; logout revocation + cookie clearing +
+  idempotent no-cookie logout; per-IP AND per-account rate limiting
+  (429, independently verified); and a real, automated check — not mere
+  code inspection — that NO token value (access token, raw refresh token)
+  ever appears in this server's own captured `console.log` output across a
+  real login→refresh→logout sequence, satisfying the DoD's own "no token
+  appears in any URL or server log" line as a genuine, repeatable test
+  rather than a one-time manual read-through. `db/authTiming.db.test.ts`
+  (SEC-11g, above) passes with the real numbers quoted. Full default `pnpm
+  test`: **444/444 passing** (2 disclosed, unrelated skips, unchanged),
+  confirming the shared-file changes this phase touched (`config.ts`,
+  `httpApp.ts`, `server.ts`, `index.ts`) introduced zero regressions
+  elsewhere. `pnpm typecheck` clean across all 6 packages; `pnpm lint`
+  clean for every file this phase touched (the aggregate's own 333
+  pre-existing problems are entirely Phase 14's diagnostic scratch `.mjs`
+  scripts plus other already-documented pre-existing gaps, none touched by
+  this phase); `pnpm format:check` flags this phase's own new/edited files
+  alongside the same pre-existing, repo-wide CRLF/`core.autocrlf` condition
+  documented since Phase 19 (223 files now, up from 202 at Phase 24 — this
+  phase's own files simply inherited it, like every prior phase's).
+
 ## 🛑 CRITICAL, OPEN, UNRESOLVED FINDING — READ THIS FIRST (2026-09-05)
 
 **The core convergence guarantee is currently known to be BROKEN under
@@ -5989,6 +6157,23 @@ status and v0.2.0-m2 tag readiness determination).
 
 ## Current phase in progress
 
+**Phase 26 (Authentication and sessions) — COMPLETE as of 2026-09-07.**
+Real user accounts, Argon2id password hashing, JWT access tokens, and
+refresh-token rotation with family-revocation-on-reuse are all live —
+`POST /v1/auth/login`, `/refresh`, `/logout`. SEC-11g's own timing
+requirement is verified with real, measured numbers (Welch's t=-0.6393,
+mean difference 1.632ms — genuinely indistinguishable). See the "Phase
+26" bullet in the Completed Phases list above for the full account,
+including the six DoD test cases, the real design decisions made (opaque
+HMAC-hashed refresh tokens vs. a self-verifying JWT, the injectable-
+`authDeps` pattern mirroring `OperationStore`'s own precedent), and
+what's explicitly deferred to Phase 27+ (the WebSocket gateway's own
+handshake still does not verify any access token — a client can still
+join any document by guessing its id, unchanged from every prior phase).
+No open item from Phase 26 blocks anything — the next phase to pick up
+is Phase 27 (or whichever phase actually wires an access token into the
+WS handshake).
+
 **Phase 25 (Milestone M2, DUR-05/06 adverse-network verification) — DoD
 verification COMPLETE as of 2026-09-07; ready for the v0.2.0-m2 tag.**
 See the final Phase 25 report (dated 2026-09-07, this session) for the
@@ -6175,11 +6360,18 @@ foreign keys — **and are REAL, PERMANENT database rows, unbounded by any
 rate limit, created for literally any documentId/connection with no
 authentication at all; see the Phase 16 entry's "⚠️ KNOWN INTERIM
 BEHAVIOR" callout above for the full risk and what must change when
-auth lands.** No auth (Phases 26-29) — any WebSocket client can join
-any document by guessing its id and is unconditionally granted the
-EDITOR role, which is
-correct for this phase and not yet a security concern since nothing is
-exposed publicly. A React component (`EditorView`), the full `beforeinput`
+auth lands.** **Real authentication now exists as of Phase 26** (API Spec
+§4.1/§4.2) — `POST /v1/auth/login`/`/refresh`/`/logout`, real Argon2id
+password hashing, JWT access tokens, refresh-token rotation with
+family-revocation-on-reuse — but it is NOT YET WIRED into the WebSocket
+gateway's own handshake, which is unchanged and still exactly as
+permissive as before: any WebSocket client can join any document by
+guessing its id and is unconditionally granted the EDITOR role. This is
+Phase 27+'s own job (verifying a real access token during HELLO and using
+its claims for real per-document authorization), not yet a security
+concern since nothing is exposed publicly, and not something Phase 26
+itself claimed to close — Phase 26 built the login/token PRIMITIVES,
+deliberately scoped no further. A React component (`EditorView`), the full `beforeinput`
 dispatch pipeline (Phase 12), MutationObserver-based DOM reconciliation
 (`MutationSentinel`, Phase 13), and a real demoable app (`packages/client/
 src/app/`, Phase 14/Milestone M1) now exist and are wired together —
