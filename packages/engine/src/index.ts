@@ -20,13 +20,13 @@ export { Engine } from "./engine.js";
 export type { ClockEvent, CollectOptions, CollectResult, EngineStats } from "./engine.js";
 export { assertInvariants, InvariantViolation } from "./invariants.js";
 export type { AssertInvariantsOptions } from "./invariants.js";
-// Block encoding (Engine Spec §7.5, Phase 20) — exported for
-// @collab-editor/protocol's SNAPSHOT body encoder, which needs to group a
-// flat, already-decoded Node[] sequence into the same maximal runs the
-// live engine's own PositionIndex forms internally, for wire compression.
-// `canFollowInBlock` is the only piece that operates on plain decoded
-// Node[]; the rest are exported so a consumer that already HAS blocks
-// (there currently is none outside packages/engine itself) isn't forced
-// to reinvent them.
-export type { Block } from "./block.js";
-export { canFollowInBlock, decodeBlock, decodeNodeAt } from "./block.js";
+// Block encoding (Engine Spec §7.5, Phase 20) and PositionIndex (Phase 19) are RETIRED as of
+// the Fugue port (2026-09-05, CLAUDE.md's "Fugue port" entry) — both were built around the
+// flat, consecutive-counter, originLeft/originRight-chained structure the retired YATA-family
+// scan produced, which a Fugue tree does not have. `@collab-editor/protocol`'s own
+// `snapshotBody.ts` (SNAPSHOT wire encoding) still imports the retired `Block`/
+// `canFollowInBlock`/`decodeBlock` exports — this is a KNOWN, DISCLOSED, OUT-OF-SESSION-SCOPE
+// break (see CLAUDE.md): a real block-run-length-equivalent compression scheme for a Fugue
+// tree needs its own from-scratch design, not an adaptation of the retired one, and is
+// deferred to whichever future phase migrates the wire protocol itself to Fugue's own
+// `(id, value, parent, side)` operation shape.

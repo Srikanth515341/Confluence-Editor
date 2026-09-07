@@ -58,7 +58,7 @@ async function runAllOpenDocuments(gateway: Gateway): Promise<void> {
       // rest of this tick's sweep from running.
       logger.error("auditScheduler.documentFailed", {
         documentId: coordinator.documentId,
-        message: err instanceof Error ? err.message : String(err),
+        errorMessage: err instanceof Error ? err.message : String(err),
       });
     }
   }

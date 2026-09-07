@@ -119,6 +119,7 @@ export function runOneDocument(coordinator: DocumentCoordinator, config: Offline
       });
       coordinator.engine.rejectPending(op.id);
       coordinator.pendingFirstSeenAtMs.delete(key);
+      coordinator.pendingOpOrigin.delete(key);
       continue;
     }
 
@@ -130,13 +131,20 @@ export function runOneDocument(coordinator: DocumentCoordinator, config: Offline
     }
     coordinator.engine.rejectPending(op.id);
     coordinator.pendingFirstSeenAtMs.delete(key);
+    coordinator.pendingOpOrigin.delete(key);
   }
 
-  // Prune tracking entries for operations that drained normally (their dependency arrived)
-  // since the last sweep — otherwise this map would grow forever for a healthy, busy document.
+  // Prune tracking entries for operations that drained normally (their dependency arrived, and
+  // writePath.ts's own "slow path" already finalized and deleted its own pendingOpOrigin entry)
+  // since the last sweep — otherwise these maps would grow forever for a healthy, busy document.
   for (const key of coordinator.pendingFirstSeenAtMs.keys()) {
     if (!stillPending.has(key)) {
       coordinator.pendingFirstSeenAtMs.delete(key);
+    }
+  }
+  for (const key of coordinator.pendingOpOrigin.keys()) {
+    if (!stillPending.has(key)) {
+      coordinator.pendingOpOrigin.delete(key);
     }
   }
 

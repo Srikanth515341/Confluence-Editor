@@ -121,8 +121,8 @@ function buildAppendChain(
       kind: "insert",
       id,
       value: valueAt(i),
-      originLeft: prevId,
-      originRight: null,
+      parent: prevId,
+      side: "R",
       bind: false,
     });
     prevId = id;
@@ -199,8 +199,8 @@ async function seedAppendChainDocument(
     const nodes: Node[] = prefix.map((op) => ({
       id: op.id,
       value: op.value,
-      originLeft: op.originLeft,
-      originRight: op.originRight,
+      parent: op.parent,
+      side: op.side,
       bind: op.bind,
       deleted: false,
       deletedBy: null,

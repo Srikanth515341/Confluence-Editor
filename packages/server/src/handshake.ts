@@ -1,4 +1,4 @@
-import type { Identifier } from "@collab-editor/engine";
+import { serializeId, type Identifier } from "@collab-editor/engine";
 import {
   CLIENT_CAP_HAS_RESIDENT_ENGINE,
   encodeCatchupOperation,
@@ -130,12 +130,28 @@ export function chunkCatchupOperations(rangeOps: readonly SeqOperation[]): Catch
 /**
  * Builds the full CATCHUP_BEGIN / CATCHUP_CHUNK[] / CATCHUP_END sequence
  * for a client whose WELCOME carried `syncMode: CATCHUP` (API Spec
- * §3.6.4-§3.6.6). `toSeq` is read from `coordinator.currentSeq` at the
- * moment this is called (may already be behind by the time all chunks
- * finish streaming, if concurrent operations commit meanwhile — those
- * simply reach this session afterward via the normal live OPS broadcast,
- * same as for any already-joined session; see CatchupBeginMessage's own
- * doc comment).
+ * §3.6.4-§3.6.6). `toSeq` is read from `coordinator.lastCommittedSeq` —
+ * deliberately NOT the raw `coordinator.currentSeq` — at the moment this
+ * is called (may already be behind by the time all chunks finish
+ * streaming, if concurrent operations commit meanwhile — those simply
+ * reach this session afterward via the normal live OPS broadcast, same as
+ * for any already-joined session; see CatchupBeginMessage's own doc
+ * comment).
+ *
+ * Phase 25 (DUR-06 fix, follow-up finding): `currentSeq` is bumped
+ * SYNCHRONOUSLY at seq-RESERVATION time, in writePath.ts, before the
+ * corresponding row(s) have necessarily reached the store — reading it
+ * here could tell a reconnecting client it has received a range that
+ * includes an operation whose own commit is still in flight (or, under a
+ * genuine interleaving with another concurrent message for this same
+ * document, one that hasn't even been ATTEMPTED yet). Since this
+ * client's own `lastServerSeq` gets set to whatever `toSeq` says
+ * (Phase 23), promising more than what `lastCommittedSeq` — the
+ * durable, gap-free prefix `DocumentCoordinator.enqueueCommit` maintains
+ * — actually contains would PERMANENTLY skip that operation for this
+ * client, with no error and no future retry (a real, hand-traced finding
+ * confirmed via `packages/client/src/sync/adverseNetwork.test.ts`'s own
+ * DUR-06 test under 4 concurrently-writing clients).
  */
 export async function buildCatchupMessages(
   coordinator: DocumentCoordinator,
@@ -145,7 +161,7 @@ export async function buildCatchupMessages(
   readonly chunks: readonly CatchupChunkMessage[];
   readonly end: CatchupEndMessage;
 }> {
-  const toSeq = coordinator.currentSeq;
+  const toSeq = coordinator.lastCommittedSeq;
   const rangeOps = await coordinator.operationStore.loadOperationLogRange(
     coordinator.documentId,
     BigInt(fromSeq),
@@ -161,10 +177,35 @@ export async function buildCatchupMessages(
 
 /**
  * Builds ALREADY_HAVE (API Spec §3.6.7) from the client's own HELLO.unacked
- * stamps — checked against durable storage (`findExistingStamps`, GC-
- * independent, see its own doc comment), never the live engine's
- * structure. Sent unconditionally, even when `unackedStamps` is empty or
- * none of it is already committed (an empty `alreadyHave` array is a
+ * stamps, as the UNION of two independent presence checks — a real, hand-
+ * traced finding (Phase 25, DUR-05 fix), not the original single-check
+ * design:
+ *
+ *   1. Durable storage (`findExistingStamps`) — GC-independent (a
+ *      long-ago-committed, since-collected operation's own row lives
+ *      forever in the log even though `coordinator.engine` no longer has
+ *      a live node for it — checking only the live engine would wrongly
+ *      report "not already have" for it, per this project's own Phase 23
+ *      reasoning).
+ *   2. The LIVE engine (`coordinator.engine.hasApplied`) — closes the
+ *      OPPOSITE gap: an operation that was just applied and BROADCAST to
+ *      every peer, but whose own `commitOperations` call is still sitting
+ *      in `DocumentCoordinator.enqueueCommit`'s per-document FIFO queue
+ *      (Phase 25's own DUR-06 fix — which can leave this window open far
+ *      longer than the single, tiny pre-fix window, whenever other
+ *      concurrent messages for the same document are queued ahead of it),
+ *      would otherwise be invisible to `findExistingStamps` — durable
+ *      storage genuinely doesn't have it YET, even though it is
+ *      GUARANTEED to land there eventually (barring an actual commit
+ *      failure, an already-accepted separate risk). A client racing a
+ *      reconnect into exactly that window would see `alreadyHave: []` for
+ *      its own already-live operation and `reconcileOfflineQueue` would
+ *      RE-MINT it as brand-new content — a genuine, silent duplicate,
+ *      confirmed via a real DUR-05 run (a converged document 11
+ *      characters longer than `totalInserts - totalDeletes`).
+ *
+ * Sent unconditionally, even when `unackedStamps` is empty or none of it
+ * is already present either way (an empty `alreadyHave` array is a
  * complete, meaningful answer: "resend everything," not "nothing to
  * report").
  */
@@ -175,10 +216,17 @@ export async function buildAlreadyHaveMessage(
   if (unackedStamps.length === 0) {
     return { kind: "alreadyHave", alreadyHave: [] };
   }
-  const alreadyHave = await coordinator.operationStore.findExistingStamps(
+  const durablyExisting = await coordinator.operationStore.findExistingStamps(
     coordinator.documentId,
     unackedStamps,
   );
+  const durablySeen = new Set(durablyExisting.map((id) => serializeId(id)));
+  const alreadyHave: Identifier[] = [...durablyExisting];
+  for (const stamp of unackedStamps) {
+    if (!durablySeen.has(serializeId(stamp)) && coordinator.engine.hasApplied(stamp)) {
+      alreadyHave.push(stamp);
+    }
+  }
   return { kind: "alreadyHave", alreadyHave };
 }
 

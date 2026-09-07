@@ -49,6 +49,11 @@ export default defineConfig({
       // end. Gated the same way via `pnpm test:reconnection`
       // (packages/client/vitest.reconnection.config.ts).
       "**/reconnection.test.ts",
+      // Phase 25's adverse-network suite (Test Plan DUR-05/DUR-06): real WebSocket
+      // connections through a real fault-injecting relay (@collab-editor/testkit's
+      // FaultRelay), deliberately injecting multi-second delays — gated the same way via
+      // `pnpm test:adverseNetwork` (packages/client/vitest.adverseNetwork.config.ts).
+      "**/adverseNetwork.test.ts",
     ],
     environment: "node",
     globals: false,

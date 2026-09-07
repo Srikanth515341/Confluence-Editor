@@ -49,8 +49,8 @@ describe("offlineWindowScheduler.runOneDocument (Phase 24, Engine Spec §7.6 Rul
       kind: "insert",
       id: { c: 1, r: session.replicaId },
       value: 0x61,
-      originLeft: { c: 99, r: 999 }, // never applied -- permanently unresolvable
-      originRight: null,
+      parent: { c: 99, r: 999 }, // never applied -- permanently unresolvable
+      side: "R",
       bind: false,
     });
     expect(coordinator.engine.pending).toHaveLength(1);
@@ -77,8 +77,8 @@ describe("offlineWindowScheduler.runOneDocument (Phase 24, Engine Spec §7.6 Rul
       kind: "insert",
       id: stuckId,
       value: 0x61,
-      originLeft: { c: 99, r: 999 },
-      originRight: null,
+      parent: { c: 99, r: 999 },
+      side: "R",
       bind: false,
     });
 
@@ -106,8 +106,8 @@ describe("offlineWindowScheduler.runOneDocument (Phase 24, Engine Spec §7.6 Rul
         kind: "insert",
         id,
         value: 0x61,
-        originLeft: { c: 999 + id.c, r: 999 }, // each anchored to a DIFFERENT, equally-unresolvable id
-        originRight: null,
+        parent: { c: 999 + id.c, r: 999 }, // each anchored to a DIFFERENT, equally-unresolvable id
+        side: "R",
         bind: false,
       });
     }
@@ -137,8 +137,8 @@ describe("offlineWindowScheduler.runOneDocument (Phase 24, Engine Spec §7.6 Rul
       kind: "insert",
       id: dependentId,
       value: 0x62,
-      originLeft: anchorId, // not applied YET -- this buffers into pending
-      originRight: null,
+      parent: anchorId, // not applied YET -- this buffers into pending
+      side: "R",
       bind: false,
     });
     expect(coordinator.engine.pending).toHaveLength(1);
@@ -149,8 +149,8 @@ describe("offlineWindowScheduler.runOneDocument (Phase 24, Engine Spec §7.6 Rul
       kind: "insert",
       id: anchorId,
       value: 0x61,
-      originLeft: null,
-      originRight: null,
+      parent: null,
+      side: "R",
       bind: false,
     });
     expect(coordinator.engine.pending).toHaveLength(0);
@@ -170,8 +170,8 @@ describe("offlineWindowScheduler.runOneDocument (Phase 24, Engine Spec §7.6 Rul
       kind: "insert",
       id: { c: 1, r: session.replicaId },
       value: 0x61,
-      originLeft: { c: 99, r: 999 },
-      originRight: null,
+      parent: { c: 99, r: 999 },
+      side: "R",
       bind: false,
     });
     coordinator.leave(session.sessionId); // the session is gone before the sweep ever fires

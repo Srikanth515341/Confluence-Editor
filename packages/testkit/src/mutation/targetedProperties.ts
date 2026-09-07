@@ -40,8 +40,8 @@ export function runTargetedProperties(
           kind: "insert",
           id: n.id,
           value: n.value,
-          originLeft: n.originLeft,
-          originRight: n.originRight,
+          parent: n.parent,
+          side: n.side,
           bind: n.bind,
         }));
 

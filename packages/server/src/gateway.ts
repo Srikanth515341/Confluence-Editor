@@ -150,7 +150,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         logger.error("ws.warmStartFailed", {
           documentId: ctrlMsg.documentId,
           sessionId,
-          message: err instanceof Error ? err.message : String(err),
+          errorMessage: err instanceof Error ? err.message : String(err),
         });
         ws.close(1011, "document failed to warm start");
         return;
@@ -208,7 +208,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           logger.error("gc.heartbeatFailed", {
             documentId: ctrlMsg.documentId,
             sessionId,
-            message: err instanceof Error ? err.message : String(err),
+            errorMessage: err instanceof Error ? err.message : String(err),
           });
         });
 
@@ -282,7 +282,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
               logger.error("gc.heartbeatFailed", {
                 documentId: coordinator.documentId,
                 sessionId,
-                message: err instanceof Error ? err.message : String(err),
+                errorMessage: err instanceof Error ? err.message : String(err),
               });
             });
           queues.enqueue(
@@ -373,7 +373,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         logger.error("ws.messageHandlerFailed", {
           sessionId,
           documentId: bound?.coordinator.documentId,
-          message: err instanceof Error ? err.message : String(err),
+          errorMessage: err instanceof Error ? err.message : String(err),
         });
       });
     });

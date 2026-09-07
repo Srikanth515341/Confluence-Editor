@@ -30,9 +30,9 @@ import {
  * exercised. So seeding replays each snapshot node as the synthetic
  * remote operation(s) that would have produced it:
  *
- *  - every node becomes an INSERT (its own id/value/originLeft/
- *    originRight/bind — a snapshot node carries exactly the fields an
- *    InsertOperation needs);
+ *  - every node becomes an INSERT (its own id/value/parent/side/bind —
+ *    Fugue port, 2026-09-05 — a snapshot node carries exactly the fields
+ *    an InsertOperation needs);
  *  - every node with `deleted: true` ALSO becomes a DELETE whose own `id`
  *    is the node's `deletedBy` — Engine Spec §4.5's causally-latest rule
  *    means `deletedBy` already IS the winning delete's own identity
@@ -44,11 +44,19 @@ import {
  * Nodes are fed in the snapshot's own (structural) order, but that is not
  * a correctness requirement — `applyRemote()`/`drain()` already buffer and
  * re-resolve out-of-order arrivals to a fixpoint (Engine Spec §4.2), which
- * is exactly what a structural walk needs: a node's `originLeft` is always
- * structurally to its left (so already replayed by the time we reach it),
- * but `originRight` is always structurally to its RIGHT (not yet replayed)
- * — every non-final insert is buffered on first attempt and resolved once
- * its `originRight` is replayed later in the same pass.
+ * is exactly what a structural walk needs regardless of DIRECTION. Note
+ * this is a WEAKER guarantee under Fugue than the retired YATA design had:
+ * `originLeft` was always structurally to a node's left (already replayed)
+ * and `originRight` always to its right — a fixed direction. A Fugue
+ * node's `parent` is structurally BEFORE it for `side: "R"` (an in-order
+ * traversal visits a parent before its own right subtree) but structurally
+ * AFTER it for `side: "L"` (the node becomes part of `parent`'s own LEFT
+ * subtree, which an in-order traversal visits before `parent` itself) —
+ * so a `side: "L"` node's dependency is fed AFTER it in a structural walk,
+ * not before. This is still correct, not merely "usually fine": the
+ * buffer/drain fixpoint does not care which direction a dependency lies
+ * in, only that it eventually arrives in the same pass, which it always
+ * does here (every node in `nodes` is fed exactly once).
  */
 export function replaySnapshotNodesInto(engine: Engine, nodes: readonly Node[]): void {
   for (const node of nodes) {
@@ -56,8 +64,8 @@ export function replaySnapshotNodesInto(engine: Engine, nodes: readonly Node[]):
       kind: "insert",
       id: node.id,
       value: node.value,
-      originLeft: node.originLeft,
-      originRight: node.originRight,
+      parent: node.parent,
+      side: node.side,
       bind: node.bind,
     };
     engine.applyRemote(insertOp);

@@ -56,10 +56,9 @@ export function generateOpStream(
 /** Engine Spec Definition 4.1's readiness test, reimplemented independently of engine.ts's own `ready()` (never imported) so this module cannot silently share a bug with the code it is checking. */
 function isReady(op: Operation, appliedIds: ReadonlySet<string>): boolean {
   if (op.kind === "insert") {
-    return (
-      (op.originLeft === null || appliedIds.has(serializeId(op.originLeft))) &&
-      (op.originRight === null || appliedIds.has(serializeId(op.originRight)))
-    );
+    // Fugue port (2026-09-05): a single `parent` reference replaces the retired
+    // originLeft/originRight pair — see operation.ts's own doc comment.
+    return op.parent === null || appliedIds.has(serializeId(op.parent));
   }
   return appliedIds.has(serializeId(op.target));
 }

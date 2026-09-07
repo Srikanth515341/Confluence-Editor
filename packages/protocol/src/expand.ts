@@ -19,8 +19,8 @@ export function opInsertToOperation(msg: OpInsertMessage): InsertOperation {
     kind: "insert",
     id: msg.id,
     value: msg.value,
-    originLeft: msg.originLeft,
-    originRight: msg.originRight,
+    parent: msg.parent,
+    side: msg.side,
     bind: msg.bind,
   };
 }
@@ -30,8 +30,8 @@ export function operationToOpInsert(op: InsertOperation, seq = 0): OpInsertMessa
     kind: "opInsert",
     seq,
     id: op.id,
-    originLeft: op.originLeft,
-    originRight: op.originRight,
+    parent: op.parent,
+    side: op.side,
     bind: op.bind,
     value: op.value,
   };
@@ -56,27 +56,36 @@ export function operationToOpUndelete(op: UndeleteOperation, seq = 0): OpUndelet
 // --- OP_INSERT_RUN / OP_DELETE_BATCH expansion (API Spec §3.5.2) -----------
 
 /**
- * Expands an OP_INSERT_RUN into one InsertOperation per character, exactly
- * per API Spec §3.5.2. Two things are easy to get backwards here, so both
- * are called out explicitly:
+ * Expands an OP_INSERT_RUN into one InsertOperation per character.
  *
- * 1. `id.c` is `firstId.c + j` for the j-th character — this relies on
- *    the SAME fact Engine Spec §3.4 relies on for block run-length
- *    encoding: consecutive local `mint()`s produce consecutive counters,
- *    so the run's own counters need never be listed individually.
- * 2. `originLeft` CHAINS forward (node j's originLeft is node j-1's id,
- *    for j > 0; only node 0 uses the run's own `originLeft`) — this is
- *    what makes the run behave, under `integrate()`, exactly like the
- *    characters having been typed one at a time via separate
- *    `localInsert()` calls, each anchored on the one immediately before
- *    it. `originRight`, in contrast, does NOT chain — every expanded node
- *    gets the SAME `originRight`, the run's own shared right boundary, not
- *    its predecessor (§3.5.2's expansion table states this explicitly:
- *    "SAME right origin for EVERY node in the run, not the predecessor").
- *    Chaining originRight too would anchor each character only against
- *    its immediate successor rather than the run's actual right neighbor
- *    at insertion time, changing where `integrate()` places the run
- *    relative to concurrent inserts anchored at that same boundary.
+ * Fugue port (2026-09-05) — this is no longer a literal translation of a
+ * pre-existing spec table (the old §3.5.2 expansion table described
+ * `originLeft`/`originRight` chaining, which no longer exists); it is a
+ * hand-traced re-derivation against `FugueTree.decidePlacement`'s own
+ * logic, verified by an exact round-trip test against a real `Engine`
+ * (see codec.test.ts's "expands a 2,000-character run identically to
+ * 2,000 individual OP_INSERT frames" test):
+ *
+ * 1. `id.c` is `firstId.c + j` for the j-th character, exactly as before —
+ *    consecutive local `mint()`s produce consecutive counters (Engine
+ *    Spec §3.4), so the run's own counters need never be listed
+ *    individually.
+ * 2. Node 0 uses the run's own `firstParent`/`firstSide` — this is
+ *    `Engine.localInsert()`'s own `decidePlacement()` output at the
+ *    moment the FIRST character of the run was minted.
+ * 3. For every node j >= 1, `parent` is ALWAYS `{c: firstId.c + j - 1, r:
+ *    firstId.r}` (the immediately preceding character in this SAME run)
+ *    and `side` is ALWAYS `"R"`. This holds unconditionally, not just for
+ *    "the common case": `FugueTree.attach()` gives a freshly-created node
+ *    zero children, so the VERY NEXT `decidePlacement()` call at the
+ *    position immediately following it — which is exactly what minting
+ *    the run's next character does, since nothing else can interleave
+ *    within one synchronous `localInsertText()` burst — always finds
+ *    "the node immediately before this position has no right children
+ *    yet" and returns `{parent: <that node>, side: "R"}`. There is no
+ *    Fugue analogue of the retired "shared originRight for the whole
+ *    run" field at all: Fugue has no second, separately-tracked boundary
+ *    reference to share.
  *
  * `bind` applies uniformly to every expanded node — §3.5.2 models a run as
  * one grapheme-cluster-uniform burst, so there is no per-character bind
@@ -86,14 +95,15 @@ export function expandInsertRun(msg: OpInsertRunMessage): InsertOperation[] {
   const ops: InsertOperation[] = [];
   for (let j = 0; j < msg.values.length; j++) {
     const id: Identifier = { c: msg.firstId.c + j, r: msg.firstId.r };
-    const originLeft: Identifier | null =
-      j === 0 ? msg.originLeft : { c: msg.firstId.c + j - 1, r: msg.firstId.r };
+    const parent: Identifier | null =
+      j === 0 ? msg.firstParent : { c: msg.firstId.c + j - 1, r: msg.firstId.r };
+    const side: "L" | "R" = j === 0 ? msg.firstSide : "R";
     ops.push({
       kind: "insert",
       id,
       value: msg.values[j]!,
-      originLeft,
-      originRight: msg.originRight,
+      parent,
+      side,
       bind: msg.bind,
     });
   }

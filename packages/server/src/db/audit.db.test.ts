@@ -127,8 +127,8 @@ function buildAppendChain(
       kind: "insert",
       id,
       value: valueAt(i),
-      originLeft: prevId,
-      originRight: null,
+      parent: prevId,
+      side: "R",
       bind: false,
     });
     prevId = id;
@@ -188,8 +188,8 @@ async function seedAppendChainDocument(
     const nodes: Node[] = prefix.map((op) => ({
       id: op.id,
       value: op.value,
-      originLeft: op.originLeft,
-      originRight: op.originRight,
+      parent: op.parent,
+      side: op.side,
       bind: op.bind,
       deleted: false,
       deletedBy: null,
@@ -339,7 +339,7 @@ describe("Phase 18 DoD — pendingCount() catches what a text comparison would n
     // `operations_no_delete` (Phase 15) makes it impossible to construct "a middle row was
     // deleted" via an actual DELETE — the same substitution Phase 16's durability.db.test.ts
     // already established for the identical reason: insert a SECOND row directly whose
-    // `originLeft` references an identifier that was never, and will never be, provided by any
+    // `parent` references an identifier that was never, and will never be, provided by any
     // other row. This produces the exact same OBSERVABLE effect a deleted middle row would
     // (a permanently-unready operation), without needing to bypass a rule that correctly cannot
     // be bypassed.
@@ -347,8 +347,8 @@ describe("Phase 18 DoD — pendingCount() catches what a text comparison would n
       kind: "insert",
       id: { c: 999, r: client.session.replicaId },
       value: letterAt(1),
-      originLeft: { c: 424242, r: 424242 }, // never provided by any row, on purpose
-      originRight: null,
+      parent: { c: 424242, r: 424242 }, // never provided by any row, on purpose
+      side: "R",
       bind: false,
     };
     await pool.query(

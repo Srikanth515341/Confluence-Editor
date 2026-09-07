@@ -20,8 +20,8 @@ function sameNodes(a: readonly Node[], b: readonly Node[]): boolean {
       n.value === m.value &&
       n.bind === m.bind &&
       n.deleted === m.deleted &&
-      JSON.stringify(n.originLeft) === JSON.stringify(m.originLeft) &&
-      JSON.stringify(n.originRight) === JSON.stringify(m.originRight) &&
+      JSON.stringify(n.parent) === JSON.stringify(m.parent) &&
+      n.side === m.side &&
       JSON.stringify(n.deletedBy) === JSON.stringify(m.deletedBy)
     );
   });
@@ -31,11 +31,23 @@ describe("structure snapshot body — round-trip against a real Engine's node li
   it("round-trips an engine with inserts, deletes, and concurrent structure", () => {
     const a = new Engine(1);
     const b = new Engine(2);
-    a.localInsert(0, 0x68); // h
-    a.localInsert(1, 0x69); // i
+    const hOp = a.localInsert(0, 0x68); // h
+    const iOp = a.localInsert(1, 0x69); // i
+    // Genuine bug found while fixing this file's own build (2026-09-05, Fugue port
+    // propagation): the ORIGINAL version of this test never forwarded h/i to b before
+    // reaching `b.localInsert(3, ...)` — under the retired YATA engine, an out-of-range
+    // `visibleIndex` silently tolerated the overshoot via its own boundary-clamping origin
+    // lookups; FugueTree correctly throws instead (`nodeAtVisible` bounds-checks for real).
+    // This test could never actually RUN against the real engine until this session fixed
+    // the surrounding typecheck failure, so the bug was latent and undetected the whole
+    // time. Fixed by actually syncing b first, which is also a more faithful fixture for
+    // "concurrent structure" — b's later `applyRemote(delOp)` now targets a node b genuinely
+    // has, rather than one it was never going to receive.
+    b.applyRemote(hOp);
+    b.applyRemote(iOp);
     const opsFromA = [a.localInsert(2, 0x21)]; // !
     for (const op of opsFromA) b.applyRemote(op);
-    b.localInsert(3, 0x3f); // ?
+    b.localInsert(3, 0x3f); // ? — appended after "hi!", now valid since b has actually synced h/i/!
     // concurrent delete on a's "i"
     const [delOp] = a.localDelete(1, 1);
     b.applyRemote(delOp!);
@@ -56,13 +68,10 @@ describe("structure snapshot body — round-trip against a real Engine's node li
     const nodeArb = fc.record({
       id: fc.record({ c: fc.nat({ max: 5_000_000 }), r: fc.nat({ max: 500 }) }),
       value: fc.integer({ min: 0, max: 0x10ffff }).filter((cp) => cp < 0xd800 || cp > 0xdfff),
-      originLeft: fc.option(fc.record({ c: fc.nat({ max: 5_000_000 }), r: fc.nat({ max: 500 }) }), {
+      parent: fc.option(fc.record({ c: fc.nat({ max: 5_000_000 }), r: fc.nat({ max: 500 }) }), {
         nil: null,
       }),
-      originRight: fc.option(
-        fc.record({ c: fc.nat({ max: 5_000_000 }), r: fc.nat({ max: 500 }) }),
-        { nil: null },
-      ),
+      side: fc.constantFrom("L" as const, "R" as const),
       bind: fc.boolean(),
       deleted: fc.boolean(),
       deletedBy: fc.option(fc.record({ c: fc.nat({ max: 5_000_000 }), r: fc.nat({ max: 500 }) }), {
@@ -152,8 +161,8 @@ describe("structure snapshot body — round-trip against a real Engine's node li
           kind: "insert",
           id: n.id,
           value: n.value,
-          originLeft: n.originLeft,
-          originRight: n.originRight,
+          parent: n.parent,
+          side: n.side,
           bind: n.bind,
         });
       }

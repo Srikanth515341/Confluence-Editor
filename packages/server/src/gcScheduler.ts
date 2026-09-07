@@ -10,6 +10,7 @@ import type { Gateway } from "./gateway.js";
 import type { DocumentCoordinator } from "./documentCoordinator.js";
 import type { GcConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { maybeCrash, SimulatedCrash } from "./testOnlyCrashInjection.js";
 
 export interface GcScheduler {
   stop(): void;
@@ -64,6 +65,10 @@ export async function runOneDocument(
       coordinator.frontierLastAdvancedAt = new Date();
     }
 
+    // DUR-03 site (j) "during a GC cycle" — checked after the (read-only) frontier query,
+    // before the engine mutation `collect()` performs below.
+    maybeCrash("duringGcCycle");
+
     // Wall-clock safety cap (Phase 21 safety net) — `budgetMs`/`clock` bound how long ONE
     // document's fixpoint sweep may run before yielding, so a pathological anchor chain on
     // this document can never block the event loop for every OTHER document sharing this
@@ -104,6 +109,9 @@ export async function runOneDocument(
       });
     }
   } catch (err) {
+    if (err instanceof SimulatedCrash) {
+      throw err; // let DUR-03's own test observe and react to its own injected crash
+    }
     // Deliberately NOT rethrown, and deliberately does NOT touch `lastGcSuccessAt` — a
     // document's own GC failure must never stop the rest of this tick's sweep (same
     // reasoning as auditScheduler.ts), and per Scope-IN's own framing ("GC's failure mode
@@ -111,7 +119,7 @@ export async function runOneDocument(
     // `gc.minutes_since_last_success` climbing, not a thrown exception anywhere visible.
     logger.error("gc.documentFailed", {
       documentId: coordinator.documentId,
-      message: err instanceof Error ? err.message : String(err),
+      errorMessage: err instanceof Error ? err.message : String(err),
     });
   }
 }

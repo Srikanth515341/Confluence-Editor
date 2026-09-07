@@ -50,7 +50,7 @@ import {
  * via `reconcileOfflineQueue`, mints a SECOND, duplicate operation for
  * the same content — and because the ORIGINAL (offline, unacked) node is
  * still sitting in the fresh engine's own structure, the new reconciled
- * operation can end up anchored (`originLeft`/`originRight`) to that
+ * operation can end up anchored (`parent`) to that
  * ORIGINAL node's id, which was NEVER transmitted to the server and can
  * NEVER resolve on any other replica — a permanently-stuck, silently
  * orphaned operation on every peer. Found via the 27-cell RC-* matrix's
@@ -99,12 +99,14 @@ function structuralIndexOf(engine: Engine, id: Identifier): number {
 
 /**
  * The visible index to insert AT so the new content lands immediately
- * after `anchor` (or at the very start, if `anchor` is null) — matching
- * `Engine.localInsert`'s own `visibleIndex` semantics (Engine Spec §4.1:
- * `originLeft`/`originRight` are derived from `index.nodeAtVisible(v-1)`/
- * `nodeAtVisible(v)`). Counts every VISIBLE node up to and including the
- * anchor's own structural position — correct even if the anchor has since
- * been tombstoned (a concurrent delete from the other client that stayed
+ * AFTER `anchor` (or at the very start, if `anchor` is null) — used for a
+ * queued insert whose original `side` was `"R"` (Fugue port, 2026-09-05;
+ * see this file's own header comment and `reconcileOfflineQueue`'s own
+ * doc comment for why the anchor must be resolved differently depending
+ * on `side`, unlike the retired YATA design's single `originLeft`
+ * derivation). Counts every VISIBLE node up to and including the anchor's
+ * own structural position — correct even if the anchor has since been
+ * tombstoned (a concurrent delete from the other client that stayed
  * online while this one was offline): the content still belongs right
  * after where that character used to be, and a tombstoned anchor
  * contributes 0 to the visible count, exactly as it should.
@@ -127,6 +129,38 @@ export function visibleIndexAfter(engine: Engine, anchor: Identifier | null): nu
   const nodes = engine.nodes;
   let visible = 0;
   for (let i = 0; i <= idx; i++) {
+    if (!nodes[i]!.deleted) {
+      visible++;
+    }
+  }
+  return visible;
+}
+
+/**
+ * The visible index to insert AT so the new content lands immediately
+ * BEFORE `anchor` — used for a queued insert whose original `side` was
+ * `"L"`. Hand-traced against `FugueTree.decidePlacement` (see this file's
+ * own header comment): a `side: "L"` node's `parent` is exactly the node
+ * that, at ORIGINAL insertion time, occupied the target visible index
+ * itself (Fugue's own Case 2 — the new node becomes the leftmost thing in
+ * that node's own left subtree, so an in-order traversal visits the new
+ * node immediately BEFORE `parent`, not after it) — so reproducing the
+ * same intended position means inserting right before wherever `anchor`
+ * currently sits, never after it. Counts every VISIBLE node STRICTLY
+ * before the anchor's own structural position; a tombstoned anchor is
+ * handled the same way `visibleIndexAfter` handles one (still contributes
+ * a well-defined structural position to insert relative to). Falls back
+ * to position 0 if the anchor no longer exists at all, same reasoning as
+ * `visibleIndexAfter`.
+ */
+export function visibleIndexBefore(engine: Engine, anchor: Identifier): number {
+  const idx = structuralIndexOf(engine, anchor);
+  if (idx === -1) {
+    return 0;
+  }
+  const nodes = engine.nodes;
+  let visible = 0;
+  for (let i = 0; i < idx; i++) {
     if (!nodes[i]!.deleted) {
       visible++;
     }
@@ -177,6 +211,17 @@ export function visibleIndexOfTarget(engine: Engine, target: Identifier): number
  * stale one — without this, every character after the first in a
  * same-session offline chain would incorrectly fail to find its anchor and
  * fall back to position 0.
+ *
+ * Fugue port (2026-09-05): an insert's target visible index is derived
+ * from `op.parent`/`op.side` together, not `parent` alone — `side: "R"`
+ * means "insert right after `parent`" (`visibleIndexAfter`), `side: "L"`
+ * means "insert right before `parent`" (`visibleIndexBefore`); see both
+ * functions' own doc comments for the hand-traced derivation against
+ * `FugueTree.decidePlacement`. `op.parent === null` only ever occurs with
+ * `side: "R"` (Fugue's own `decidePlacement` never returns `side: "L"`
+ * with a null parent — Case 2's `parent` is always a real descendant
+ * node), so it is handled directly as visible index 0 without consulting
+ * `side` at all.
  */
 export function reconcileOfflineQueue(
   engine: Engine,
@@ -188,8 +233,14 @@ export function reconcileOfflineQueue(
   const resent: Operation[] = [];
   for (const op of queuedOps) {
     if (op.kind === "insert") {
-      const anchor = op.originLeft === null ? null : resolve(op.originLeft);
-      const visibleIndex = visibleIndexAfter(engine, anchor);
+      let visibleIndex: number;
+      if (op.parent === null) {
+        visibleIndex = 0;
+      } else {
+        const anchor = resolve(op.parent);
+        visibleIndex =
+          op.side === "R" ? visibleIndexAfter(engine, anchor) : visibleIndexBefore(engine, anchor);
+      }
       const newOp = engine.localInsert(visibleIndex, op.value, op.bind);
       remap.set(serializeId(op.id), newOp.id);
       resent.push(newOp);

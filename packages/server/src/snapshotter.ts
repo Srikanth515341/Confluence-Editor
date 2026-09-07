@@ -19,6 +19,7 @@
 import { encodeStructureSnapshotBody } from "@collab-editor/protocol";
 import type { DocumentCoordinator } from "./documentCoordinator.js";
 import { logger } from "./logger.js";
+import { maybeCrash, SimulatedCrash } from "./testOnlyCrashInjection.js";
 
 /** RFC §13.2's own numbers — not casually configurable via env; a future phase that needs different cadence should change these deliberately, not accidentally via misconfiguration. */
 export const SNAPSHOT_OP_THRESHOLD = 500;
@@ -63,12 +64,22 @@ export function maybeScheduleSnapshot(
  * whatever the latest state actually is, never a stale capture, and
  * `opCount` always matches exactly what's being reset to zero below.
  */
-async function writeSnapshotNow(coordinator: DocumentCoordinator): Promise<void> {
+/**
+ * Exported (not only reached via `maybeScheduleSnapshot`'s deferred `setImmediate`) so DUR-03's
+ * own test can call it directly and let a simulated crash propagate synchronously to the
+ * caller, the same way `runOneDocument` (gcScheduler.ts) is already exported for its own
+ * deterministic test-triggered cycles.
+ */
+export async function writeSnapshotNow(coordinator: DocumentCoordinator): Promise<void> {
   const seq = coordinator.currentSeq;
   const opCount = coordinator.opsSinceSnap;
   const content = coordinator.engine.text();
   const structure = encodeStructureSnapshotBody(coordinator.engine.nodes);
   try {
+    // DUR-03 site (i) "during snapshot write" — checked before the actual durable write
+    // begins, so a simulated crash here leaves this snapshot entirely absent, exactly as a
+    // real crash mid-write would (the write is a single INSERT, never partially visible).
+    maybeCrash("duringSnapshotWrite");
     await coordinator.operationStore.writeSnapshot({
       documentId: coordinator.documentId,
       seq,
@@ -83,10 +94,13 @@ async function writeSnapshotNow(coordinator: DocumentCoordinator): Promise<void>
     coordinator.opsSinceSnap = 0;
     coordinator.lastSnapAt = new Date();
   } catch (err) {
+    if (err instanceof SimulatedCrash) {
+      throw err; // let DUR-03's own test observe and react to its own injected crash
+    }
     logger.error("snapshotter.writeFailed", {
       documentId: coordinator.documentId,
       seq: seq.toString(),
-      message: err instanceof Error ? err.message : String(err),
+      errorMessage: err instanceof Error ? err.message : String(err),
     });
   }
 }

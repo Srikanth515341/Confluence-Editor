@@ -24,17 +24,16 @@ const engineSrcDir = join(here, "..", "..", "..", "engine", "src");
 // unmutated so assertInvariants() still runs against whatever Engine
 // instance the mutant produces (its import of Engine is type-only, so it
 // carries no runtime coupling to which Engine class is actually loaded).
-// positionIndex.ts was added Phase 19 and block.ts Phase 20 — engine.ts
-// imports both at runtime (not just for types), so they must be copied
-// into the scratch directory too or the mutant build's own transpiled
-// engine.js fails to resolve its imports.
+// `block.ts`/`positionIndex.ts` (Phase 19/20) are RETIRED as of the Fugue
+// port (2026-09-05) — engine.ts now imports `fugueTree.ts` at runtime
+// instead, so that file must be copied into the scratch directory too or
+// the mutant build's own transpiled engine.js fails to resolve its import.
 const SOURCE_FILES = [
   "identifier.ts",
   "node.ts",
   "operation.ts",
   "grapheme.ts",
-  "block.ts",
-  "positionIndex.ts",
+  "fugueTree.ts",
   "engine.ts",
   "invariants.ts",
 ];
@@ -60,8 +59,9 @@ let loadCounter = 0;
 export interface EngineNodeLike {
   readonly id: { readonly c: number; readonly r: number };
   readonly value: number;
-  readonly originLeft: { readonly c: number; readonly r: number } | null;
-  readonly originRight: { readonly c: number; readonly r: number } | null;
+  /** Fugue port (2026-09-05): the single `parent` reference replacing the retired originLeft/originRight pair. */
+  readonly parent: { readonly c: number; readonly r: number } | null;
+  readonly side: "L" | "R";
   readonly bind: boolean;
   deleted: boolean;
   deletedBy: { readonly c: number; readonly r: number } | null;

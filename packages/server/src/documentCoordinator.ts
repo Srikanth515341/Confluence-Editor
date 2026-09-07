@@ -18,6 +18,22 @@ import type { ConnectionSendQueues } from "./sendQueues.js";
 export const SERVER_REPLICA_ID = 0;
 
 /**
+ * Phase 25 (DUR-06 fix) — plain identity data for a still-BUFFERED operation's original
+ * sender, captured at the moment writePath.ts first learns the operation is not yet ready
+ * (`Engine.applyRemote` returning `{buffered: true}`). Needed because such an operation may
+ * finalize (become ready, get a real seq, get broadcast/committed/acked) as a SIDE EFFECT of a
+ * completely different, LATER message's own processing (writePath.ts's own "slow path") —
+ * whatever session handles that later message has no other way to learn who originally sent
+ * the now-resolved operation, or what identity to commit/ack it under.
+ */
+export interface PendingOpOrigin {
+  readonly sessionId: string;
+  readonly userId: string;
+  readonly displayName: string;
+  readonly replicaId: number;
+}
+
+/**
  * Per-connection state, populated once a HELLO/WELCOME handshake completes
  * (Phase 9, API Spec §3.6.1-3.6.2). `lastPingAt`/`presenceStale`/
  * `staleTimer` are heartbeat.ts's liveness bookkeeping (§3.6.11) — mutated
@@ -73,6 +89,69 @@ export class DocumentCoordinator {
    * consecutive seq values.
    */
   currentSeq = 0n;
+
+  /**
+   * Phase 25 (DUR-06 fix, follow-up finding) — the highest seq for which this coordinator is
+   * CERTAIN the full prefix `[0..that]` has been durably committed, in order, with no gaps.
+   * Distinct from `currentSeq` above, which is bumped SYNCHRONOUSLY at seq-RESERVATION time —
+   * before the corresponding row has necessarily reached the store. Advanced ONLY by
+   * {@link enqueueCommit}, in strict commit order, never by anything else. `handshake.ts`'s
+   * `buildCatchupMessages` reads THIS field for CATCHUP's own `toSeq` bound, never the raw
+   * `currentSeq` — see `enqueueCommit`'s own doc comment for the full reasoning (a hand-traced
+   * finding: without this, a reconnecting client's CATCHUP can be told it received more than
+   * what is actually, durably present, permanently skipping an operation with no error).
+   * Initialized from `currentSeq` once warm start completes (below) — everything replayed by
+   * warm start came from the persisted log itself, so it is durable by construction.
+   */
+  lastCommittedSeq = 0n;
+
+  /**
+   * Phase 25 (DUR-06 fix, follow-up finding) — the tail of a per-document FIFO promise chain.
+   * Never read directly outside {@link enqueueCommit}.
+   */
+  private commitQueueTail: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Serializes EVERY `OperationStore.commitOperations` call for this document through one FIFO
+   * queue — `fn` for a LATER-reserved seq range can never even START executing until every
+   * earlier-enqueued `fn` has fully settled. This is what makes commit EXECUTION order always
+   * equal seq RESERVATION order, for ANY number of operations, authors, or write-path branches
+   * (writePath.ts's fast path OR its slow path), removing the "commits can land in the store
+   * out of seq order" bug class entirely — not narrowing the window, removing it, regardless of
+   * how many concurrent messages interleave.
+   *
+   * MUST be called SYNCHRONOUSLY, with no `await` between reserving the seq range `endSeq`
+   * describes and calling this — every call site in writePath.ts satisfies this. The ordering
+   * guarantee rests entirely on that: Node's single-threaded execution means one message's
+   * synchronous "reserve seq, then enqueue" sequence can never be interrupted by another
+   * message's synchronous code, so enqueue order is provably identical to seq-reservation order
+   * — and this queue then makes commit EXECUTION order identical to enqueue order.
+   *
+   * `endSeq` is the LAST seq value `fn`'s own commit call covers. On success, `lastCommittedSeq`
+   * is set to it (never merged via `Math.max` — safe precisely because the queue guarantees
+   * strict in-order execution, so `endSeq` values arrive already monotonically increasing). On
+   * failure, `lastCommittedSeq` is deliberately left exactly where it was: that seq range's own
+   * row(s) never actually landed, so the durable prefix genuinely stops there — advancing past
+   * it would let a LATER, unrelated success paper over a real, permanent gap, which is exactly
+   * the dishonest-CATCHUP-promise class of bug this field exists to prevent. This mirrors an
+   * already-accepted risk elsewhere in this codebase (writePath.ts's own "no ack for a commit
+   * that failed" reasoning) — this only makes CATCHUP's own promise to a reconnecting client
+   * honest about it too, rather than a NEW failure mode.
+   */
+  enqueueCommit<T>(endSeq: bigint, fn: () => Promise<T>): Promise<T> {
+    const result = this.commitQueueTail.then(() => fn());
+    this.commitQueueTail = result.then(
+      () => {
+        this.lastCommittedSeq = endSeq;
+      },
+      () => {
+        // Swallow here only so the QUEUE keeps advancing for later, unrelated commits — `result`
+        // itself (returned below) still carries the real rejection to whichever writePath.ts
+        // call site awaits it, exactly as before this field existed.
+      },
+    );
+    return result;
+  }
 
   /** Per-replica last-acknowledged seq, updated on every PING's `lastAppliedSeq` (§3.6.11: "server updates the session's ... last-acked-seq on receipt"). Mirrors `sessions.last_ack_seq` — real persistence is Phase 16. */
   readonly watermarks = new Map<number, bigint>();
@@ -157,6 +236,17 @@ export class DocumentCoordinator {
   readonly pendingFirstSeenAtMs = new Map<string, number>();
 
   /**
+   * Phase 25 (DUR-06 fix) — see {@link PendingOpOrigin}'s own doc comment for the full
+   * reasoning. Populated by writePath.ts the instant `applyRemote` reports an operation as
+   * buffered; consumed (and deleted) by writePath.ts's own "slow path" when that operation
+   * later finalizes as a side effect of a different message, OR by offlineWindowScheduler.ts
+   * when it explicitly rejects/evicts the same operation instead — whichever happens first is
+   * expected to clean up its own entry, so this map never grows for an operation that has
+   * already been resolved one way or the other.
+   */
+  readonly pendingOpOrigin = new Map<string, PendingOpOrigin>();
+
+  /**
    * TEST-ONLY (Phase 24, Test Plan RC-32) — a ONE-SHOT role override consumed by the very NEXT
    * session to join this coordinator, standing in for a real, persisted permission lookup that
    * doesn't exist until Phases 26-30. Simulates "the owner already changed this specific
@@ -214,9 +304,14 @@ export class DocumentCoordinator {
    * rather than continuing.
    */
   private async warmStart(): Promise<void> {
-    const { snapshotNodes, suffixOps, currentSeq } = await this.operationStore.warmStart(
+    const { snapshotNodes, suffixOps, currentSeq, nextReplicaId } = await this.operationStore.warmStart(
       this.documentId,
     );
+    // Phase 25 (found via DUR-03): seeded from a real query, not left at this field's own
+    // class-default of 1 — see WarmStartResult.nextReplicaId's own doc comment for the exact
+    // collision this closes (a restarted coordinator's counter re-handing-out a replica id a
+    // still-existing `sessions` row already used for this same document).
+    this.nextReplicaId = nextReplicaId;
     if (snapshotNodes) {
       replaySnapshotNodesInto(this.engine, snapshotNodes);
     }
@@ -232,6 +327,10 @@ export class DocumentCoordinator {
       );
     }
     this.currentSeq = currentSeq;
+    // Everything up to `currentSeq` at this point came from the persisted log itself (or is 0
+    // for a brand-new document) — durable by construction, so the commit-queue watermark starts
+    // in lockstep with it, not at 0n.
+    this.lastCommittedSeq = currentSeq;
     this.lastSnapAt = new Date(); // the real baseline — see this field's own doc comment
   }
 

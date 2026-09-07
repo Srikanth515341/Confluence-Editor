@@ -64,13 +64,50 @@ export function operationToOpsMessage(op: Operation): OpsMessage {
  * messages. This is what turns a 2,000-character paste into ONE wire frame
  * instead of 2,000 (Test Plan MUT-01), while still coalescing correctly
  * around any embedded combining marks in less common inputs.
+ *
+ * REGRESSION FIX (2026-09-06, Phase 25 DUR-06 investigation — see
+ * wireHelpers.test.ts's own "REGRESSION" describe block): grouping used to
+ * check ONLY `bind` equality. `expandInsertRun`'s decoder hardcodes a
+ * specific chain relationship for every run member after the first —
+ * `parent === previous.id && side === "R"` (see expand.ts's own doc
+ * comment) — which genuinely holds for THIS function's original caller
+ * (`SyncClient.localInsertText`'s synchronous typing burst: traced against
+ * `FugueTree.decidePlacement`, the left-origin at each subsequent position
+ * is always the just-minted previous character, which has zero
+ * `rightChildren`, so `decidePlacement` unconditionally returns
+ * `{parent: prev.id, side: "R"}` every time) but is NOT guaranteed for
+ * `operationsToWireMessages`'s other caller (`reconcileOfflineQueue`'s
+ * reconciliation resend, whose operations are independently re-anchored
+ * against the live engine, not a contiguous typed chain). `continuesRun`
+ * below checks the actual chain relationship, not just `bind` — a group
+ * only coalesces into one run if EVERY adjacent pair genuinely forms the
+ * chain the decoder will assume. This changes nothing for the original
+ * caller (the chain always holds there, proven above) and correctly
+ * splits at any non-chain boundary for the reconciliation caller.
  */
+function continuesRun(next: InsertOperation, prev: InsertOperation): boolean {
+  return (
+    next.bind === prev.bind &&
+    next.side === "R" &&
+    next.parent !== null &&
+    next.parent.c === prev.id.c &&
+    next.parent.r === prev.id.r &&
+    // Belt-and-suspenders: counter contiguity is implied by "these are two
+    // sequential mints on the same engine with nothing else interleaved,"
+    // which is true for both current callers, but the wire format's
+    // `firstId.c + j` decode arithmetic depends on it directly — check it
+    // explicitly rather than relying on an invariant enforced two files away.
+    next.id.r === prev.id.r &&
+    next.id.c === prev.id.c + 1
+  );
+}
+
 export function operationsToRunMessages(ops: readonly InsertOperation[]): OpsMessage[] {
   const messages: OpsMessage[] = [];
   let i = 0;
   while (i < ops.length) {
     let j = i + 1;
-    while (j < ops.length && ops[j]!.bind === ops[i]!.bind) {
+    while (j < ops.length && continuesRun(ops[j]!, ops[j - 1]!)) {
       j += 1;
     }
     const group = ops.slice(i, j);
@@ -80,8 +117,8 @@ export function operationsToRunMessages(ops: readonly InsertOperation[]): OpsMes
         kind: "opInsertRun",
         seq: 0,
         firstId: first.id,
-        originLeft: first.originLeft,
-        originRight: first.originRight,
+        firstParent: first.parent,
+        firstSide: first.side,
         bind: first.bind,
         values: group.map((op) => op.value),
       };

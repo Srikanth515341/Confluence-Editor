@@ -60,6 +60,14 @@ export {
   type OfflineWindowScheduler,
 } from "./offlineWindowScheduler.js";
 export type { GcConfig, OfflineWindowConfig } from "./config.js";
+export {
+  ALL_CRASH_SITES,
+  armCrashSite,
+  disarmCrashSite,
+  SimulatedCrash,
+  type CrashSite,
+} from "./testOnlyCrashInjection.js";
+export { writeSnapshotNow } from "./snapshotter.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";

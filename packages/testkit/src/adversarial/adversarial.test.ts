@@ -28,8 +28,8 @@ function syncFromSeed(seed: Engine, ...replicas: Engine[]): void {
       kind: "insert",
       id: node.id,
       value: node.value,
-      originLeft: node.originLeft,
-      originRight: node.originRight,
+      parent: node.parent,
+      side: node.side,
       bind: node.bind,
     };
     for (const replica of replicas) {
@@ -515,16 +515,12 @@ describe("Adversarial suite — Engine-derived group (ADV-14…ADV-22)", () => {
       expect(counters[i]).toBe(i + 1); // exactly 1..3000, no gaps — Invariant I0
     }
 
-    // Engine Spec §7.5's block run-length encoding represents one run of N
-    // consecutive (counter, replica) pairs as a single block descriptor
-    // instead of N individual identifiers. As of Phase 20, this is a REAL
-    // measurement against the live engine's own block storage
-    // (`engine.blockCount`, PositionIndex's diagnostic getter) — not the
-    // hardcoded `N / 1` placeholder this test used before block encoding
-    // existed (Phase 6-era: block-aware serialization wasn't built yet, so
-    // this ratio couldn't be measured for real).
-    expect(engine.blockCount).toBe(1);
-    const compressionRatio = N / engine.blockCount;
-    expect(compressionRatio).toBeGreaterThan(1000);
+    // Engine Spec §7.5's block run-length encoding (Phase 20) and its diagnostic
+    // `engine.blockCount` getter are RETIRED as of the Fugue port (2026-09-05, CLAUDE.md's
+    // "Fugue port" entry) — a Fugue tree has no flat, consecutive-counter block storage to
+    // count, and the compression-ratio claim this sub-case exists to check needs its own
+    // from-scratch design for a tree structure (deferred, disclosed, out of this session's
+    // scope — see CLAUDE.md). The I0 counter-sequence check above (the sub-case's own actual
+    // named invariant, "Engine Spec I0") is unaffected and still verified.
   });
 });

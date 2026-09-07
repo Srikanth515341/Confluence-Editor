@@ -32,13 +32,17 @@ export interface DecodeFrameOptions {
 }
 
 // --- OP_INSERT / OP_INSERT_RUN flags byte (§3.5.1, §3.5.2) ------------------
-// bits 3-7 MUST be 0 — a set reserved bit is a malformed frame, so a future
-// protocol version using a bit this build doesn't know about is never
-// silently misinterpreted.
-const FLAG_HAS_ORIGIN_LEFT = 0x01;
-const FLAG_HAS_ORIGIN_RIGHT = 0x02;
+// Fugue port (2026-09-05): ONE causal-dependency stamp (`parent`) instead of
+// two (`originLeft`/`originRight`) — `side` costs only a single bit, since
+// it's a binary L/R choice, not a whole optional identifier. This is a real
+// wire-size reduction on the common case (one fewer optional stamp field),
+// not merely a rename. bits 3-7 MUST be 0 — a set reserved bit is a
+// malformed frame, so a future protocol version using a bit this build
+// doesn't know about is never silently misinterpreted.
+const FLAG_HAS_PARENT = 0x01;
+const FLAG_SIDE_R = 0x02;
 const FLAG_BIND = 0x04;
-const INSERT_FLAGS_KNOWN_BITS = FLAG_HAS_ORIGIN_LEFT | FLAG_HAS_ORIGIN_RIGHT | FLAG_BIND;
+const INSERT_FLAGS_KNOWN_BITS = FLAG_HAS_PARENT | FLAG_SIDE_R | FLAG_BIND;
 
 function checkNoReservedBits(
   byte: number,
@@ -77,13 +81,12 @@ const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 function encodeOpInsertPayload(writer: ByteWriter, msg: OpInsertMessage): void {
   writeVarint(writer, msg.seq);
   let flags = 0;
-  if (msg.originLeft !== null) flags |= FLAG_HAS_ORIGIN_LEFT;
-  if (msg.originRight !== null) flags |= FLAG_HAS_ORIGIN_RIGHT;
+  if (msg.parent !== null) flags |= FLAG_HAS_PARENT;
+  if (msg.side === "R") flags |= FLAG_SIDE_R;
   if (msg.bind) flags |= FLAG_BIND;
   writer.writeByte(flags);
   encodeStamp(writer, msg.id);
-  encodeOptionalStamp(writer, msg.originLeft);
-  encodeOptionalStamp(writer, msg.originRight);
+  encodeOptionalStamp(writer, msg.parent);
   writeVarint(writer, msg.value);
 }
 
@@ -100,15 +103,14 @@ function decodeOpInsertPayload(
     "OP_INSERT flags byte has a reserved bit set (bits 3-7 must be 0)",
   );
   const id = decodeStamp(reader);
-  const originLeft = decodeOptionalStamp(reader, (flags & FLAG_HAS_ORIGIN_LEFT) !== 0);
-  const originRight = decodeOptionalStamp(reader, (flags & FLAG_HAS_ORIGIN_RIGHT) !== 0);
+  const parent = decodeOptionalStamp(reader, (flags & FLAG_HAS_PARENT) !== 0);
   const value = readVarint(reader);
   return {
     kind: "opInsert",
     seq,
     id,
-    originLeft,
-    originRight,
+    parent,
+    side: (flags & FLAG_SIDE_R) !== 0 ? "R" : "L",
     bind: (flags & FLAG_BIND) !== 0,
     value,
   };
@@ -122,13 +124,12 @@ function encodeOpInsertRunPayload(writer: ByteWriter, msg: OpInsertRunMessage): 
   }
   writeVarint(writer, msg.seq);
   let flags = 0;
-  if (msg.originLeft !== null) flags |= FLAG_HAS_ORIGIN_LEFT;
-  if (msg.originRight !== null) flags |= FLAG_HAS_ORIGIN_RIGHT;
+  if (msg.firstParent !== null) flags |= FLAG_HAS_PARENT;
+  if (msg.firstSide === "R") flags |= FLAG_SIDE_R;
   if (msg.bind) flags |= FLAG_BIND;
   writer.writeByte(flags);
   encodeStamp(writer, msg.firstId);
-  encodeOptionalStamp(writer, msg.originLeft);
-  encodeOptionalStamp(writer, msg.originRight);
+  encodeOptionalStamp(writer, msg.firstParent);
   writeVarint(writer, msg.values.length);
   const utf8 = textEncoder.encode(String.fromCodePoint(...msg.values));
   writeVarint(writer, utf8.length);
@@ -148,8 +149,8 @@ function decodeOpInsertRunPayload(
     "OP_INSERT_RUN flags byte has a reserved bit set (bits 3-7 must be 0)",
   );
   const firstId = decodeStamp(reader);
-  const originLeft = decodeOptionalStamp(reader, (flags & FLAG_HAS_ORIGIN_LEFT) !== 0);
-  const originRight = decodeOptionalStamp(reader, (flags & FLAG_HAS_ORIGIN_RIGHT) !== 0);
+  const firstParent = decodeOptionalStamp(reader, (flags & FLAG_HAS_PARENT) !== 0);
+  const firstSide: "L" | "R" = (flags & FLAG_SIDE_R) !== 0 ? "R" : "L";
   const count = readVarint(reader);
   if (count < 2) {
     throw new ProtocolDecodeError(
@@ -176,8 +177,8 @@ function decodeOpInsertRunPayload(
     kind: "opInsertRun",
     seq,
     firstId,
-    originLeft,
-    originRight,
+    firstParent,
+    firstSide,
     bind: (flags & FLAG_BIND) !== 0,
     values,
   };
@@ -502,8 +503,8 @@ export function debugProject(bytes: Uint8Array): unknown {
         messageType: msg.kind,
         seq: msg.seq,
         id: stampToDebug(msg.id),
-        originLeft: stampToDebug(msg.originLeft),
-        originRight: stampToDebug(msg.originRight),
+        parent: stampToDebug(msg.parent),
+        side: msg.side,
         bind: msg.bind,
         value: msg.value,
         char: String.fromCodePoint(msg.value),
@@ -513,8 +514,8 @@ export function debugProject(bytes: Uint8Array): unknown {
         messageType: msg.kind,
         seq: msg.seq,
         firstId: stampToDebug(msg.firstId),
-        originLeft: stampToDebug(msg.originLeft),
-        originRight: stampToDebug(msg.originRight),
+        firstParent: stampToDebug(msg.firstParent),
+        firstSide: msg.firstSide,
         bind: msg.bind,
         count: msg.values.length,
         text: String.fromCodePoint(...msg.values),

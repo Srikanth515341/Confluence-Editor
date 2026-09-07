@@ -83,8 +83,17 @@ export function generateMatrixReport(
           "are untouched by M3's mutation, so it stays live and would have registered a kill had it fired).",
       );
     }
-  } else {
+  } else if (rows.some((r) => r.mutant.id === "M3_no_case_c")) {
     lines.push("Not run — M3_no_case_c was killed by another suite before MUT-KILL-01 was needed.");
+  } else {
+    lines.push(
+      "Not applicable as of the Fugue port (2026-09-05) — `M3_no_case_c` (and `M2_no_right_bound`) " +
+        "targeted the retired YATA-family scan's own window-bookkeeping, which Fugue's placement " +
+        "algorithm has no analogue of (see mutants.ts's own header comment and CLAUDE.md's " +
+        "'Fugue port' entry). Both mutants are currently OMITTED from this matrix rather than " +
+        "force-fit to a mechanism that no longer exists — restoring a tenth mutant requires new, " +
+        "genuinely Fugue-native patches sourced the same deliberate way the original ten were.",
+    );
   }
   lines.push("");
 
@@ -93,6 +102,12 @@ export function generateMatrixReport(
   lines.push(
     `- ${rows.length - survivors.length} of ${rows.length} mutants killed by at least one suite.`,
   );
+  if (!rows.some((r) => r.mutant.id === "M3_no_case_c")) {
+    lines.push(
+      "- `M2_no_right_bound` and `M3_no_case_c` (Test Plan §2.8's original ten) are OMITTED from " +
+        "this matrix as of the Fugue port (2026-09-05) — see the MUT-KILL-01 section above for why.",
+    );
+  }
   if (survivors.length > 0) {
     lines.push(
       `- Survives every suite here: ${survivors.map((r) => `\`${r.mutant.id}\``).join(", ")}.`,

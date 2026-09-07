@@ -41,8 +41,8 @@ import type { Engine } from "./engine.js";
 interface NodeSnapshot {
   readonly id: Identifier;
   readonly value: number;
-  readonly originLeft: Identifier | null;
-  readonly originRight: Identifier | null;
+  readonly parent: Identifier | null;
+  readonly side: "L" | "R";
   readonly bind: boolean;
 }
 
@@ -188,79 +188,69 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
   for (const node of nodes) {
     const key = serializeId(node.id);
 
-    // I2 — identifier immutability: id/value/originLeft/originRight/bind never
-    // change after creation (Engine Spec §5 I2, Definition 2.1/§2.2).
+    // I2 — identifier immutability: id/value/parent/side/bind never change
+    // after creation (Engine Spec §5 I2, Definition 2.1/§2.2). As of the
+    // Fugue port, this is STRICTER than the retired Phase-20 exception for
+    // originRight (which a block split legitimately reassigned) — a Fugue
+    // node's tree attachment is permanent by design (fugueTree.ts's own
+    // header comment), so `parent`/`side` are real, unconditional identity
+    // fields now, with no representation-level carve-out needed.
     const prevSnapshot = state.nodeSnapshots.get(key);
     if (prevSnapshot === undefined) {
       state.nodeSnapshots.set(key, {
         id: node.id,
         value: node.value,
-        originLeft: node.originLeft,
-        originRight: node.originRight,
+        parent: node.parent,
+        side: node.side,
         bind: node.bind,
       });
     } else if (
       !sameId(prevSnapshot.id, node.id) ||
       prevSnapshot.value !== node.value ||
-      !sameId(prevSnapshot.originLeft, node.originLeft) ||
+      !sameId(prevSnapshot.parent, node.parent) ||
+      prevSnapshot.side !== node.side ||
       prevSnapshot.bind !== node.bind
     ) {
-      // NOTE: originRight is deliberately EXCLUDED from this comparison as of Phase 20 — a
-      // block's stored originRight is reassigned by design on append/split/merge (Engine Spec
-      // §7.5/§7.6), so it is no longer immutable per-node history the way id/value/originLeft/
-      // bind still are. See block.ts's own header for the full reasoning: originRight is
-      // write-once, read-once metadata (consulted only during a node's own original
-      // integration), so this representation-level change has no observable consequence.
       violations.push(
         `I2 violated: node ${serializeId(node.id)}'s identity fields changed after creation — ` +
           "Engine Spec §5 I2.",
       );
     }
 
-    // I4/I6 resolve each origin exactly once and share the result — both
-    // checks need "does this origin resolve, and where" and there is no
-    // reason to pay for the lookup twice on a path this hot.
-    const leftNode = node.originLeft !== null ? resolve(node.originLeft) : undefined;
-    const rightNode = node.originRight !== null ? resolve(node.originRight) : undefined;
-
-    // I4 — origin presence: every origin a node currently carries resolves to
-    // a node actually in the structure (Engine Spec §5 I4, §4.2).
-    if (node.originLeft !== null && leftNode === undefined) {
+    // I4 — origin presence: every `parent` a node currently carries resolves to
+    // a node actually in the structure (Engine Spec §5 I4, §4.2). Fugue has
+    // exactly ONE causal-reference field per node, replacing the retired
+    // originLeft/originRight pair.
+    const parentNode = node.parent !== null ? resolve(node.parent) : undefined;
+    if (node.parent !== null && parentNode === undefined) {
       violations.push(
-        `I4 violated: node ${serializeId(node.id)}'s originLeft ${serializeId(node.originLeft)} is not ` +
-          "present in the structure — Engine Spec §5 I4, §4.2.",
-      );
-    }
-    if (node.originRight !== null && rightNode === undefined) {
-      violations.push(
-        `I4 violated: node ${serializeId(node.id)}'s originRight ${serializeId(node.originRight)} is not ` +
+        `I4 violated: node ${serializeId(node.id)}'s parent ${serializeId(node.parent)} is not ` +
           "present in the structure — Engine Spec §5 I4, §4.2.",
       );
     }
 
-    // I6 — scan-window determinism, checked via its lasting structural
-    // consequence: every node sits strictly between its own origin bounds
-    // (Engine Spec §5 I6, §4.3). Reads each node's CURRENT decoded
-    // originRight, which (Phase 20) may have been reassigned by a split —
-    // still correct to check here, since both sides of this comparison
-    // derive from the same live, current block state.
+    // I6 — scan-window determinism, restated for Fugue's own placement rule (there is no
+    // "scan window" anymore, so this checks the structural consequence the retired
+    // originLeft/originRight-bounded version checked instead): a node attached as its
+    // parent's RIGHT child (side "R") must sort strictly AFTER its parent in the total
+    // order; one attached as the LEFT child of some node (side "L") must sort strictly
+    // BEFORE that reference node. This is the direct Fugue-era analogue of "every node sits
+    // strictly between its own origin bounds" — Fugue only has one bound (`parent`), and
+    // which side of it depends on `side`.
     const myIndex = indexOf.get(node);
-    if (myIndex !== undefined) {
-      if (leftNode !== undefined) {
-        const leftIndex = indexOf.get(leftNode);
-        if (leftIndex !== undefined && !(leftIndex < myIndex)) {
+    if (myIndex !== undefined && parentNode !== undefined) {
+      const parentIndex = indexOf.get(parentNode);
+      if (parentIndex !== undefined) {
+        if (node.side === "R" && !(parentIndex < myIndex)) {
           violations.push(
-            `I6 violated: node ${serializeId(node.id)} is not positioned after its originLeft — ` +
-              "Engine Spec §5 I6, §4.3.",
+            `I6 violated: node ${serializeId(node.id)} (side R) is not positioned after its parent — ` +
+              "Engine Spec §5 I6, §4.3 (Fugue placement rule).",
           );
         }
-      }
-      if (rightNode !== undefined) {
-        const rightIndex = indexOf.get(rightNode);
-        if (rightIndex !== undefined && !(myIndex < rightIndex)) {
+        if (node.side === "L" && !(myIndex < parentIndex)) {
           violations.push(
-            `I6 violated: node ${serializeId(node.id)} is not positioned before its originRight — ` +
-              "Engine Spec §5 I6, §4.3.",
+            `I6 violated: node ${serializeId(node.id)} (side L) is not positioned before its reference node — ` +
+              "Engine Spec §5 I6, §4.3 (Fugue placement rule).",
           );
         }
       }
@@ -280,18 +270,35 @@ export function assertInvariants(engine: Engine, options: AssertInvariantsOption
       }
     }
 
-    // I8 — grapheme cluster contiguity: no ordinary (bind=false) sibling ever
-    // sits between a base and a combining mark that shares its left origin
-    // (Engine Spec §5 I8, §4.4).
-    if (node.bind && myIndex !== undefined) {
-      const originLeft = node.originLeft;
-      const baseIndex = leftNode !== undefined ? (indexOf.get(leftNode) ?? -1) : -1;
-      for (let i = baseIndex + 1; i < myIndex; i++) {
-        const between = nodes[i];
-        if (between && !between.bind && sameId(between.originLeft, originLeft)) {
+    // I8 — grapheme cluster contiguity (Engine Spec §5 I8, §4.4), restated for Fugue's own
+    // sibling-order mechanism: `fugueTree.ts`'s `siblingRank` sorts bind:true siblings before
+    // bind:false ones among nodes attached to the SAME parent on the SAME side (the direct
+    // Fugue-era analogue of the retired rank()'s own [bind?0:1, replicaId] tie-break) — this
+    // checks that substitution was actually applied correctly: a bind:true node must never
+    // have an ordinary (bind:false) SIBLING (same parent + side) sorted before it. This is a
+    // narrower, directly-checkable restatement of the retired version's own "no ordinary node
+    // sits between a base and its mark" claim, scoped to the one mechanism `siblingRank`
+    // actually controls (immediate same-parent-same-side sibling order) — deeper,
+    // multi-generation interposition scenarios are exhaustively covered instead by the real
+    // ADV-17/ADV-19 empirical cases (Test Plan §2.4) and this project's own Phase 5 DoD check
+    // (temporarily dropping `bind` from `siblingRank` and confirming those two cases fail),
+    // re-verified fresh under this port rather than assumed to still hold.
+    // Any node sharing this (parent, side) is a sibling, regardless of position — the set is
+    // typically tiny (only concurrent insertions at the exact same anchor point ever produce
+    // more than one), so a plain pass over all nodes is fine here.
+    for (const other of nodes) {
+      if (other === node) continue;
+      if (!sameId(other.parent, node.parent) || other.side !== node.side) continue;
+      // `other` is a same-parent-same-side sibling of `node`. If `node` is a combining mark
+      // (bind:true) and `other` is ordinary (bind:false), `node` must sort before `other`
+      // (siblingRank's own bind-then-replica rule) — checked via id/id comparison directly,
+      // mirroring `siblingRank`'s own definition, rather than trusting position alone.
+      if (node.bind && !other.bind) {
+        const otherIndex = indexOf.get(other);
+        if (myIndex !== undefined && otherIndex !== undefined && otherIndex < myIndex) {
           violations.push(
-            `I8 violated: ordinary node ${serializeId(between.id)} sits between the base and combining ` +
-              `mark ${serializeId(node.id)} sharing its left origin — Engine Spec §5 I8, §4.4.`,
+            `I8 violated: ordinary sibling ${serializeId(other.id)} sorts before combining mark ` +
+              `${serializeId(node.id)} sharing the same parent/side — Engine Spec §5 I8, §4.4.`,
           );
         }
       }

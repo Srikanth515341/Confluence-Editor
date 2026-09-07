@@ -8,8 +8,8 @@ function insertOp(c: number, r: number): InsertOperation {
     kind: "insert",
     id: { c, r },
     value: 0x61,
-    originLeft: null,
-    originRight: null,
+    parent: null,
+    side: "R",
     bind: false,
   };
 }
