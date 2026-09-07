@@ -21,13 +21,13 @@ export function decodeStamp(reader: ByteReader): Identifier {
 }
 
 /**
- * `originLeft`/`originRight` are `null` (⊥, a structure boundary — Node
- * §originLeft/originRight docs) exactly as often as they are a real
- * identifier, so absence is signaled by a presence bit in the message's
- * flags byte (API Spec §1.4) — a stamp is written/read only when the
- * caller has already confirmed, via that bit, that one is present. These
- * two helpers exist so every call site spells that out the same way rather
- * than re-deriving the branch.
+ * An insert's `parent` (Fugue port, 2026-09-05 — the retired `originLeft`/
+ * `originRight` pair's single successor) is `null` (a document-root
+ * attachment) about as often as it is a real identifier, so absence is
+ * signaled by a presence bit in the message's flags byte (API Spec §1.4) —
+ * a stamp is written/read only when the caller has already confirmed, via
+ * that bit, that one is present. These two helpers exist so every call
+ * site spells that out the same way rather than re-deriving the branch.
  */
 export function encodeOptionalStamp(writer: ByteWriter, id: Identifier | null): void {
   if (id !== null) {

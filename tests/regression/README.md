@@ -226,6 +226,96 @@ CLAUDE.md's "Engine Spec §6.2 sub-case iii-d correction" entry.
 though both are now fixed** — a corpus entry documents a bug that
 happened, not a currently-open issue.
 
+## R0012 (2026-09-06) — 🛑 CRITICAL, OPEN, UNRESOLVED: a live, connected client's ordinary keystroke can anchor to a server-collected tombstone
+
+Found while investigating a Phase 25 M8-e soak-test failure, then
+explicitly generalized (per direct user challenge) beyond that test's own
+simplified harness: `Engine.localInsert()` — the exact call every real,
+continuously-connected `SyncClient`'s live keystroke makes — can, via
+`FugueTree.decidePlacement`'s own `leftmostDescendant` branch (which
+performs no `deleted` check), anchor to a tombstoned node the SERVER has
+already physically removed via `Engine.collect()`. Unlike R0008-R0011,
+this is not a placement-algorithm defect — Fugue's `decidePlacement` and
+`collect()` are each individually correct per their own specifications.
+It is a genuine gap in the INTERACTION between three independently-correct
+components: GC's own anchor check is structurally blind to future,
+not-yet-submitted client operations; the RFC's own undo horizon is an
+explicitly "unvalidated" heuristic delay, not a structural safety proof;
+and the client has no mechanism to learn a node it still holds locally has
+been server-collected, nor to revert an already-integrated local
+operation if that turns out to matter. The result: a silent, PERMANENT
+divergence between one client and every other real replica, reachable via
+completely ordinary live editing — no reconnection, no offline queueing,
+no fault injection of any kind. Fully satisfies Rule 3 (a complete,
+deterministic 5-operation stream — no timing/randomness required).
+Permanent automated regression protection:
+`packages/engine/src/regressionR0012.test.ts` (currently asserts the BUG's
+own behavior, deliberately, so a future fix changes this test's final
+assertions as a visible, reviewed change, not a silently-fixed gap). See
+CLAUDE.md's own critical-flag entry, same date, for the full account and
+the fix options under active consideration — **this entry must not be
+treated as resolved until that CLAUDE.md status is updated to say so.**
+
+## R0013 (2026-09-07, RESOLVED same day) — confirms Item 10's offline-window-sweep fix works, reveals R0012 fires far more often than "rare" under BOTH aggressive and realistic GC tuning; the heap-growth anomaly is confirmed unforced-GC noise, not a leak
+
+Found while re-running M8-e after wiring `offlineWindowScheduler.ts`'s
+sweep into `soak.db.test.ts`'s loop (Open Item 10). Two distinct results,
+recorded together since both came from the same run:
+
+**Confirmed working**: `coordinator.engine.pending.length` correctly
+reaches 0 by the end of a real 30,000-operation soak, with orphaned
+operations explicitly rejected via `OFFLINE_WINDOW_EXCEEDED` along the
+way (Rule 7.2) rather than left stuck forever — the ONLY assertion that
+failed in the whole run was an unrelated heap check (below), not any
+pending-length assertion.
+
+**New finding — frequency**: under this test's own deliberately-zero
+undo-horizon grace window, the R0012 race (see immediately above) fired
+1,605 times out of 30,000 operations (5.35%) — not a rare edge case at
+this configuration. Because this soak's simulated clients are bare
+`Engine` instances (never real `SyncClient`s), none of these 1,605
+rejections were ever revert-corrected by Option 2 — every one is a
+permanent, un-reverted local divergence in THIS harness specifically.
+This raises the practical urgency of Open Item 9 (Option 1's
+structurally-safe GC/undo-horizon redesign) — see CLAUDE.md's own entry.
+
+**Heap growth — RESOLVED as noise, same day.** The original run's heap
+usage more than doubled (97.8MB → 241.2MB) between the last two GC
+checkpoints, failing the test's own coarse 4x-of-median smell test, with
+no corresponding structural jump. Re-measured with `global.gc()` forced
+before every sample (`NODE_OPTIONS=--expose-gc`, `--pool=forks
+--poolOptions.forks.singleFork`): heap growth was smooth and tracked
+structural growth closely (29.5MB → 76.3MB, ~2.6x, against ~5.4x
+structural growth) — the spike did not reproduce. Per-checkpoint sizes
+of every long-lived DocumentCoordinator Map (`pendingFirstSeenAtMs`,
+`pendingOpOrigin`, `watermarks`) were also sampled and confirmed
+bounded, never growing without bound. **Confirmed noise, not a leak**;
+the full test suite passed cleanly (1/1, zero assertion failures) in
+this same re-run.
+
+**A follow-up comparison at the REAL, non-zero undo-horizon default**
+(5min/200-ops-per-replica, swapped in for one run then reverted) found
+**no material difference** in the R0012 rejection rate — 5.44% vs.
+5.35% under the zero-grace config — because at this soak's own
+throughput, Rule 7.3's op-count condition (200 further ops per replica)
+is satisfied in roughly 12 real seconds, making the nominal 5-minute
+age threshold practically irrelevant at this rate. This is an honest
+data point RAISING, not lowering, Open Item 9's own priority: a
+genuinely busy multi-user session could plausibly see a similarly high
+rate under realistic tuning, not only under this test's own
+deliberately aggressive configuration.
+
+Full data (per-checkpoint tombstone ratios, heap samples under both
+methodologies, map-size diagnostics, GC-cycle detail, exact reproduction
+commands) and the full resolution account:
+`tests/regression/R0013-2026-09-07-m8e-soak-heap-growth-and-high-frequency-r0012-rejections.json`
+(kept per Rule 2 — the original findings are preserved unchanged; the
+resolution is recorded as an additional, clearly-labeled section). No
+new deterministic minimal repro was built — the underlying mechanism is
+already R0012's own; this entry documents AGGREGATE FREQUENCY and
+MEMORY BEHAVIOR at soak scale, which R0012's own 5-operation minimal
+repro cannot speak to.
+
 ## See also — the Phase 21 pathological GC chain (NOT an R#### entry, and deliberately so)
 
 Phase 21's `Engine.collect()` DoD work found a hand-constructed (not

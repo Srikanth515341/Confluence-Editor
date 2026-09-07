@@ -106,8 +106,8 @@ describe("processIncomingOperation — step 1 authorize (Phase 24, RC-32)", () =
       kind: "opInsertRun",
       seq: 0,
       firstId: first.id,
-      originLeft: first.originLeft,
-      originRight: first.originRight,
+      firstParent: first.parent,
+      firstSide: first.side,
       bind: false,
       values: Array.from("hello", (c) => c.codePointAt(0)!),
     };

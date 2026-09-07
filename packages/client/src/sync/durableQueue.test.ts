@@ -21,7 +21,7 @@ function freshFactory(): IDBFactory {
 }
 
 function insertOp(c: number, r: number, value = 0x61): InsertOperation {
-  return { kind: "insert", id: { c, r }, value, originLeft: null, originRight: null, bind: false };
+  return { kind: "insert", id: { c, r }, value, parent: null, side: "R", bind: false };
 }
 
 function deleteOp(c: number, r: number, target: { c: number; r: number }): DeleteOperation {

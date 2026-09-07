@@ -75,8 +75,8 @@ export function createHttpApp(deps: HttpAppDeps): Express {
     res.status(200).json({
       nodes: replay.nodes.map((n) => ({
         id: n.id,
-        originLeft: n.originLeft,
-        originRight: n.originRight,
+        parent: n.parent,
+        side: n.side,
         bind: n.bind,
         deleted: n.deleted,
         deletedBy: n.deletedBy,

@@ -77,8 +77,18 @@ export interface OpInsertMessage {
   /** 0 from client; assigned by the server (§3.5.1). */
   readonly seq: number;
   readonly id: Identifier;
-  readonly originLeft: Identifier | null;
-  readonly originRight: Identifier | null;
+  /**
+   * Fugue port (2026-09-05, see CLAUDE.md's "Fugue port" entry): the single
+   * causal-dependency reference replacing the retired `originLeft`/
+   * `originRight` pair — `null` only for a node attached directly under the
+   * document's own root. This is a REQUIRED wire-shape change, not
+   * cosmetic: a receiver cannot safely re-derive Fugue's own placement
+   * decision from a weaker signal, so `parent`/`side` are decided once by
+   * the minting replica (`Engine.localInsert`) and carried verbatim.
+   */
+  readonly parent: Identifier | null;
+  /** Which side of `parent` this node attaches to — see `Node.side`'s own doc comment (`@collab-editor/engine`). */
+  readonly side: "L" | "R";
   readonly bind: boolean;
   readonly value: number;
 }
@@ -91,16 +101,27 @@ export interface OpInsertMessage {
  * models a run as one grapheme-cluster-uniform burst, not a mix. On the
  * wire, `values` is carried as the run's scalars re-encoded as UTF-8 text
  * (§3.5.2's `bytes utf8`), not as a list of individual varints; see
- * codec.ts for that transcoding. `originLeft`/`originRight` are the FIRST
- * node's origins — see expand.ts's `expandInsertRun` for the exact
- * per-node derivation this implies for nodes 1..n-1.
+ * codec.ts for that transcoding.
+ *
+ * Fugue port (2026-09-05): `firstParent`/`firstSide` are the FIRST node's
+ * own placement decision only — there is no second, shared "originRight"
+ * field anymore, and none is needed. For every node j >= 1 in the run,
+ * `parent` is ALWAYS the immediately preceding node in the SAME run
+ * (`{c: firstId.c + j - 1, r: firstId.r}`) and `side` is ALWAYS `"R"` —
+ * this is not an approximation but a hand-traced structural fact about
+ * `FugueTree.decidePlacement`: a node just attached via `attach()` always
+ * has zero children of its own, so the VERY NEXT `decidePlacement` call at
+ * the position immediately after it always returns `{parent: <that node's
+ * id>, side: "R"}`, regardless of anything else in the tree — see
+ * expand.ts's `expandInsertRun` for the exact derivation this wire shape
+ * relies on, and CLAUDE.md's "Fugue port" entry for the full account.
  */
 export interface OpInsertRunMessage {
   readonly kind: "opInsertRun";
   readonly seq: number;
   readonly firstId: Identifier;
-  readonly originLeft: Identifier | null;
-  readonly originRight: Identifier | null;
+  readonly firstParent: Identifier | null;
+  readonly firstSide: "L" | "R";
   readonly bind: boolean;
   readonly values: readonly number[];
 }

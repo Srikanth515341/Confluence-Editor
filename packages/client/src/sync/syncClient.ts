@@ -52,6 +52,22 @@ export interface RejectedEntry {
   readonly reason: RejectReason;
   readonly detail: string;
   readonly rejectedAt: number;
+  /**
+   * Phase 25 (Option 2 / R0012's own scoped mitigation) — `true` when this rejection was for an
+   * INSERT this client had already integrated locally (this project's own real-time-feel
+   * design applies synchronously at mint time, before the server ever confirms it), AND the
+   * revert succeeded (`Engine.tryRevertLocalInsert` — the "clean" case, nothing else anchors to
+   * it yet): the character has already been REMOVED from this client's own document, not merely
+   * preserved-but-still-silently-showing. `false` covers every other case uniformly — a
+   * rejected delete (never attempted, out of this fix's own disclosed scope), and the
+   * "cascading" case (something already chains onto the rejected insert, so reverting it would
+   * dangle that other node's own `parent` reference, Engine Spec I4/I5) — in both, the document
+   * is UNCHANGED and the content is preserved here exactly as it always was before this fix.
+   * NOT persisted to the durable `rejected` store — a purely in-memory UI signal for "did we
+   * already clean this up," not required for correctness (the engine's own state is what
+   * durably reflects the revert, this flag is not load-bearing across a page reload).
+   */
+  readonly reverted: boolean;
 }
 
 /** API Spec §1.2/§3: WebSocket path and subprotocol — restated here (not imported from `@collab-editor/server`, which a client must never depend on). */
@@ -257,8 +273,112 @@ export class SyncClient {
   private readonly gapTracker = new SequenceGapTracker();
 
   private readonly unacked = new UnackedQueue();
-  /** The seq PING reports — the highest seq this client has ever applied, NOT the gap tracker's contiguous value (§3.7.5's "apply anyway" means these can legitimately differ while a gap is open). */
+  /**
+   * Phase 25 (DUR-06 fix, client-side mirror of writePath.ts's own fix) — the highest seq for
+   * which this client is CERTAIN it has genuinely, actually integrated (not merely received)
+   * every operation up to and including it. Reported as HELLO's `lastServerSeq` (`onOpen()`),
+   * which becomes CATCHUP's `fromSeq` boundary — a value here must never overclaim, or a
+   * reconnect's CATCHUP will silently skip re-sending an operation this client only ever
+   * RECEIVED, never actually applied (buffered, still sitting in `engine.pending`, discarded
+   * wholesale by `rebuildEngineForReconnect`/`handleSnapshot` on the next reconnect).
+   *
+   * Deliberately DISTINCT from `gapTracker.value` (used only for `hasStalled()`'s stall
+   * detection), whose own doc comment explicitly documents it as NOT contiguous by design
+   * (Phase 14: a client's own self-authored operations are permanent, expected, structural
+   * gaps in what it ever receives via live broadcast — tolerating that is correct for stall
+   * detection, but Phase 23 (CATCHUP) had been reusing this SAME non-contiguous value for
+   * `lastServerSeq`, which fundamentally requires contiguity — a latent design flaw since
+   * Phase 23 shipped, only exposed by DUR-06's own heavy reorder rate causing a REMOTE
+   * (not self-authored) operation to legitimately buffer).
+   *
+   * Updated by TWO DISTINCT mechanisms, deliberately kept separate rather than unified — see
+   * each one's own doc comment for why a single shared mechanism is NOT safe for both:
+   *   - CATCHUP (`handleCatchupChunk`/`handleCatchupEnd`): {@link catchupPendingSeqs} +
+   *     {@link catchupHighestSeqSeen}, via {@link recomputeCatchupSeqCeiling} — a
+   *     "trust the jump once nothing is outstanding" ceiling, SAFE here specifically because a
+   *     CATCHUP range is a COMPLETE, authoritative delta (the durable log query has no
+   *     structural exclusions — unlike live broadcast, it includes this client's own past
+   *     operations too), so "nothing left pending within this range" genuinely does mean the
+   *     whole range is accounted for.
+   *   - LIVE OPS (`handleOps`): {@link livePendingSeqs} + {@link liveConfirmedSeqs}, via
+   *     {@link advanceLiveSeqCeiling} — a strict, ONE-AT-A-TIME contiguous walk through
+   *     INDIVIDUALLY PROVEN seq numbers (either applied successfully, or confirmed as this
+   *     client's own via `OP_ACK`'s `ackSeq`), because live broadcast structurally EXCLUDES the
+   *     sender (`otherSessions`, Phase 8) — an unexplained gap in live traffic could legitimately
+   *     be "my own excluded op" (safe) OR "a genuinely buffered/lost remote op" (NOT safe), and
+   *     these are indistinguishable without independently proving which seq numbers are
+   *     self-authored. The first (naive) implementation of this fix reused the CATCHUP-style
+   *     "trust any jump" ceiling for live traffic too, and a regression test caught it
+   *     immediately: it advanced past an UNEXPLAINED gap before a buffered operation, exactly
+   *     reintroducing this bug's own root cause one level down.
+   */
   private highestAppliedSeq = 0;
+
+  /**
+   * Phase 25 (DUR-06 fix) — CATCHUP-specific. Absolute seq of every operation this client has
+   * received via a CATCHUP chunk that came back `{buffered: true}` from `engine.applyRemote`
+   * and is therefore still sitting in `engine.pending`, keyed by the operation's own serialized
+   * stamp. Pruned in {@link recomputeCatchupSeqCeiling} the moment an entry is no longer found
+   * in `engine.pending` — including when it resolves as a SIDE EFFECT of a LATER chunk's own
+   * `drain()` cascade, mirroring exactly how writePath.ts's own slow path detects a
+   * side-effect-resolved operation from a different message. Cleared whenever `engine` itself
+   * is replaced (`rebuildEngineForReconnect`, `handleSnapshot`) — a discarded engine's own
+   * `pending` array is meaningless once superseded.
+   */
+  private readonly catchupPendingSeqs = new Map<string, number>();
+
+  /**
+   * Phase 25 (DUR-06 fix) — CATCHUP-specific. The highest seq covered by ANY catchup chunk/end
+   * this client has ever received in the current handshake, regardless of whether every
+   * operation within it actually applied. The CEILING `highestAppliedSeq` is allowed to rise to
+   * once {@link catchupPendingSeqs} is empty — never reported directly on its own. Reset
+   * alongside `catchupPendingSeqs` whenever `engine` is replaced.
+   */
+  private catchupHighestSeqSeen = 0;
+
+  /**
+   * Phase 25 (DUR-06 fix) — LIVE-traffic-specific. Every INDIVIDUAL seq number this client has
+   * independently PROVEN safe: either a live OPS operation that applied successfully
+   * (`handleOps`), or this client's OWN operation, confirmed via `OP_ACK`'s own `ackSeq`
+   * (`handleOpsMessage`'s `"opAck"` case) — the latter is what lets a self-authored gap
+   * (structurally never seen via live broadcast at all) still get credited, without having to
+   * blindly trust an unexplained one. {@link advanceLiveSeqCeiling} walks `highestAppliedSeq`
+   * forward ONE AT A TIME through this set, stopping at the first number not (yet) proven —
+   * never jumping over an unexplained gap. Reset whenever `engine` is replaced.
+   */
+  private readonly liveConfirmedSeqs = new Set<number>();
+
+  /**
+   * Phase 25 (DUR-06 fix) — LIVE-traffic-specific mirror of {@link catchupPendingSeqs}: absolute
+   * seq of every LIVE (not catchup) operation this client has received that came back
+   * `{buffered: true}`, keyed by its own serialized stamp. Pruned in
+   * {@link advanceLiveSeqCeiling} the moment an entry resolves (added to `liveConfirmedSeqs` at
+   * that point, since its own application is now proven). Reset whenever `engine` is replaced.
+   */
+  private readonly livePendingSeqs = new Map<string, number>();
+
+  /**
+   * Phase 25 (DUR-06 fix) — incremented once per `onOpen()` (i.e. once per real connection
+   * attempt). `handleCatchupChunk`/`handleCatchupEnd`/`handleAlreadyHave` each chain work onto
+   * the mutable `handshakeGate` field, which a reconnect RESETS but does not — cannot —
+   * retroactively cancel: a `.then()` callback already scheduled on the OLD promise chain
+   * (before the reset) still fires whenever its own turn comes up, entirely independent of
+   * what `handshakeGate` currently points to. Confirmed via a deterministic scratch
+   * reproduction that such a stale callback's own `engine.applyRemote()` call still runs,
+   * reading `this.engine` LAZILY at execution time — i.e. against whatever engine a LATER
+   * reconnect has since rebuilt. Applying stale content itself is harmless (id-based
+   * idempotence) — but letting that stale callback's own seq bookkeeping
+   * (`notePossiblyBuffered`/`recomputeAppliedSeqCeiling`) mutate the CURRENT generation's
+   * `pendingFrameSeqs`/`highestAppliedSeq` is not: it could insert a phantom "still pending"
+   * entry keyed by an OLD-generation seq number that may never resolve against the NEW
+   * engine's own catchup range, permanently capping the new generation's safe watermark — the
+   * same SHAPE of bug as `InMemoryOperationStore`'s own call-order assumption (Phase 25's other
+   * DUR-06 finding), just on the client's receiving end. Each handshake-scoped callback
+   * captures this counter at scheduling time and becomes a full no-op if it has since changed
+   * — mirroring the existing `ws !== this.ws` stale-socket guard (`openSocket()`), applied here
+   * to the logical HANDSHAKE generation instead of the raw socket.
+   */
+  private handshakeGeneration = 0;
 
   private durableQueue: DurableQueue | null = null;
   private durableInitStarted = false;
@@ -673,6 +793,7 @@ export class SyncClient {
 
   private onOpen(): void {
     this.armSurvivedTimer();
+    this.handshakeGeneration += 1; // Phase 25 (DUR-06 fix) — see this field's own doc comment
     this.handshakeGate = Promise.resolve(); // fresh handshake — see this field's own doc comment
     // Captured HERE, not read fresh later, because `this.unacked` can legitimately gain entries
     // AFTER this HELLO is sent but BEFORE ALREADY_HAVE arrives — Phase 22's relaxed
@@ -686,7 +807,10 @@ export class SyncClient {
       kind: "hello",
       documentId: this.documentId,
       ticket: new Uint8Array(), // no auth yet (Phase 29) — "accept any bytes" server-side
-      lastServerSeq: this.gapTracker.value,
+      // Phase 25 (DUR-06 fix): `highestAppliedSeq`, NOT `gapTracker.value` — see
+      // `highestAppliedSeq`'s own doc comment for why the gap tracker's own (deliberately
+      // non-contiguous) value is unsafe to use as CATCHUP's own fromSeq boundary.
+      lastServerSeq: this.highestAppliedSeq,
       unacked: this.helloUnackedIds,
       clientCapabilities:
         CLIENT_CAP_ACCEPTS_OP_INSERT_RUN |
@@ -801,6 +925,13 @@ export class SyncClient {
     }
     this.gapTracker.reset(seq);
     this.highestAppliedSeq = seq;
+    // Phase 25 (DUR-06 fix): a fresh SNAPSHOT is authoritative, whole-structure truth as of
+    // exactly `seq` — no gap is possible, so every tracking structure resets to match rather
+    // than carrying over anything from a now-discarded engine generation.
+    this.catchupPendingSeqs.clear();
+    this.catchupHighestSeqSeen = seq;
+    this.liveConfirmedSeqs.clear();
+    this.livePendingSeqs.clear();
     this.persistMeta();
     // handshakeGate is left exactly as onOpen() set it (trivially resolved) — SNAPSHOT does no
     // async chunked work, so ALREADY_HAVE's own handler (chained onto handshakeGate) runs
@@ -839,6 +970,22 @@ export class SyncClient {
       replaySnapshotNodesInto(fresh, buildCleanCatchupBase(this.engine.nodes, unackedIds));
     }
     this.engine = fresh;
+    // Phase 25 (DUR-06 fix): the OLD engine's `pending` (and whatever this client had tracked
+    // about it) is discarded along with the engine itself — carrying stale entries forward
+    // into the new generation would check them against an engine that never received them,
+    // either wrongly treating them as "resolved" (inflating the new generation's own safe
+    // watermark) or leaving a phantom entry that can never resolve. `catchupHighestSeqSeen`
+    // resets to the CURRENT `highestAppliedSeq` baseline — nothing beyond what's already
+    // confirmed-safe is known yet for this new generation; the upcoming CATCHUP chunks/end (or
+    // trivially, ALREADY_CURRENT's own lack of any) will re-establish it from here.
+    // `liveConfirmedSeqs`/`livePendingSeqs` reset too: whatever this client's own live-traffic
+    // ceiling had accumulated is meaningless against a rebuilt engine (and the OLD generation's
+    // acked-but-unbroadcast self-authored seqs remain safely folded into `highestAppliedSeq`
+    // already, via the acks that produced them — nothing is lost by clearing the sets).
+    this.catchupPendingSeqs.clear();
+    this.catchupHighestSeqSeen = this.highestAppliedSeq;
+    this.liveConfirmedSeqs.clear();
+    this.livePendingSeqs.clear();
   }
 
   /**
@@ -897,15 +1044,31 @@ export class SyncClient {
       this.highestAppliedSeq = Math.max(this.highestAppliedSeq, throughSeq);
       this.persistMeta();
     }
+    // Phase 25 (DUR-06 fix): a chunk's own claimed range is CONTIGUOUS (chunkCatchupOperations's
+    // own construction, handshake.ts), so its first seq is derivable from `throughSeq` and the
+    // op count.
+    const chunkFirstSeq = throughSeq - ops.length + 1;
+    // Captured NOW, at scheduling time — see `handshakeGeneration`'s own doc comment for why a
+    // reconnect that supersedes this handshake before this chunk's own queued work runs must
+    // make that work a full no-op, not merely apply it against whatever engine happens to be
+    // current by then.
+    const generation = this.handshakeGeneration;
     this.handshakeGate = this.handshakeGate
       .then(() => {
+        if (generation !== this.handshakeGeneration) {
+          return; // stale — superseded by a LATER reconnect before this chunk's own turn came up
+        }
         const engine = this.engine;
         if (!engine) {
           return;
         }
-        for (const op of ops) {
-          engine.applyRemote(op);
+        for (let i = 0; i < ops.length; i++) {
+          const op = ops[i]!;
+          const { buffered } = engine.applyRemote(op);
+          this.noteCatchupPossiblyBuffered(chunkFirstSeq + i, op.id, buffered);
         }
+        this.catchupHighestSeqSeen = Math.max(this.catchupHighestSeqSeen, throughSeq);
+        this.recomputeCatchupSeqCeiling();
         this.catchupReceivedOps += ops.length;
       })
       .then(() => yieldToEventLoop());
@@ -919,12 +1082,25 @@ export class SyncClient {
    * in-flight chunk.
    */
   private handleCatchupEnd(toSeq: number): void {
+    // lastServerSeq advances only here, at CATCHUP_END — never per chunk. A client
+    // that advances per chunk and then loses the socket mid-catch-up requests the
+    // wrong range on reconnect and SILENTLY SKIPS operations. API Spec §11.5.
+    //
+    // Phase 25 (DUR-06 fix): "advances... at CATCHUP_END" is necessary but not sufficient on
+    // its own — the ORIGINAL bug this comment already warned against (advancing too EARLY) is
+    // distinct from the bug THIS fix closes (advancing to `toSeq` UNCONDITIONALLY even when a
+    // chunk along the way left something buffered). `catchupHighestSeqSeen` covers the
+    // zero-chunk case too (an already-fully-current CATCHUP range with `totalOps: 0` never
+    // calls `handleCatchupChunk` at all, so CATCHUP_END is the ONLY place that range's own
+    // completion is ever recorded).
+    const generation = this.handshakeGeneration;
     this.handshakeGate = this.handshakeGate.then(() => {
-      // lastServerSeq advances only here, at CATCHUP_END — never per chunk. A client
-      // that advances per chunk and then loses the socket mid-catch-up requests the
-      // wrong range on reconnect and SILENTLY SKIPS operations. API Spec §11.5.
+      if (generation !== this.handshakeGeneration) {
+        return; // stale — see handshakeGeneration's own doc comment
+      }
+      this.catchupHighestSeqSeen = Math.max(this.catchupHighestSeqSeen, toSeq);
+      this.recomputeCatchupSeqCeiling();
       this.gapTracker.observe(toSeq);
-      this.highestAppliedSeq = Math.max(this.highestAppliedSeq, toSeq);
       this.persistMeta();
     });
   }
@@ -936,7 +1112,14 @@ export class SyncClient {
    * CATCHUP_END's own final advance) has completed.
    */
   private handleAlreadyHave(alreadyHave: readonly Identifier[]): void {
-    void this.handshakeGate.then(() => this.finishHandshakeAfterAlreadyHave(alreadyHave));
+    const generation = this.handshakeGeneration;
+    void this.handshakeGate.then(() => {
+      if (generation !== this.handshakeGeneration) {
+        return; // stale — see handshakeGeneration's own doc comment; a superseded handshake's
+        // own reconciliation/SYNC_COMPLETE must never run against a LATER generation's state.
+      }
+      this.finishHandshakeAfterAlreadyHave(alreadyHave);
+    });
   }
 
   /**
@@ -1023,7 +1206,15 @@ export class SyncClient {
       case "opAck":
         for (const ack of msg.acks) {
           this.unacked.ack(ack.ackedId);
+          // Phase 25 (DUR-06 fix): an ACK's own `ackSeq` is this client's ONLY way to learn
+          // that a specific seq number is its OWN operation — live broadcast structurally
+          // never echoes it back (`otherSessions`, Phase 8), so without this, a self-authored
+          // seq would look identical to a genuinely lost remote operation, and
+          // `advanceLiveSeqCeiling`'s own strict, no-blind-jumps walk would get stuck at it
+          // forever. See `liveConfirmedSeqs`'s own doc comment for the full reasoning.
+          this.liveConfirmedSeqs.add(ack.ackSeq);
         }
+        this.advanceLiveSeqCeiling();
         this.syncUnsyncedCountObservable();
         break;
       case "opReject": {
@@ -1049,7 +1240,28 @@ export class SyncClient {
             this.recentlySentOps.get(serializeId(rejected.rejectedId));
           this.unacked.ack(rejected.rejectedId); // harmless no-op if this stamp was never (or is no longer) in `unacked`
           if (op) {
-            this.preserveRejected(op, rejected.reason, msg.detail);
+            // Phase 25 (Option 2 / R0012's own scoped mitigation, Engine Spec §7.6 Rule 7.2):
+            // this client applied `op` to its OWN resident engine synchronously at mint time
+            // (this project's real-time-feel design, Phase 3/10) — LONG before this rejection
+            // could possibly arrive. Scoped to INSERTS only (a rejected delete never structurally
+            // "shows" anything extra on screen the way an un-reverted insert does — reverting a
+            // delete would mean a real Undelete, Phase 36's own resurrection semantics, out of
+            // this fix's scope and disclosed as such). `tryRevertLocalInsert` itself decides
+            // safety: succeeds only in the "clean" case (nothing anchors to it yet); returns
+            // `false` in the "cascading" case (the same user's own very next keystroke already
+            // chains onto it) without attempting any partial/unsafe removal — the ordinary
+            // preserve-only path below is exactly correct for that case, unchanged.
+            const reverted = op.kind === "insert" && (this.engine?.tryRevertLocalInsert(op.id) ?? false);
+            this.preserveRejected(op, rejected.reason, msg.detail, reverted);
+            if (reverted) {
+              // Reuses the SAME "document changed for a reason other than my own most recent
+              // keystroke, please re-render" signal EditorView already listens to for remote
+              // edits (Phase 14) — a revert is exactly that from the DOM layer's perspective,
+              // regardless of whether the change originated from a peer's broadcast or this
+              // client's own now-undone insert.
+              this.notifyRemoteOpsApplied();
+              this.notifyLocalInsertReverted(this.rejectedOps.get(serializeId(op.id))!);
+            }
           }
         }
         this.syncUnsyncedCountObservable();
@@ -1061,7 +1273,7 @@ export class SyncClient {
     }
   }
 
-  /** Populates `rejectedOps` from a durable restore (a prior page load's preserved rejections, read back before this client even opens a socket) — a page reload is exactly the scenario Rule 7.2's "preserved" requirement exists for, not only a same-session late OP_REJECT. */
+  /** Populates `rejectedOps` from a durable restore (a prior page load's preserved rejections, read back before this client even opens a socket) — a page reload is exactly the scenario Rule 7.2's "preserved" requirement exists for, not only a same-session late OP_REJECT. `reverted` is never persisted (see `RejectedEntry.reverted`'s own doc comment) — always restored `false`, which is always CORRECT here regardless of what happened in a prior session: a page reload means this client's own resident engine (and any revert it had made) is gone anyway, replaced by a fresh SNAPSHOT/CATCHUP rebuild. */
   private restoreRejected(records: readonly RejectedRecord[]): void {
     for (const record of records) {
       this.rejectedOps.set(serializeId(record.op.id), {
@@ -1069,15 +1281,16 @@ export class SyncClient {
         reason: record.reason,
         detail: record.detail,
         rejectedAt: record.rejectedAt,
+        reverted: false,
       });
     }
     this.rejectedCountValue.set(this.rejectedOps.size);
   }
 
-  /** API Spec §5.5 step 1 ("move to the rejected store, do not delete") + step 3 ("show which operations saved and which did not") — the shared tail every `opReject` entry goes through, regardless of reason code. */
-  private preserveRejected(op: Operation, reason: RejectReason, detail: string): void {
+  /** API Spec §5.5 step 1 ("move to the rejected store, do not delete") + step 3 ("show which operations saved and which did not") — the shared tail every `opReject` entry goes through, regardless of reason code. `reverted` (Phase 25, Option 2) is an in-memory-only annotation — see `RejectedEntry.reverted`'s own doc comment for why it is deliberately never written to the durable store. */
+  private preserveRejected(op: Operation, reason: RejectReason, detail: string, reverted: boolean): void {
     const key = serializeId(op.id);
-    this.rejectedOps.set(key, { op, reason, detail, rejectedAt: Date.now() });
+    this.rejectedOps.set(key, { op, reason, detail, rejectedAt: Date.now(), reverted });
     this.rejectedCountValue.set(this.rejectedOps.size);
     if (this.durableQueue) {
       this.durableQueue.scheduleWriteRejected({
@@ -1116,15 +1329,102 @@ export class SyncClient {
     }
   }
 
+  /**
+   * Phase 25 (DUR-06 fix) — CATCHUP-specific. Records that the catchup-delivered operation at
+   * `seq` (id `id`) came back `buffered` from `engine.applyRemote`. A no-op when `buffered` is
+   * false. Paired with {@link recomputeCatchupSeqCeiling}, called once after a whole CATCHUP
+   * chunk has been applied.
+   */
+  private noteCatchupPossiblyBuffered(seq: number, id: Identifier, buffered: boolean): void {
+    if (buffered) {
+      this.catchupPendingSeqs.set(serializeId(id), seq);
+    }
+  }
+
+  /**
+   * Phase 25 (DUR-06 fix) — CATCHUP-specific "trust the jump once nothing outstanding" ceiling
+   * computation — see `highestAppliedSeq`'s own doc comment for why this is safe specifically
+   * for CATCHUP (a complete, authoritative range with no structural exclusions) and NOT for
+   * live traffic (`advanceLiveSeqCeiling` below is the live-specific equivalent). First prunes
+   * `catchupPendingSeqs` of anything no longer in `engine.pending` (resolved, possibly as a
+   * side effect of a LATER chunk's own `drain()` cascade). Then: if nothing remains
+   * outstanding, `highestAppliedSeq` is free to rise to `catchupHighestSeqSeen`; otherwise it is
+   * capped at `(lowest still-outstanding seq) - 1`. `Math.max` rather than a direct assignment
+   * purely for defense-in-depth and to avoid interfering with `mutateAdvanceSeqPerChunk`'s own
+   * deliberately-broken RC-33e test path, which asserts state synchronously before this
+   * method's own (correct) async computation ever runs.
+   */
+  private recomputeCatchupSeqCeiling(): void {
+    const engine = this.engine;
+    if (engine) {
+      for (const key of [...this.catchupPendingSeqs.keys()]) {
+        if (!engine.pending.some((op) => serializeId(op.id) === key)) {
+          this.catchupPendingSeqs.delete(key);
+        }
+      }
+    }
+    const safeSeq =
+      this.catchupPendingSeqs.size === 0
+        ? this.catchupHighestSeqSeen
+        : Math.min(...this.catchupPendingSeqs.values()) - 1;
+    this.highestAppliedSeq = Math.max(this.highestAppliedSeq, safeSeq);
+  }
+
+  /**
+   * Phase 25 (DUR-06 fix) — LIVE-traffic-specific. Prunes `livePendingSeqs` of anything no
+   * longer in `engine.pending` (resolved, possibly as a side effect of a completely different,
+   * LATER live frame's own `drain()` cascade — crediting it into `liveConfirmedSeqs` at that
+   * point, since its own application is now proven), then walks `highestAppliedSeq` forward ONE
+   * SEQ NUMBER AT A TIME through `liveConfirmedSeqs`, stopping at the first number not (yet)
+   * proven. This NEVER jumps over an unexplained gap — see `liveConfirmedSeqs`'s own doc
+   * comment for why that distinction (vs. `recomputeCatchupSeqCeiling`'s "trust the jump")
+   * matters here specifically.
+   *
+   * Hand-traced (Phase 25, DUR-06 fix design review, INCLUDING a real regression caught by this
+   * fix's own first-pass test run — see the historical note in `highestAppliedSeq`'s own doc
+   * comment) against: a frame with mixed ready/buffered operations (correctly stops before the
+   * buffered one, never trusting the unexplained gap ahead of it); a later, unrelated frame
+   * resolving an earlier buffered operation via `drain()` (correctly walks forward past BOTH in
+   * one call, once every intervening seq number is individually proven); and a disconnect while
+   * something is still legitimately buffered (the discarded engine's own `pending` is
+   * irrelevant — `highestAppliedSeq` was never advanced past it, so the next HELLO correctly
+   * still requests it).
+   */
+  private advanceLiveSeqCeiling(): void {
+    const engine = this.engine;
+    if (engine) {
+      for (const [key, resolvedSeq] of [...this.livePendingSeqs]) {
+        if (!engine.pending.some((op) => serializeId(op.id) === key)) {
+          this.livePendingSeqs.delete(key);
+          this.liveConfirmedSeqs.add(resolvedSeq);
+        }
+      }
+    }
+    while (this.liveConfirmedSeqs.has(this.highestAppliedSeq + 1)) {
+      this.highestAppliedSeq += 1;
+      this.liveConfirmedSeqs.delete(this.highestAppliedSeq);
+    }
+  }
+
   private handleOps(seq: number, ops: Operation[]): void {
     const engine = this.engine;
     if (!engine) {
       return; // an OPS frame before handshake completes would be a server protocol violation — ignore
     }
     // "Client MUST: apply the operation anyway" (§3.7.5) — applying happens unconditionally,
-    // BEFORE any gap bookkeeping below, regardless of whether seq is contiguous.
-    for (const op of ops) {
-      engine.applyRemote(op);
+    // BEFORE any gap bookkeeping below, regardless of whether seq is contiguous. Phase 25
+    // (DUR-06 fix): the PER-OPERATION buffered result is now recorded too — see
+    // `liveConfirmedSeqs`'s own doc comment for why the frame's own claimed range can no longer
+    // be trusted wholesale.
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i]!;
+      const opSeq = seq + i;
+      const { buffered } = engine.applyRemote(op);
+      if (buffered) {
+        this.livePendingSeqs.set(serializeId(op.id), opSeq);
+      } else {
+        this.liveConfirmedSeqs.add(opSeq);
+      }
     }
     // As of Phase 16, `seq` is the STARTING seq of the range this frame occupies — a run/batch
     // of N operations consumes seq..seq+N-1 (documentCoordinator.ts's own doc comment explains
@@ -1133,7 +1433,11 @@ export class SyncClient {
     // alone here would make the gap tracker see every multi-operation frame as leaving a
     // "gap" of its own operations, which are not actually missing.
     const endSeq = ops.length > 0 ? seq + ops.length - 1 : seq;
-    this.highestAppliedSeq = Math.max(this.highestAppliedSeq, endSeq);
+    this.advanceLiveSeqCeiling();
+    // gapTracker's OWN semantics are UNCHANGED — stall detection only (hasStalled()), which
+    // correctly tolerates any forward jump regardless of buffering; see gapTracker.ts's own doc
+    // comment and `highestAppliedSeq`'s own doc comment above for why these two trackers are
+    // deliberately different values used for different purposes.
     this.gapTracker.observe(endSeq);
     this.persistMeta(); // batched (durableQueue.ts's 200ms trailing edge) — keeps meta.lastServerSeq reasonably fresh for a LATER crash, not just immediately post-snapshot
     // Reconnection off a stalled `gapTracker` is checked on the ping cadence (`startPingTimer`),
@@ -1167,6 +1471,35 @@ export class SyncClient {
   private notifyRemoteOpsApplied(): void {
     for (const listener of this.remoteOpsListeners) {
       listener();
+    }
+  }
+
+  private readonly localInsertRevertedListeners = new Set<(entry: RejectedEntry) => void>();
+
+  /**
+   * Phase 25 (Option 2 / R0012's own scoped mitigation) — subscribes to "a local insert this
+   * client already showed the user was just REVERTED, because the server explicitly rejected it
+   * and nothing else anchored to it yet (the 'clean' case — see `Engine.tryRevertLocalInsert`'s
+   * own doc comment)." Fired AFTER the document has already been corrected (`engine`'s own state
+   * no longer contains the reverted character, and `notifyRemoteOpsApplied` has already told the
+   * DOM layer to re-render) — purely so a caller can surface an honest, visible notification
+   * ("this edit couldn't be saved and was removed — here's the content if you want to reinsert
+   * it," per the user's own explicit wording) rather than leaving a silent, permanent visual lie
+   * on screen. Building that notification UI itself is disclosed, out-of-scope future work here
+   * — matching this exact project's own established precedent (Phase 24's own
+   * `offlineWindowStatus`/`rejectedCount` were built the same way: the real SyncClient-level
+   * capability now, a future UI phase wires it up). Returns an unsubscribe function.
+   */
+  onLocalInsertReverted(listener: (entry: RejectedEntry) => void): () => void {
+    this.localInsertRevertedListeners.add(listener);
+    return () => {
+      this.localInsertRevertedListeners.delete(listener);
+    };
+  }
+
+  private notifyLocalInsertReverted(entry: RejectedEntry): void {
+    for (const listener of this.localInsertRevertedListeners) {
+      listener(entry);
     }
   }
 

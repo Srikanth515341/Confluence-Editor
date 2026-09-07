@@ -41,6 +41,7 @@ import {
   operationToOpUndelete,
 } from "@collab-editor/protocol";
 import { toOperations } from "../ingest.js";
+import { maybeCrash } from "../testOnlyCrashInjection.js";
 import type { DbPool } from "./pool.js";
 
 /**
@@ -122,6 +123,23 @@ export interface WarmStartResult {
   readonly suffixOps: readonly WarmStartSuffixOperation[];
   /** `documents.current_seq` AFTER provisioning — the highest seq ever assigned for this document, including seq values "spent" on a resent duplicate that hit ON CONFLICT DO NOTHING (see commitOperations's own doc comment) and therefore left no row of their own. This, not `MAX(operations.seq)` or `ops.length`, is what a coordinator must resume numbering from — using either of those instead would eventually reissue an already-spent seq and crash on the operations table's own PRIMARY KEY the moment a genuinely new operation collided with it. */
   readonly currentSeq: bigint;
+  /**
+   * Phase 25 (found via DUR-03's own crash-injection test, not anticipated in advance): the
+   * NEXT replica id a freshly-restarted coordinator's `allocateReplicaId()` counter should
+   * hand out for this document — `MAX(sessions.replica_id) + 1` for this document, or `1` if
+   * no session row exists yet. Without this, a restarted coordinator's in-memory counter
+   * always restarts at 1 (`DocumentCoordinator`'s own field default), and the FIRST client to
+   * (re)join after a real restart could be allocated a replica id a STILL-EXISTING `sessions`
+   * row (from before the restart — session rows are permanent, Phase 16) already used for this
+   * SAME document, violating `sessions_replica_uq` the moment that new session's own first
+   * operation tries to auto-provision its session row inside `commitOperations` — a real bug,
+   * not merely a test-construction artifact, since a genuine server process restart resets
+   * this exact in-memory counter the exact same way. This does NOT persist replica-id
+   * allocation across a restart in general (a later phase's job, per CLAUDE.md's own
+   * documented gap) — it only guarantees the NEXT allocation after a restart can never
+   * collide with an already-used one for this document.
+   */
+  readonly nextReplicaId: number;
 }
 
 /** One row of `snapshots`, content only — audit.ts's bisect (Phase 18) only ever needs `content` for the byte comparison, never `structure`; a separate, lighter query than `warmStart`'s (which needs `structure` to seed an engine). */
@@ -368,6 +386,19 @@ export class PostgresOperationStore implements OperationStore {
       `SELECT current_seq FROM documents WHERE id = $1`,
       [documentId],
     );
+    // See WarmStartResult.nextReplicaId's own doc comment (Phase 25, DUR-03) for why this
+    // query exists at all: a freshly-restarted coordinator's in-memory replica-id counter must
+    // never re-hand-out a replica id a still-existing session row already used for THIS document.
+    // `replica_id` is BIGINT (sessions table, Phase 15) -- node-postgres returns bigint
+    // columns as STRINGS, never a JS number, to avoid silent precision loss; a real bug found
+    // here (not anticipated in advance) was treating this as already-numeric, which produced
+    // string concatenation ("30" + 1 -> "301") instead of arithmetic the moment a document's
+    // FIRST restart actually exercised this query against a real (non-null) MAX.
+    const { rows: replicaRows } = await this.pool.query<{ max_replica_id: string | null }>(
+      `SELECT MAX(replica_id) AS max_replica_id FROM sessions WHERE document_id = $1`,
+      [documentId],
+    );
+    const nextReplicaId = (replicaRows[0]?.max_replica_id ? Number(replicaRows[0].max_replica_id) : 0) + 1;
     return {
       snapshotNodes,
       snapshotSeq,
@@ -377,6 +408,7 @@ export class PostgresOperationStore implements OperationStore {
         committedAtMs: r.committed_at.getTime(),
       })),
       currentSeq: docRows[0] ? BigInt(docRows[0].current_seq) : 0n,
+      nextReplicaId,
     };
   }
 
@@ -593,6 +625,11 @@ export class PostgresOperationStore implements OperationStore {
         `UPDATE documents SET current_seq = GREATEST(current_seq, $2) WHERE id = $1`,
         [input.documentId, endSeq.toString()],
       );
+      // DUR-03 site (f) "inside the transaction, before COMMIT" — every row above has been
+      // written to this connection's own uncommitted transaction; a crash here means Postgres
+      // itself rolls the whole transaction back on connection loss, so nothing here is durable
+      // yet, matching the reference text's own framing of this site.
+      maybeCrash("beforeCommit");
       await client.query("COMMIT");
       return { insertedCount };
     } catch (err) {
@@ -684,7 +721,9 @@ export class InMemoryOperationStore implements OperationStore {
   // store, so a caller can never accidentally rely on this resolving synchronously just
   // because the test double happens to.
   async warmStart(_documentId: string): Promise<WarmStartResult> {
-    return { snapshotNodes: null, snapshotSeq: 0n, suffixOps: [], currentSeq: 0n };
+    // No real sessions table exists for this store (no real durability at all — see this
+    // class's own header) — always 1, since there is nothing that could ever collide.
+    return { snapshotNodes: null, snapshotSeq: 0n, suffixOps: [], currentSeq: 0n, nextReplicaId: 1 };
   }
 
   /** GC-relevant methods (Phase 21) — see this file's own header for why this store never has real durability. No sessions exist to query, so the frontier is always the coordinator's own current_seq-equivalent (0n here, since this store tracks no seq at all) — cold-load compaction's own COALESCE fallback shape, degenerately. */

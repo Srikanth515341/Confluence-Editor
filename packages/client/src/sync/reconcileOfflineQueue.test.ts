@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { Engine, type DeleteOperation, type InsertOperation } from "@collab-editor/engine";
-import { reconcileOfflineQueue, visibleIndexAfter, visibleIndexOfTarget } from "./reconcileOfflineQueue.js";
+import {
+  reconcileOfflineQueue,
+  visibleIndexAfter,
+  visibleIndexBefore,
+  visibleIndexOfTarget,
+} from "./reconcileOfflineQueue.js";
 
 describe("reconcileOfflineQueue (Phase 22) — the client-only 'no session resumption' resolution", () => {
   it("re-mints a single offline insert under the NEW engine's replica id, preserving content and position", () => {
@@ -36,14 +41,14 @@ describe("reconcileOfflineQueue (Phase 22) — the client-only 'no session resum
     const existingA = newEngine.nodes[0]!;
 
     // An offline op typed by the OLD engine, anchored right after 'A' (same identifier space —
-    // identifiers are globally stable, so this old op's originLeft genuinely matches the new
+    // identifiers are globally stable, so this old op's `parent` genuinely matches the new
     // engine's own 'A' node).
     const offlineOp: InsertOperation = {
       kind: "insert",
       id: { c: 99, r: 1 },
       value: 0x78, // 'x'
-      originLeft: existingA.id,
-      originRight: null,
+      parent: existingA.id,
+      side: "R",
       bind: false,
     };
 
@@ -94,6 +99,32 @@ describe("reconcileOfflineQueue (Phase 22) — the client-only 'no session resum
     const newEngine = new Engine(2);
     expect(reconcileOfflineQueue(newEngine, [])).toEqual([]);
   });
+
+  it("Fugue port (2026-09-05): a queued insert whose original `side` was \"L\" reconciles to a position BEFORE its anchor, not after — a real, hand-traced FugueTree.decidePlacement Case 2 scenario, not a hypothetical", () => {
+    // Construct a genuine side:"L" op via a real Engine: base "AC" (A parent:null side:R; C
+    // parent:A side:R, since C is appended after A). Inserting 'B' at visible index 1 (between
+    // A and C) hits FugueTree.decidePlacement's Case 2 — A already has a right child (C), so
+    // the new node attaches as C's own LEFT child: {parent: C.id, side: "L"}. Verified directly
+    // below (not assumed) before using it as this test's own fixture.
+    const source = new Engine(1);
+    const opA = source.localInsert(0, 0x41); // 'A'
+    const opC = source.localInsert(1, 0x43); // 'C' — appended after A
+    const opB = source.localInsert(1, 0x42); // 'B' — between A and C
+    expect(source.text()).toBe("ABC");
+    expect(opB.side).toBe("L");
+    expect(opB.parent).toEqual(opC.id);
+
+    // A fresh engine (a new SNAPSHOT/reconnect) already has "AC" under the SAME identifiers —
+    // only 'B' is the queued offline op being reconciled.
+    const newEngine = new Engine(2);
+    newEngine.applyRemote(opA);
+    newEngine.applyRemote(opC);
+    expect(newEngine.text()).toBe("AC");
+
+    const resent = reconcileOfflineQueue(newEngine, [opB]);
+    expect(resent).toHaveLength(1);
+    expect(newEngine.text()).toBe("ABC"); // landed BEFORE 'C', per its original side:"L" intent
+  });
 });
 
 describe("visibleIndexAfter / visibleIndexOfTarget — the position-resolution helpers", () => {
@@ -138,5 +169,33 @@ describe("visibleIndexAfter / visibleIndexOfTarget — the position-resolution h
     engine.localInsert(0, 0x61); // 'a' — visible index 0
     const b = engine.localInsert(1, 0x62); // 'b' — visible index 1
     expect(visibleIndexOfTarget(engine, b.id)).toBe(1);
+  });
+});
+
+describe("visibleIndexBefore — the side:\"L\" position-resolution helper (Fugue port, 2026-09-05)", () => {
+  it("resolves to the anchor's own visible index (insert lands immediately before it)", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, 0x61); // 'a' — visible index 0
+    const b = engine.localInsert(1, 0x62); // 'b' — visible index 1
+    engine.localInsert(2, 0x63); // 'c' — visible index 2
+    expect(visibleIndexBefore(engine, b.id)).toBe(1); // inserting here lands right before 'b'
+  });
+
+  it("excludes a tombstoned anchor from the count, same as visibleIndexAfter's own tombstone handling", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, 0x61); // 'a'
+    const b = engine.localInsert(1, 0x62); // 'b'
+    engine.localDelete(1, 1); // delete 'b' — now tombstoned
+    expect(engine.text()).toBe("a");
+    // "insert right before b" should resolve to visible index 1 (a is still visible and counts;
+    // b itself, now tombstoned, contributes nothing) — i.e., right after 'a', where 'b' used to
+    // start.
+    expect(visibleIndexBefore(engine, b.id)).toBe(1);
+  });
+
+  it("falls back to 0 for a genuinely nonexistent anchor", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, 0x61);
+    expect(visibleIndexBefore(engine, { c: 999, r: 999 })).toBe(0);
   });
 });

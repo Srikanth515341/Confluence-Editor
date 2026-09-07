@@ -4915,9 +4915,1131 @@ check:purity` was ALSO silently broken by two comments (one in
   scope (RC-30's scenario has the client already reconnected by the
   time rejection fires).
 
+## 🛑 CRITICAL, OPEN, UNRESOLVED FINDING — READ THIS FIRST (2026-09-05)
+
+**The core convergence guarantee is currently known to be BROKEN under
+ordinary, non-adversarial real-world use — not just under fault
+injection.** Phase 25's DUR-05/06 DoD verification found a real, severe
+bug in `Engine.integrate()` (`packages/engine/src/engine.ts`), root-caused
+across FOUR permanent regression fixtures — `tests/regression/R0008`,
+`R0009`, `R0010`, `R0011` — the last of which (R0011) reproduces with
+**zero duplication, zero reordering, zero drops** — pure, ordinary
+per-sender-FIFO network delivery to 4 replicas, differing only in
+ordinary, unavoidable per-peer latency variance, is sufficient to trigger
+either a thrown structural-sanity canary or (confirmed separately, via an
+independent hand-trace against production Yjs's own real source) a
+**silent, undetected document divergence with no crash and no signal at
+all**.
+
+**Status of the investigation, in order**:
+1. R0008 and R0009 (Phase 20) were each fixed with a targeted rank-check
+   patch to this project's own hand-derived Case A/B/C scan.
+2. R0010 (Phase 25 pivot) found a THIRD, structurally distinct gap in
+   that same hand-derived scan — not a per-branch omission but a
+   violation of TRANSITIVITY (two nodes never directly compared can end
+   up in opposite relative order on different replicas). Given three
+   bugs in the same family, the scan was REPLACED OUTRIGHT with a
+   faithful port of the real, published, peer-reviewed YATA algorithm
+   (Kleppmann; verified directly against Sypytkowski's reference
+   implementation source). This fix was verified via 70,000+ convergence
+   fuzz seeds (all 7 configs, zero divergences), all 22 adversarial
+   cases, the full property suite, the PositionIndex cross-check, and a
+   mutation matrix that went from 9/10 to 10/10 kills.
+3. R0011 (same day) found that even the real YATA port still exhibits
+   the identical transitivity defect, and — critically — does NOT
+   require any fault injection to reach it at all, only ordinary network
+   latency variance between independent peers. A SEPARATE, independent
+   hand-trace of production Yjs's own actual `Item.js` source (fetched
+   directly from https://github.com/yjs/yjs, not recalled from memory)
+   confirmed Yjs's real, shipped algorithm has the SAME defect — it
+   fails silently (no crash) rather than throwing, which is worse.
+4. **Why this was never caught by this project's own 70,000+-seed
+   convergence fuzz suite**: none of the 7 fuzz configs (C1-C7) model
+   the delivery pattern R0011 needs — independent, per-TARGET delivery
+   latency (the same broadcast operation reaching different peers at
+   different points in each peer's own local timeline). C1-C6 use one
+   global end-of-trial shuffle; C7 (added specifically to close
+   R0008/R0009's own gap) broadcasts to every peer immediately and
+   synchronously. This is a real, load-bearing gap in this project's
+   own primary safety net, not just in the algorithm.
+5. Given FOUR distinct failures found across the SAME algorithm family
+   (this project's own hand-derived scan, AND the real, published YATA
+   algorithm, AND production Yjs's own actual shipped code), the
+   decision was made to STOP patching YATA-family algorithms and
+   seriously investigate Fugue (Weidner & Kleppmann, "The Art of the
+   Fugue: Minimizing Interleaving in Collaborative Text Editing",
+   arXiv:2305.00583) as of 2026-09-05.
+
+**FUGUE INVESTIGATION RESULT (2026-09-05): Fugue passes all four
+regression cases plus RFC NQ-2, verified via a faithful port of the
+paper author's own real reference implementation** (fetched directly
+from `https://raw.githubusercontent.com/mweidner037/fugue/main/fugue-simple/src/index.ts`
+— Weidner's own repo, the `fugue-simple` package — not recalled from
+memory or reconstructed from the paper's prose alone; stripped only of
+`@collabs/collabs` framework plumbing (`CPrimitive`/`InitToken`/
+`MessageMeta`/gzip save-load), with the `Tree`/`insert`/`delete`/
+`addNode`/`traverse` algorithm kept byte-for-byte):
+  - **R0008**: all 24 delivery-order permutations (buffered on missing
+    causal dependencies, same discipline as `Engine.applyRemote`'s own
+    `pending`/`drain`) converge to `"it"`.
+  - **R0009**: all 6 delivery orders converge to `"pit"` (a different
+    literal string than the YATA port's own `"itp"` — expected and
+    harmless, since Fugue's tie-break rule differs from YATA's; what
+    matters is that it is the SAME string every time).
+  - **R0010**: out-of-FIFO delivery to the reordered replica converges
+    to the identical text (`"ghdfec"`) as natural in-order delivery.
+  - **R0011 (the highest-priority case — the one requiring NO fault
+    injection at all)**: full 4-replica closure, replaying the exact
+    same mint/delivery sequence that broke both this project's YATA
+    port and production Yjs, converges to the IDENTICAL text
+    (`"doibgahj"`) on all 4 replicas, with zero throws anywhere.
+  - **RFC NQ-2** (the original non-interleaving motivation for moving
+    away from a naive scan): backward-typed concurrent runs from two
+    replicas stay fully contiguous and converge identically
+    (`"cbazyxX"`), matching this project's own existing worked trace.
+
+**Structural reason Fugue avoids this whole defect family, confirmed by
+reading its algorithm, not just its results**: unlike YATA (and this
+project's own prior hand-derived scan), a Fugue node's `parent`+`side`
+are decided ONCE, at creation, and NEVER RECOMPUTED — there is no
+"scan window between two origins" that must be re-resolved against
+CURRENT positions on every `integrate()` call. A new node's placement
+depends on exactly ONE existing reference point's own (monotonically
+growing, never-invalidated) child structure, never on the CURRENT
+relative position of two SEPARATELY-tracked origin nodes. The total
+order is a pure function of fixed parent/side/sibling-order
+relationships (in-order tree traversal), which by construction can
+never invert, because there is no pair of "boundary" identifiers whose
+resolved positions could drift out of relative order the way YATA's
+recomputed `leftIndex`/`rightIndex` (or Yjs's own live-pointer walk,
+independently confirmed to have the identical defect) can.
+
+**UPDATE (2026-09-05, later the same day): the real Fugue port has now
+been MERGED into `engine.ts` and the surrounding engine/testkit code —
+this is no longer a gated scratch verification, it is the live
+algorithm.** Full file-by-file account:
+
+- **`packages/engine/src/node.ts`/`operation.ts`**: `originLeft`/
+  `originRight` replaced with `parent: Identifier | null` + `side: "L" |
+  "R"` on both `Node` and `InsertOperation`. This is a wire-shape change
+  (disclosed, out-of-session-scope ripple into `packages/protocol`'s
+  `snapshotBody.ts`/block codec, which still references the retired
+  `Block`/`originLeft`/`originRight` shapes and will not typecheck until
+  a future phase redesigns them for a tree structure).
+- **`packages/engine/src/fugueTree.ts`** (new): the real `FugueTree`
+  class — ported from the same real reference source cited above —
+  `attach`/`decidePlacement`/`setDeleted`/`nodeAtVisible`/`toArray`/
+  `remove` (Phase 21's GC primitive, throws on a node with surviving
+  children). `siblingRank(n) = [n.bind ? 0 : 1, n.id.r]` is the Engine
+  Spec I8 substitution, verified against the real ADV-17 test.
+- **`packages/engine/src/engine.ts`**: fully rewritten around
+  `FugueTree` — `integrate()`/`rank()`/`compareRank()` no longer exist
+  in any form; `ready()` now checks a single `parent` dependency;
+  `collect()` (Phase 21 GC) restated as a single-reference fixpoint,
+  physical removal now an iterative leaves-first loop calling
+  `tree.remove()`.
+- **`packages/engine/src/invariants.ts`**: I2/I4/I6/I8 restated in terms
+  of `parent`/`side`; the I2 block-split carve-out (Phase 20) is gone —
+  Fugue's `parent` is truly, permanently immutable.
+- **Retired outright** (deleted, not adapted — Fugue's tree structure has
+  no field-rename-compatible analogue): `positionIndex.ts` + both its
+  test files (Phase 19), `block.ts`/`block.test.ts` (Phase 20),
+  `packages/testkit/src/benchmark/compression.ts`/`.bench.test.ts`
+  (Phase 20). `packages/engine/src/index.ts` no longer exports
+  `Block`/`canFollowInBlock`/`decodeBlock`.
+- **A real bug found and fixed during this merge, via the project's own
+  I4 invariant firing**: `FugueTree`'s root sentinel node
+  (`{c:0,r:0}`) was leaking through as a real parent identifier instead
+  of `null`, because the original free-function `toPublicNode` couldn't
+  compare against `this.root`. Fixed by making it a private class
+  method with `this.root` in scope. Caught immediately by
+  `engine.test.ts`'s GC tests throwing `I4 violated: node 1:1's parent
+  0:0 is not present`.
+- **A real, severe, DISCLOSED performance finding, NOT a bug in the
+  translation**: the real reference implementation's `updateSize()`
+  walks every ancestor on each `attach()` call. Sequential typing (the
+  most common real editing pattern) builds a maximally unbalanced,
+  deep right-child chain, giving O(N) per insert / O(N²) total —
+  measured directly (0.031ms/op at N=500 → 0.069ms/op at N=4000, growing
+  per-op cost confirming quadratic total cost). **Per the user's explicit
+  direction, this is EXPLICITLY DEFERRED to its own future dedicated
+  session** — a balanced-storage/treap-backed redesign that decouples
+  Fugue's placement DECISION from its STORAGE/QUERY layer. Two
+  90,000-node pathological GC-chain tests in `engine.test.ts` and
+  `gcSafetyCap.bench.test.ts`'s own test are `it.skip`'d with detailed
+  disclosure comments citing this measurement — not silently reduced or
+  hidden.
+- **Mutation matrix redesigned, honestly, not force-fit**:
+  `M2_no_right_bound`/`M3_no_case_c` (Test Plan §2.8's original mutants)
+  targeted the retired YATA scan's own window-bookkeeping, which Fugue
+  has no analogue of — both are explicitly OMITTED from
+  `packages/testkit/src/mutation/mutants.ts`'s `MUTANTS` array (with a
+  header comment explaining why), not invented under this project's own
+  authority. The other 8 were re-derived/retargeted (M1/M4 →
+  `fugueTree.ts`'s `siblingRank`; M7 renamed `M7_no_readiness_check`,
+  since Fugue's `ready()` has only one dependency to drop, not one of
+  two; M5/M6/M8/M9/M10 mechanically retargeted). **Result: 8 of 8
+  mutants killed, no survivors** — confirmed via a real run of
+  `pnpm test:mutation` (task `bw33e7jr1`, 85.4s wall time, exit 0).
+  `generateReport.ts`'s MUT-KILL-01 section had a stale hardcoded
+  message assuming M3 always exists; fixed to check for its absence and
+  print an accurate explanation instead.
+
+**Verification completed so far, against the REAL merged `engine.ts`**
+(all at whatever scale is safe for the O(N²) reference algorithm, per
+the user's explicit "cap the scale, say so explicitly" instruction —
+correctness-first, balanced-storage redesign deliberately deferred to
+its own session): `packages/engine`'s own test suite (38/38, 2 disclosed
+skips), R0008/R0009/R0010/R0011 all re-verified exhaustively against the
+real merged engine, `pnpm test:adversarial` (22/22), `pnpm
+test:properties` (6/6), `pnpm test:mutation` (8/8 killed as above).
+
+**RESOLVED (2026-09-05, later still the same day): every remaining
+verification item is now confirmed against the real, merged
+`engine.ts`.**
+1. `pnpm test:convergence` (all 7 configs, full 10,000-seed-per-config
+   budget, 70,000 total) — ran to completion: **70,000/70,000 seeds
+   converged, zero divergences, zero stuck-pending, zero errors, across
+   all 7 configs** (74.3 minutes wall time — notably slower than the
+   pre-Fugue baseline of ~34-45 minutes for the same seed count, an
+   expected, disclosed consequence of the tree's per-operation
+   allocation/ancestor-walk overhead described above, not a correctness
+   concern).
+2. `fugueTree.crosscheck.test.ts` — re-run in genuine isolation (machine
+   confirmed at 0 running `node.exe` processes beforehand) once the
+   convergence job above finished: **passes cleanly, 3,000/3,000 seeds,
+   zero disagreements** with the independent linear-scan oracle, in
+   83.4s. The two earlier "Worker exited unexpectedly" crashes are
+   RETRACTED as a genuine bug or resource-contention finding — both were
+   an artifact of this session's own diagnostic tooling: the first
+   confirmed run used a `timeout 60` wrapper that killed the vitest
+   worker before it could finish (this test genuinely takes ~85s under
+   Fugue's real per-op overhead, not the few seconds a flat-array
+   comparison would take), which Tinypool then reported as "Worker
+   exited unexpectedly" — a symptom of the forced kill, not an
+   independent crash. Recorded here explicitly per this project's own
+   "retract a claim on direct challenge rather than let it stand"
+   discipline (Phase 14's own precedent).
+3. `pnpm test:mutation` re-run once more after the `generateReport.ts`
+   fix (a separate run, task `bw33e7jr1`'s own output predates that fix)
+   to confirm the regenerated `docs/mutation-matrix.md` now prints the
+   correct M2/M3-omission explanation rather than the old stale
+   "M3_no_case_c was killed by another suite" text: **confirmed correct
+   in the freshly regenerated file** — 8/8 mutants killed, MUT-KILL-01's
+   section now reads "Not applicable as of the Fugue port... Both
+   mutants are currently OMITTED," and the Summary section carries the
+   explicit omission line.
+
+**Every item from the user's own verification checklist (all 22
+adversarial cases, all worked traces, all 5 property suites, R0008-R0011
+exhaustive coverage, the full 70,000-seed convergence suite, the full
+mutation matrix, the Phase 19/20-equivalent structural cross-check) is
+now confirmed passing against the real, merged `engine.ts`.** The
+balanced-storage/O(log N) performance redesign remains real, necessary,
+explicitly deferred follow-up work for its own dedicated future
+session — not a blocker to this investigation's own correctness
+conclusion. Full technical detail, hand-traces, and citations: the four
+regression fixtures above.
+
+## ✅ PHASE 25 UPDATE (2026-09-06) — Item 1 fixed, DUR-06 root-caused and fixed, six real bugs found and fixed in one continuous session
+
+This entry picks up exactly where the 2026-09-05 session left off (Item 1
+above), and covers the full chain of investigation that followed, in
+order. It does not replace anything in the sections above — R0008/R0009/
+R0010/R0011 and the Fugue migration are unchanged and remain the
+authoritative account of that part of the story. This entry is the
+continuation: what happened once integration work resumed on top of the
+newly-merged Fugue engine.
+
+**Six distinct, real bugs were found and fixed across this investigation,
+in the order discovered:**
+
+### Bug 1/2 — R0008/R0009 (Case B/C rank-check gaps) and R0010/R0011 (transitivity violation → the Fugue migration)
+
+Already fully documented above (the "🛑 CRITICAL, OPEN, UNRESOLVED
+FINDING" and "Engine Spec §4.3 replaced by the real YATA algorithm"
+sections). Listed here only for completeness of the chronological
+account — no new information, cross-referenced rather than repeated.
+
+### Bug 3 — Item 1's own integration breakage (`packages/protocol`/`server`/`client` never updated for `parent`/`side`)
+
+Confirmed and fixed as the very first task of this session. Every call
+site that still referenced the retired `originLeft`/`originRight` shape
+(`wireHelpers.ts`, `syncClient.ts`, `expand.ts`, `snapshotBody.ts`/
+`snapshotSeed.ts`, and their respective test fixtures) was updated to the
+real `parent`/`side` shape. `snapshotBody.ts`'s block run-length wire
+format — which had no Fugue-tree analogue at all (Item 5 in the section
+below) — was genuinely redesigned, not merely renamed, for a tree
+structure. Verified: `pnpm typecheck` clean across all 6 packages;
+`pnpm test` passing in full (the 64/407 failures documented in Item 1
+below are gone). This item is **RESOLVED** — see the updated Item 1
+status in the open-items list below.
+
+### Bug 4 — `writePath.ts` ignored `Engine.applyRemote`'s `{buffered: true}` return, violating "acknowledgement implies durability"
+
+This is DUR-06's actual server-side root cause, found and fixed BEFORE
+the client-side seq-tracking mirror fix (Bug 7 below) — the client fix was
+always described as "mirroring an earlier server-side writePath.ts fix,"
+and this is that fix, now fully documented. `Engine.applyRemote()` can
+report an operation as buffered — its causal dependency hasn't arrived
+at the SERVER yet (e.g. a concurrently delayed/dropped peer operation
+under DUR-06's own fault rates). Before this fix, `processIncomingOperation`
+ignored that return value entirely: it broadcast, assigned a seq to,
+committed, and acked the operation regardless — handing peers an
+operation whose own dependency the SERVER ITSELF didn't have yet, with a
+`coordinator.currentSeq` that had already raced ahead of it. If that
+dependency was later permanently dropped, this became a permanent
+orphan, and even when the dependency arrived shortly after, a seq
+reserved for a not-yet-integrated operation broke CATCHUP's own
+`seq > lastServerSeq` contract for anyone querying that range in the
+gap.
+
+**Fix**: `processIncomingOperation` now branches on whether every
+operation in the incoming message applied cleanly AND no OTHER,
+previously-buffered operation resolved as a side effect of this
+message's own `Engine.drain()`. The common case (`runFastPath`) is
+byte-for-byte the previously-existing code. The new `runSlowPath`
+assigns seq LAZILY, only at the moment an operation is actually
+finalized (never reserved up front for something still sitting in
+`engine.pending`); records a delete's GC context (Phase 21, Engine Spec
+§7.3) via the new `Engine.setDeleteContext()` at that same moment (seq
+isn't known at `applyRemote` time under this design); recovers a
+side-effect-resolved operation's ORIGINAL sender identity via a new
+`DocumentCoordinator.pendingOpOrigin` map (populated the instant
+`applyRemote` reports `buffered: true`, since the session handling a
+LATER message has no other way to know whose earlier operation just
+finalized); and broadcasts/commits/acks each finalized operation
+individually, since a mixed-readiness batch has no single compact
+run/batch wire shape left to relay.
+
+### Bug 5 — a real out-of-order-commit race, found via the `InMemoryOperationStore`-backed DUR-05/06 tests while hand-tracing Bug 4's own fix (the `enqueueCommit`/`lastCommittedSeq` fix)
+
+Note on naming: this is the bug referred to elsewhere as "the
+`InMemoryOperationStore` commit-ordering bug" — the race is not in that
+store's own internal logic (its `commitOperations` is a synchronous
+array push with no `await` inside it at all) but in what surfaces
+THROUGH it: `processIncomingOperation`'s own `await` on ANY store's
+`commitOperations` call — including an already-synchronously-resolved
+one — still yields to the microtask queue at that point, so two
+overlapping `processIncomingOperation` calls for the same document can
+still have their POST-await continuations run in a different order than
+their seq-reservation order. This is exactly what the DUR-05/06 tests
+(which use `InMemoryOperationStore`) surfaced. The fix below applies at
+the `DocumentCoordinator` level and protects correctness regardless of
+which store is used underneath.
+
+Hand-tracing Bug 4's fix for two-author interleaving surfaced this
+second, related gap: nothing previously prevented two concurrent
+`processIncomingOperation` calls (for the SAME document) from reserving
+seq ranges in one order but completing their own `commitOperations` awaits
+in the OPPOSITE order — Node's single-threaded synchronous seq-reservation
+step guarantees reservation order, but the actual database commit is
+awaited, and two overlapping awaits can resolve in either order. A
+reconnecting client's CATCHUP is built from `documents.current_seq`
+(or, after Bug 4's fix, the analogous "highest reserved" value), so a
+client could be told its CATCHUP delta goes all the way through seq N
+when the row for some seq M < N genuinely hasn't committed yet — a
+permanently, silently skipped operation, no error, no signal.
+
+**Fix**: `DocumentCoordinator.enqueueCommit(endSeq, fn)` — a per-document
+FIFO promise chain that serializes EVERY `commitOperations` call for that
+document, so commit EXECUTION order is always identical to commit
+RESERVATION order regardless of how many concurrent messages interleave
+or which write-path branch (fast or slow) they take. A new
+`DocumentCoordinator.lastCommittedSeq` field (updated only on the
+`enqueueCommit` queue's own success continuation, deliberately never via
+`Math.max`, since the queue's strict ordering already guarantees
+monotonically increasing values) is what `handshake.ts`'s
+`buildCatchupMessages` now reads for CATCHUP's own `toSeq` bound — never
+raw `currentSeq` — so CATCHUP can only ever promise a reconnecting client
+what has actually, durably committed, never what merely has a seq number
+reserved for it. On a commit failure, `lastCommittedSeq` is deliberately
+left exactly where it was (not advanced), matching writePath.ts's own
+pre-existing "no ack for a commit that failed" reasoning — this makes
+CATCHUP's own promise honest about a real, already-accepted risk, rather
+than introducing a new failure mode.
+
+### Bug 6a — a replica-id-reuse-after-restart bug, found via DUR-03's own crash-injection test
+
+Not anticipated in advance — found by DUR-03's own "restart, then
+reconnect every client" step (see the DUR-02/03/M8-a/M8-e status
+paragraph below for that file's own scope): a freshly-restarted `DocumentCoordinator`'s in-memory
+`allocateReplicaId()` counter always restarts at 1, but `sessions` rows
+are permanent (Phase 16) and never deleted — so the first client to
+(re)join after a real restart could be handed a replica id a
+still-existing `sessions` row for that SAME document already used before
+the restart, violating `sessions_replica_uq` the moment that new
+session's first operation tried to auto-provision its own session row.
+**Fix**: `WarmStartResult` gained `nextReplicaId` (`MAX(sessions.replica_id)
++ 1` for the document, or `1` if no session row exists yet), computed
+during warm start and used to seed the coordinator's counter after a
+restart — guaranteeing the next allocation can never collide with an
+already-used one for this document. (This does not persist replica-id
+allocation across a restart in general, only protects the boundary
+case — a still-disclosed gap, unchanged from before.)
+
+### Bug 6b — a bigint-as-string arithmetic bug, found while building Bug 6a's own fix
+
+`sessions.replica_id` is `BIGINT` (Phase 15 schema); `node-postgres`
+returns `BIGINT` columns as JavaScript strings, never numbers, specifically
+to avoid silent precision loss. The first version of the `nextReplicaId`
+query treated the returned `MAX(replica_id)` as already numeric and added
+1 to it directly — producing STRING CONCATENATION (`"30" + 1 → "301"`)
+instead of arithmetic, the instant any document's first restart actually
+exercised this query against a real, non-null `MAX`. Fixed by an explicit
+`Number(...)` conversion before the arithmetic.
+
+### Bug 7 — the client-side seq-tracking bug (`SyncClient`'s TCP-cumulative-ack redesign)
+
+The client-side mirror of Bug 4, described in full in this session's own
+prior turns and unchanged here: `SyncClient`'s tracked `lastServerSeq`
+(HELLO's own field, driving CATCHUP's `fromSeq` on the next reconnect)
+was advancing to a frame's claimed seq range regardless of whether every
+operation in that frame actually applied (`Engine.applyRemote` returning
+`buffered: true` client-side, the same class of gap as Bug 4's
+server-side version). Fixed via a TCP-cumulative-ack-style design:
+separate CATCHUP-path (`catchupPendingSeqs`/`catchupHighestSeqSeen`/
+`recomputeCatchupSeqCeiling()`, a "trust the jump" ceiling — CATCHUP is
+durable-log-driven, so a jump is never itself suspect) and LIVE-path
+(`liveConfirmedSeqs`/`livePendingSeqs`/`advanceLiveSeqCeiling()`, a
+strict one-at-a-time contiguous walk requiring ACK-based crediting for a
+self-authored gap) tracking, plus a `handshakeGeneration` guard against a
+stale `handshakeGate` continuation racing a newer reconnect. Verified via
+a dedicated new regression file, `syncClient.appliedSeqCeiling.test.ts`
+(3/3 passing, covering mixed readiness within one frame, drain-side-effect
+resolution, disconnect-while-buffered, and a stale-handshake-generation
+guard).
+
+### Bug 8 — the wire-protocol run-coalescing bug (`operationsToRunMessages`)
+
+The final piece, closing DUR-06's remaining ~50% permanent-stall rate
+after Bugs 4-7 had already fixed the seq-ceiling/commit-ordering side of
+the investigation. `operationsToRunMessages` (`wireHelpers.ts`) coalesced
+consecutive insert operations into one `OP_INSERT_RUN` using ONLY
+`ops[j].bind === ops[i].bind` as its grouping condition — never verifying
+the actual parent-chain relationship `expandInsertRun`'s decoder hardcodes
+for every run member after the first (`parent === previous.id && side ===
+"R"`). That relationship genuinely holds for this function's ORIGINAL
+caller (`SyncClient.localInsertText`'s synchronous typing burst — proven
+by tracing `FugueTree.decidePlacement`: the left-origin at each
+subsequent position is always the just-minted previous character, which
+always has zero right-children at that instant) but was never guaranteed
+for its Phase 24 caller, `operationsToWireMessages`, used by
+`finishHandshakeAfterAlreadyHave` to coalesce `reconcileOfflineQueue`'s
+independently re-anchored reconciliation resends. Two reconciled inserts
+sharing consecutive counters (inevitable — same engine, minted back to
+back) and the same `bind` flag (near-certain for ordinary text) were
+wrongly coalesced into one run, silently discarding every operation after
+the first's true `parent`/`side` on the wire — genuine field-level node
+corruption, requiring NO fault injection, delay, duplication, or
+reordering to reach (any client reconnecting with 2+ unacked inserts that
+don't happen to form a true chain triggers it).
+
+**Fix**: `operationsToRunMessages` now requires a genuine chain (`next.bind
+=== prev.bind && next.side === "R" && next.parent` matches `prev.id`,
+plus explicit counter-contiguity as a belt-and-suspenders check) between
+EVERY adjacent pair before coalescing, falling back to individual
+`OP_INSERT` messages at any break. Hand-traced against three specific
+concerns before implementation (all confirmed sound): (1) both call
+sites — the original synchronous-typing-burst caller is provably
+unaffected (the chain always holds there); (2) a mid-batch chain break
+splits correctly into multiple runs/individual messages via the natural
+behavior of a greedy left-to-right scan, never over-merging or
+degrading to all-individual from one break; (3) wire efficiency for the
+common path is unchanged (a 2,000-character paste still coalesces into
+exactly one frame). New permanent regression tests in
+`wireHelpers.test.ts` (the corruption case, now fixed; a genuine-chain
+case; a partial-break case; a wire-efficiency-unregressed case).
+
+### Full verification (2026-09-06), all against the real, fully-integrated codebase
+
+- `pnpm typecheck`: clean across all 6 packages.
+- `pnpm test`: **417/417 passing**, 45 files, 2 disclosed skips (the
+  deferred O(N²) GC-chain tests, unchanged).
+- `pnpm test:reconnection`: **35/36 passing** — the 1 failure (RC-27's
+  own 20-repeated-reconnection p95 timing stress test) is a **pre-existing
+  flake, not a regression from any of today's fixes**: the identical
+  failure signature (`waitForState: timed out after 10000ms waiting for
+  "synced"`) occurred in this session's very FIRST `pnpm test:reconnection`
+  run, before any code was touched today. Re-confirmed via two further
+  isolated re-runs (no concurrent load) — both still failed, alternating
+  between `waitForState` and `waitForTextLength` timeouts at different
+  points within the 20-iteration loop, consistent with a real-timing flake
+  under sustained load (plausibly compounded by the already-disclosed,
+  already-deferred Fugue O(N²) sequential-insertion cost — see Item 3
+  below), not a deterministic logic bug. Every other cell in the 27-cell
+  matrix, plus RC-28/33/34, passed cleanly, both before and after today's
+  fixes.
+- **DUR-06: 10/10 clean runs** (1 initial + 7-run loop + 2 post-cleanup
+  runs), each completing in 6-14 seconds — a complete reversal from the
+  ~50% permanent-stall rate this investigation started from. DUR-05: 2/2
+  clean.
+- Temporary DUR-06 diagnostic instrumentation (the `reconnectAttemptLog`,
+  node-set/deleted-flag/base64-text/field-level comparison blocks) removed
+  from `adverseNetwork.test.ts`; the temporary 700s test-timeout bump in
+  `vitest.adverseNetwork.config.ts` reverted to 400s.
+
+**Item 1 and Item 2 from the 2026-09-05 open-items list below are both
+RESOLVED as of this session** — see the updated list.
+
+**DUR-02/DUR-03/M8-a/M8-e status, reviewed but deliberately NOT executed
+this session** (per explicit user instruction — picking these up fresh
+next session): all four already exist as complete, real implementations
+in the working tree, not partial/scaffolded work —
+`packages/server/src/db/dur02LedgerReconciliation.db.test.ts` (a real
+12,000-operation, 4-client ledger-reconciliation test against a real
+Postgres instance, with all three DUR-02 assertions implemented
+verbatim); `packages/server/src/db/dur03CrashInjection.db.test.ts` (100
+repetitions across all 10 named crash sites, using the real
+`testOnlyCrashInjection.ts` registry — confirmed genuinely wired into
+`writePath.ts`/`operationStore.ts`/`snapshotter.ts`/`gcScheduler.ts`, not
+merely defined and unused); `packages/server/src/db/soak.db.test.ts`
+(M8-e, an honestly-disclosed scoped-down 30,000-operation soak in place
+of the reference text's 24h/10^6-op target, with the reduction's
+rationale documented in the file's own header, matching this project's
+established disclosure convention); and
+`packages/testkit/src/benchmark/finalMemoryLatency.bench.test.ts` (M8-a,
+memory before/after Phase 21's real GC plus `applyRemote` apply-latency
+on the post-GC document, both against a real `Engine`). All four appear
+ready to execute as-is; none were run this session per the user's
+explicit instruction to pick this up in a fresh session instead.
+
+## ⚠️ CRITICAL FINDING #2 — PARTIALLY ADDRESSED (found 2026-09-06, Option 2 fix shipped same day; Option 1 explicitly deferred)
+
+**A live, continuously-connected client's ORDINARY keystroke can anchor
+to a node the server has already garbage-collected, integrating content
+locally that the server will never accept — no reconnection, no offline
+queueing, no fault injection of any kind required.** Found while
+investigating a Phase 25 M8-e soak-test failure
+(`packages/server/src/db/soak.db.test.ts`: `coordinator.engine.pending.
+length` was 1,400, not 0, after 30,000 real operations), then explicitly
+generalized beyond that test's own simplified harness per direct
+challenge from the user before this was allowed to be treated as "just a
+test-fixture gap."
+
+**STATUS, stated precisely — read before assuming this is either "open"
+or "closed":** the underlying RACE itself is **NOT eliminated** — a live
+client can still mint an operation anchored to a node the server has
+since collected; that has not changed and is not something Option 2
+touches. What HAS shipped, the same day, is a fix to the RACE'S OWN WORST
+CONSEQUENCE: this used to be **silent and permanent** (the affected
+user's own document showed content forever that no other replica would
+ever see, with no indication anything was wrong). As of the Option 2 fix
+below, in the common case (nothing else anchors to the affected content
+yet when the rejection arrives), the client's own engine now genuinely
+**reverts** the rejected insert and the user is told about it — the
+divergence becomes bounded (up to the ~30s rejection latency) and
+visible/recoverable, not silent and permanent. **The "cascading" case
+(something was typed right after the rejected content before the
+rejection arrived) is UNCHANGED — still a real, silent, permanent
+divergence for that specific content, exactly as before.** The
+structural fix that would eliminate the race entirely (Option 1, below)
+is explicitly deferred to its own dedicated future session — **do not
+treat this finding as fully closed.**
+
+**Full permanent regression fixture**: `tests/regression/
+R0012-2026-09-06-live-client-anchors-server-collected-tombstone.json`
+(fully satisfies Test Plan §2.3 Rule 3 — a complete, deterministic,
+5-operation stream, no timing/randomness needed) plus a permanent,
+automated test, `packages/engine/src/regressionR0012.test.ts` (already in
+the default `pnpm test` suite — currently asserts the BUG's own behavior
+deliberately, so that a future fix changes its final assertions as a
+visible, reviewed diff, never a silently-fixed gap nobody notices).
+
+**The mechanism, in brief** (full account in the R0012 fixture and in
+this session's own transcript):
+1. Client and server converge on ordinary content. A character is
+   deleted (fully ordinary). The server eventually GC-collects that
+   tombstone once the stability frontier and undo-horizon conditions are
+   met (RFC's own undo-horizon default, 5min/200-ops-per-replica, is
+   EXPLICITLY flagged in the RFC as "unvalidated" — a heuristic delay,
+   never a structural safety proof).
+2. GC's own condition 3 ("nothing live still anchors this") is checked
+   purely against the SERVER's current tree — it is structurally BLIND to
+   operations a client has not yet minted or sent. This is not a bug in
+   `collect()` itself; `collect()` is correct given what it can see.
+3. No client ever runs its own GC, and the server never tells a client
+   "I collected this" — so the client's own local tree keeps the
+   tombstoned node forever, completely unaware anything changed
+   server-side.
+4. `FugueTree.decidePlacement`'s own `leftmostDescendant` branch (used by
+   ordinary `Engine.localInsert()` — the exact call every live keystroke
+   makes) performs NO `deleted` check. It can select that now-collected,
+   still-locally-present tombstoned node as a brand-new operation's own
+   `parent` — this is completely ordinary, expected Fugue behavior in
+   isolation; nothing wrong with `decidePlacement` on its own either.
+5. The client's own engine integrates this new operation SYNCHRONOUSLY at
+   mint time (fundamental to this whole project's real-time-feel design
+   since Phase 3/10) — the user sees their own edit succeed immediately,
+   permanently, with no network round trip required.
+6. The operation reaches the server; `applyRemote` finds its parent gone
+   and buffers it in `engine.pending` — PERMANENTLY, since that parent
+   will never exist again. `offlineWindowScheduler.ts`'s Rule 7.2 sweep
+   (Phase 24) will eventually (default 30s) explicitly reject it
+   server-side rather than leave it stuck forever, and `SyncClient`'s
+   preserve-rule machinery (also Phase 24) will retain its CONTENT in
+   `rejectedOps` rather than silently lose it — but **nothing currently
+   reverts the character from the AUTHORING client's own visible
+   document.** `Engine` has no "undo one specific already-integrated
+   operation" primitive (Undelete's structural inverse, Phase 36, does
+   not apply here and remains unbuilt regardless). The affected user's
+   own screen keeps showing content that will never exist anywhere else,
+   with no indication anything is wrong.
+
+**Why this is a genuinely different class of finding than R0008-R0011**:
+those were defects IN the CRDT placement/ordering algorithm itself
+(YATA-family, since replaced by Fugue). This is not a placement-algorithm
+defect at all — `decidePlacement` and `collect()` are each individually
+correct per their own specifications. This is a gap in the INTERACTION
+between three independently-correct components (GC's necessarily-local
+view, an explicitly-heuristic undo horizon, and a client with no
+"node was collected" signal or "revert my own op" mechanism) — fixing it
+is a cross-component design decision, not a single-function algorithm
+patch.
+
+**Why Phase 24's own existing proof does not cover this**: that proof
+(see this file's own "Key Technical Decisions" entry on
+`reconcileOfflineQueue.ts`) is scoped SPECIFICALLY to the
+reconnection-reconciliation code path, whose anchor-resolution functions
+always re-resolve against CURRENT structure and therefore can never name
+a stale identifier. Ordinary `Engine.localInsert()` — every live
+keystroke, for a client that has NEVER disconnected — does not go
+through that path at all.
+
+**Fix decision (2026-09-06, same day): Option 2 chosen and implemented;
+Option 1 explicitly deferred to its own dedicated future session,
+tracked separately from (not merged into) Open Item 3's O(N²)→O(log N)
+redesign — see the new Open Item 9 below.** Full tractability/risk
+analysis for all three options is preserved below exactly as given to
+the user before the decision, since it remains the accurate account of
+why Option 1 is real, necessary, future work rather than something to
+casually revisit:
+
+- **Option 1 — make the undo horizon structurally safe, not just a
+  heuristic delay.** Extend the stability-frontier mechanism so a node
+  cannot become collectible until there is a real guarantee (not just
+  elapsed time/op-count) that no CONNECTED client's own resident tree
+  could still reference it as an origin for a future operation — e.g.
+  extending each session's own tracked state beyond "acked seq" to cover
+  "which node identifiers this session's own resident tree could still
+  anchor to." Traced structurally (not just hand-waved) during the
+  analysis: since a connected client's resident tree only ever GROWS
+  (no client runs its own GC, and a client can legitimately reference
+  content it received arbitrarily long ago for a brand-new local edit,
+  with no time limit), true structural safety reduces to "never collect a
+  node while any currently-connected session has ever seen it" — i.e.
+  GC becomes gated on SESSION CHURN (disconnection), not on elapsed
+  time/op-count. This is tractable (the needed data, `last_ack_seq`/
+  watermarks, already exists) but is a genuine GC-eligibility redesign
+  with real behavioral consequences (a document with long-lived,
+  continuously-connected sessions could go a long time without
+  collecting anything near the actively-edited region) requiring full
+  re-verification of Phase 21's own M8-c/M8-d DoD tests plus new tests
+  proving R0012 specifically can no longer occur. Comparable in scope to
+  the already-deferred O(N²)→O(log N) balanced-storage redesign (Open
+  Item 3) — a real, dedicated-session GC-design investigation, not a
+  contained fix. **Deferred — see Open Item 9.**
+- **Option 2 — accept the race can happen, make the CONSEQUENCE
+  non-silent and non-permanent. CHOSEN AND IMPLEMENTED.** See the
+  "Option 2 implementation" entry immediately below for the full account
+  — a new `Engine.tryRevertLocalInsert()`/`FugueTree.tryRemoveLeaf()`
+  pair (clean case: safe removal; cascading case: refuses, zero
+  structural side effects) plus `SyncClient` wiring (reuses the existing
+  `onRemoteOpsApplied` DOM re-render signal, plus a new dedicated
+  `onLocalInsertReverted` notification channel and a `RejectedEntry.
+  reverted` flag) — verified via a new targeted engine-level test (4
+  cases: clean, cascading via a right child, cascading via a left child,
+  already-gone) and a new `SyncClient`-level integration test (3 cases:
+  clean revert end-to-end through a real `OFFLINE_WINDOW_EXCEEDED`
+  OP_REJECT frame, cascading refusal, and rejected DELETEs explicitly
+  left out of scope). Scoped to INSERTS only, as approved — a rejected
+  DELETE is preserved exactly as before this fix, unchanged; reverting a
+  delete would mean a real Undelete (Phase 36's own resurrection
+  semantics), explicitly out of scope here.
+- **Option 3 — something else.** Considered a server-initiated
+  "confirm before collecting" handshake with connected sessions before
+  physically removing a node; rejected as not better than Option 1 (adds
+  real-time coordination latency to the GC path, and does not even fully
+  close the gap — a session mid-confirmation-round-trip when it
+  independently mints a new op is back to the same race) and not as
+  contained as Option 2. Not pursued.
+
+### Option 2 implementation (2026-09-06)
+
+**`packages/engine/src/fugueTree.ts`**: new `tryRemoveLeaf(id): Node |
+undefined` — a safe, NON-THROWING sibling of the existing GC-only
+`remove()`. Returns the removed node if `id` currently has NO children
+(left or right) — the "clean" case, identical unlink + size bookkeeping
+to `remove()`. Returns `undefined` immediately, with ZERO structural
+mutation, the instant EITHER children array is non-empty — the
+"cascading" case (typically the same user's own very next keystroke,
+chained via Fugue's own "attach right after the last thing I typed"
+rule) — deliberately refusing rather than risk dangling that other
+node's own `parent` reference (Engine Spec I4/I5).
+
+**`packages/engine/src/engine.ts`**: new `tryRevertLocalInsert(id):
+boolean`, a thin public wrapper delegating directly to
+`tree.tryRemoveLeaf`. Deliberately does NOT touch `this.applied` — the
+reverted id must never be treated as "safe to reapply," which holds
+regardless of outcome, since this project's design never resends a
+rejected operation under its own original identity anyway.
+
+**`packages/client/src/sync/syncClient.ts`**: `handleOpsMessage`'s
+`"opReject"` case now attempts `engine.tryRevertLocalInsert(op.id)` for
+any rejected op with `kind === "insert"` (deletes are left untouched,
+explicitly out of scope) BEFORE the existing `preserveRejected` call, and
+passes the outcome through as `RejectedEntry.reverted` (a new field,
+deliberately NOT persisted to the durable `rejected` store — a page
+reload replaces the resident engine wholesale via a fresh SNAPSHOT/
+CATCHUP anyway, so `reverted` is a purely in-memory UI signal, not
+load-bearing for correctness). On a successful revert, TWO things fire:
+the EXISTING `onRemoteOpsApplied` listener set (Phase 14) — reused
+deliberately, since "the document changed for a reason other than my own
+most recent keystroke, please re-render" is exactly true of a revert
+regardless of whether the change originated from a peer's broadcast or
+this client's own now-undone insert, so this triggers the real, already-
+wired DOM re-render with zero new `EditorView` code — and a NEW, dedicated
+`onLocalInsertReverted(listener)` channel, carrying the full
+`RejectedEntry`, so a future UI can show the honest notification the user
+asked for ("this edit couldn't be saved and was removed — here's the
+content if you want to reinsert it"). Building that notification UI
+itself remains disclosed, out-of-scope future work — the SAME "build the
+real capability now, a future UI phase wires it up" precedent Phase 24
+already established for `offlineWindowStatus`/`rejectedCount`;
+`ConnectionIndicator.tsx`/`EditorView.tsx` are untouched by this fix.
+
+**Hand-traced before implementation, per the user's own explicit
+requirement, both cases**: (1) the clean case — nothing anchors to the
+rejected node — removal is safe, size bookkeeping correct
+(`visibleLength`/`totalElements` both decrement by exactly one), no
+dangling references possible (nothing else ever referenced the removed
+node), I4/I5 hold (verified via `assertInvariants(engine, {afterCollect:
+true})` — the SAME sanctioned "this call is allowed to show a smaller
+node count" escape hatch I5 already provides for `collect()`, reused
+here since a revert is a second, now-legitimate way structure can
+shrink outside of GC). (2) the cascading case — something already
+chains onto the rejected node — refused immediately, zero structural
+mutation, document and stats byte-for-byte unchanged, confirmed via a
+dedicated test asserting `engine.stats()` equality before/after the
+refused attempt.
+
+**Full verification, all against the real, merged code**: `pnpm
+typecheck` clean across all 6 packages; the new engine-level test
+(`packages/engine/src/engine.test.ts`'s new "tryRevertLocalInsert()"
+describe block, 4 tests: clean-right-child case, cascading-right-child
+case, cascading-left-child case — confirming BOTH children arrays are
+checked, not just `rightChildren` — and already-gone-id case) and the new
+`packages/client/src/sync/localInsertRevert.test.ts` (3 tests: clean
+revert firing both notification channels end-to-end through a real
+`OFFLINE_WINDOW_EXCEEDED` OP_REJECT frame against a fake-but-fully-
+synchronous socket, cascading refusal leaving the document and
+`rejectedOps` unchanged except `reverted: false`, and a rejected DELETE
+confirmed untouched/unreverted) — all pass. R0008-R0011 (via the full
+engine + `fugueTree.crosscheck.test.ts` suites) and the new R0012
+regression test (`packages/engine/src/regressionR0012.test.ts`) all
+still pass. Full default `pnpm test`: **425/425 passing** (up from 417 —
+the +8 are this fix's own new tests), 47 files, 2 disclosed skips
+(unrelated, the deferred O(N²) GC-chain tests), zero regressions.
+
+**The `soak.db.test.ts` scheduler-wiring fix (wiring
+`offlineWindowScheduler.ts`'s sweep into the soak test's own loop,
+proposed before this investigation began) is now UNBLOCKED** — Option 2
+is shipped and verified, so proceeding with that fix no longer risks
+leaving a completely unaddressed, undisclosed silent-divergence risk
+behind it. Not yet done as of this entry — the next step for whichever
+session picks this up.
+
+## ✅ OPEN ITEM 10 DONE, OPEN ITEM 11 RESOLVED (2026-09-07) — M8-e now passes cleanly at both configs
+
+`offlineWindowScheduler.ts`'s `runOneDocument` (Phase 24's Rule 7.2
+sweep) is now wired into `soak.db.test.ts`'s own loop — called every 500
+operations (the same cadence as the existing session-heartbeat block),
+using the REAL default config (`pendingRejectTimeoutMs: 30_000`, not
+shortened), plus one final real 31-second wait and a last sweep call
+after the main loop so any operation that became stuck in the LAST 30
+real seconds of the run still has time to be evicted before the final
+quiescence assertions run.
+
+**Confirmed fixed, the specific goal of this item**: re-running M8-e in
+full (30,000 real operations, real Postgres, 796.14s wall time),
+`coordinator.engine.pending.length` reaches 0 by the end, with orphaned
+operations explicitly rejected via `OFFLINE_WINDOW_EXCEEDED` along the
+way. The previous run's own failure mode (1,400 permanently stuck
+operations, reported 2026-09-06) is gone — confirmed by inspecting the
+run's own output: exactly one assertion failed in the entire 796-second
+run, and it was NOT any pending-length assertion (see below).
+
+**But the re-run itself surfaced two new things, neither chased further
+tonight, per the standing "flag and stop" instruction** — full data,
+reproduction command, and suggested next steps in
+`tests/regression/R0013-2026-09-07-m8e-soak-heap-growth-and-high-frequency-r0012-rejections.json`
+and `docs/benchmarks.md`'s own new "M8-e soak run" section:
+
+1. **R0012's rejection rate, measured for the first time**: under this
+   soak's own deliberately-zero undo-horizon grace window
+   (`undoHorizonMaxAgeMs: 0`, `undoHorizonMaxOpsPerReplica: 0` — "no
+   artificial grace window, this soak's own point is to actually
+   collect," per the file's own pre-existing comment), the Critical
+   Finding #2 / R0012 race fired on **1,605 of 30,000 operations
+   (5.35%)** — not a rare edge case at this configuration, constantly
+   recurring instead. This soak's simulated clients are bare `Engine`
+   instances, never real `SyncClient`s, so NONE of these 1,605
+   rejections were ever revert-corrected by Option 2 — every one is a
+   permanent, un-reverted local divergence in THIS harness specifically
+   (a disclosed harness limitation, not a regression in Option 2 itself,
+   which has its own dedicated, passing tests). This is not a new
+   algorithm defect — it is the SAME R0012 mechanism, now measured at
+   realistic operation volume under aggressive GC tuning for the first
+   time — but it materially raises the practical urgency of **Open Item
+   9** (Option 1's structurally-safe GC/undo-horizon redesign): a real
+   deployment tuning GC aggressively could see this at a similarly high
+   rate, not merely as a theoretical rare race.
+2. **A new, unresolved heap-growth anomaly**: heap usage more than
+   doubled (97.8MB → 241.2MB) between the last two GC checkpoints,
+   failing the test's own coarse 4×-of-median smell test, with NO
+   corresponding structural jump (`totalElements` grew only ~18% in that
+   same interval, in line with every other interval — GC's own
+   tombstone-ratio bound held fine throughout, 0.3697→0.3490,
+   flat-to-decreasing). Cause not investigated tonight — `global.gc()`
+   is deliberately not forced per checkpoint in this test (already
+   disclosed in the file's own header as a coarse, non-exhaustive
+   signal), so ordinary unforced V8 allocator noise has not been ruled
+   out as an explanation, nor has a genuine leak been ruled in.
+
+**M8-e's status at that point**: NOT marked fully passing. Its own
+previously-failing assertion (pending reaches 0) was fixed and
+confirmed. The test as a whole still failed, on the newly-found
+heap-growth assertion.
+
+### ✅ Open Item 11 RESOLVED — same day, direct follow-up investigation
+
+The heap-growth anomaly was investigated immediately after, at the
+user's explicit direction, using the exact same rigor as every other
+finding in this project — full account in `tests/regression/R0013`'s
+own new `part4_resolution_2026_09_07_followup` section and
+`docs/benchmarks.md`'s own updated "M8-e soak run" section:
+
+1. **Forced-GC re-measurement** (`NODE_OPTIONS=--expose-gc`, `--pool=forks
+   --poolOptions.forks.singleFork` — the same technique already
+   established for M8-a's own benchmark): heap growth under forced GC
+   was smooth and tracked structural growth closely — 29.5MB → 76.3MB
+   (~2.6x) against ~5.4x structural growth over the identical interval.
+   The original run's dramatic final-checkpoint spike (97.8MB → 241.2MB)
+   **did not reproduce**. **Confirmed noise, not a leak.** This same run
+   also served as the "full test suite now passes cleanly" re-run: 1/1,
+   zero assertion failures.
+2. **Map-size diagnostics** (`DocumentCoordinator.pendingFirstSeenAtMs`/
+   `pendingOpOrigin`/`watermarks`, sampled at every checkpoint in the
+   same run): grew to a bounded 183 entries by the end (proportional to
+   the sustained rejection rate, demonstrably pruned each sweep, never
+   creeping unbounded) — not the source of the original anomaly.
+   `watermarks` stayed at 0 throughout (this harness's simulated clients
+   never send a real PING) — unrelated, not a finding.
+3. **A follow-up comparison at the REAL, non-zero undo-horizon default**
+   (5min/200-ops-per-replica, temporarily swapped in for one run, then
+   reverted): **no material difference** in the R0012 rejection rate —
+   5.44% vs. 5.35% under the zero-grace config. Why: Rule 7.3's
+   op-count condition (200 further ops per replica) is satisfied in
+   roughly 12 real seconds at this soak's own throughput, making the
+   nominal 5-minute age threshold practically irrelevant at this op
+   rate. **This is an honest data point that RAISES, not lowers, Open
+   Item 9's own priority** — a genuinely busy real multi-user editing
+   session could plausibly hit the op-count condition within seconds to
+   a couple of minutes too, not the full 5 minutes the RFC's own number
+   might suggest read in isolation, so R0012's real-world frequency
+   under active editing may be much closer to ~5.4% than a naive
+   "the grace window is generous" reading would predict. Does not
+   change Item 9's own deferred-to-its-own-session status (correctly not
+   chased in this session either), but materially informs how urgently
+   it should be picked up.
+4. A minor, non-blocking observation from the step-3 comparison run
+   (a single GC cycle hitting its 150ms fixpoint safety cap,
+   `incomplete: true`, `collectedCount: 0`) is recorded in R0013 but not
+   investigated further — by design this collects zero nodes rather than
+   an unproven partial set, and the tombstone-ratio bound held
+   comfortably regardless.
+
+**M8-e's status now, stated precisely**: fully passing at both its own
+shipped (zero-grace) config and the real production default — both
+re-runs passed 1/1 with zero assertion failures. Open Item 11 is
+resolved. See the Phase 25 final report (this same date, below) for the
+complete DoD status and v0.2.0-m2 tag readiness determination.
+
+## 📋 OPEN ITEMS TRACKED FOR FUTURE SESSIONS (as of 2026-09-05, end of session)
+
+Consolidated here, in priority order, so a future session (or this one,
+resuming) has one place to check before doing anything else. Items 1-2
+were found DURING the act of writing this very consolidation, by actually
+re-running `pnpm typecheck`/`pnpm test` rather than assuming the earlier
+"resolved" verification (engine-package-scoped) extended to the whole
+workspace — it did not.
+
+1. **✅ RESOLVED 2026-09-06 — see the "PHASE 25 UPDATE" section immediately
+   above for the full account.** `pnpm typecheck` and `pnpm test` are both
+   confirmed clean across the whole workspace. Original description of
+   the problem retained below for historical accuracy (what was found and
+   why it mattered), not because it's still open.
+
+   **🛑 URGENT, NOT YET DISCLOSED IN DETAIL UNTIL NOW: `packages/protocol`,
+   `packages/server`, and `packages/client` were never updated for the
+   Fugue port's `originLeft`/`originRight` → `parent`/`side` field
+   rename, and the actual, measured breakage is much larger than this
+   document's Fugue section previously said.** Confirmed by actually
+   running both gates just now, not assumed from the shape of the diff:
+   - `pnpm typecheck` **fails** at `packages/protocol` (`codec.test.ts`,
+     `controlCodec.test.ts`, `expand.ts`, `snapshotBody.ts`,
+     `snapshotBody.test.ts`, `snapshotSeed.ts` — all still reference
+     `originLeft`/`originRight` on `InsertOperation`/`Node`, and
+     `snapshotBody.ts` still imports the fully-removed `Block`/
+     `canFollowInBlock`/`decodeBlock` from `@collab-editor/engine`).
+     `pnpm -r` stops at the first failure, so `packages/server` and
+     `packages/client`'s own `tsc --noEmit` were NEVER REACHED this
+     run — their typecheck status is UNVERIFIED, not confirmed clean.
+   - `pnpm test` (the default suite) **fails 64 of 407 tests across 15
+     files**, spanning all three downstream packages, not just protocol:
+     `packages/protocol/src/{codec,snapshotBody}.test.ts`;
+     `packages/server/src/{gateway,handshake,httpApp,
+     offlineWindowScheduler,writePath}.test.ts`;
+     `packages/client/src/{editor/EditorView,input/inputPipeline,
+     sentinel/mutationSentinel,sync/headlessHarness,
+     sync/offlineWindowPreservation,sync/reconcileOfflineQueue,
+     sync/syncClient,sync/syncClient.durableQueue}.test.ts`. The failures
+     are real runtime crashes, not just stale assertions — e.g.
+     `encodeStamp` throws `Cannot read properties of undefined (reading
+     'c')` because `wireHelpers.ts`/`syncClient.ts`/test fixtures still
+     construct operations with an `originLeft`/`originRight` shape the
+     real `InsertOperation` type no longer has, so `.parent` is
+     `undefined` at the wire-encoding call site.
+   - **Net effect: this project's actual product — the client↔server
+     sync path, the wire protocol, SNAPSHOT's structure-form body — does
+     NOT currently build or run correctly against the new engine.** The
+     engine-level Fugue verification above (R0008-R0011, adversarial,
+     properties, convergence, mutation matrix) is real and does not need
+     redoing, but it only proves `packages/engine` itself is correct in
+     isolation — it says nothing about the rest of the workspace, which
+     this session never touched beyond the disclosed, deliberate
+     `snapshotBody.ts`/block-codec deferral. **This needs a dedicated
+     integration pass** (mechanical field-rename fixes in most call
+     sites, but a REAL redesign — not a rename — for
+     `snapshotBody.ts`'s block-run-length wire format, since Fugue has no
+     block-boundary analogue; see item 5). Do this BEFORE resuming
+     DUR-06, since DUR-06 itself depends on `packages/client`/`server`
+     actually working.
+
+2. **✅ RESOLVED 2026-09-06 — see the "PHASE 25 UPDATE" section above (Bugs
+   4-8) for the full root-cause chain and fix.** DUR-06's permanent-stall
+   pattern (previously ~50% of runs) is gone: 10/10 clean runs post-fix.
+   DUR-05: 2/2 clean. Original description retained below for historical
+   accuracy.
+
+   DUR-06's original convergence-timing question — completely
+   untouched since before the Fugue investigation began; Phase 25's own
+   original DUR-05/06 DoD verification work. Cannot meaningfully resume
+   until item 1 above is fixed (DUR-06 needs a working client/server).
+
+3. **The O(N²) → O(log N) balanced-storage redesign for `FugueTree`** —
+   explicitly, deliberately deferred to its own dedicated future session
+   per the user's direct instruction (see the O(N²) performance finding
+   above): decouple Fugue's placement DECISION (lightweight parent/side
+   pointers) from a balanced treap-backed STORAGE/QUERY layer. Until this
+   lands, two tests remain `it.skip`'d with disclosure comments —
+   `packages/engine/src/engine.test.ts`'s two 90,000-node pathological GC
+   chain tests, and `packages/testkit/src/benchmark/
+   gcSafetyCap.bench.test.ts`'s own single test — both should be
+   un-skipped once the redesign is in.
+
+4. **The RFC and Engine Specification documents need updating to reflect
+   the move from the YATA-family `integrate()` to Fugue** — a
+   documentation task on the six approved design documents themselves
+   (pasted into context each session, not stored in this repo), separate
+   from and in addition to this repo's own code/CLAUDE.md account. Engine
+   Spec §4.3 (the INTEGRATE pseudocode), §6.2 (sub-case iii-d, already
+   known false since Phase 20 and now entirely moot under Fugue), and
+   §8.5 (the PositionIndex contract, retired) all need real edits, not
+   just this file's own record of what changed. Flagged as its own
+   deliberately-deferred item, not attempted this session.
+
+5. **`packages/protocol/src/snapshotBody.ts`'s block run-length wire
+   format needs a full from-scratch redesign for a tree structure, not a
+   field rename** — folded into item 1 above but worth calling out
+   separately since it's a different KIND of work. Phase 20's block
+   encoding (`Block`/`canFollowInBlock`/`decodeBlock`, and the compression
+   benchmark `packages/testkit/src/benchmark/compression.ts`/
+   `.bench.test.ts`) was built entirely around YATA's flat, consecutive-
+   counter node storage and has already been deleted outright (not
+   adapted) as part of this session's Fugue merge — there is no
+   Fugue-tree analogue of "a maximal run of consecutive-counter,
+   same-replica nodes" to fall back on. SNAPSHOT's structure-form body
+   will need a genuinely new design for compactly encoding a Fugue tree
+   (parent/side/sibling-order) on the wire, and the compression benchmark
+   will need an equivalent new design once that format exists.
+
+6. **The Phase 19 index cross-check's replacement
+   (`fugueTree.crosscheck.test.ts`) is deliberately NARROWER in scope
+   than Phase 19's original** — single-replica only (3,000 seeds), not
+   Phase 19's original 10,000-seed check which also stressed CONCURRENT
+   placement. Disclosed and accepted at the time (building an independent
+   oracle for Fugue's own concurrent `decidePlacement` logic would
+   require re-deriving the algorithm itself), and this project's other
+   suites (adversarial, properties, convergence, R0008-R0011) already
+   stress concurrent placement far more thoroughly — but worth tracking
+   as a known, permanent scope reduction from the pre-Fugue baseline, not
+   something to silently forget.
+
+7. **RC-27's own 20-repeated-reconnection p95 timing stress test is
+   flaky, independent of anything fixed in the 2026-09-06 session**
+   (found while verifying that session's own Bugs 4-8 — `pnpm
+   test:reconnection` is otherwise 35/36 to 36/36 clean). The failure
+   (`waitForState`/`waitForTextLength` timeouts, at varying points across
+   the 20-iteration loop) reproduced identically before ANY of that
+   session's fixes (its very first `pnpm test:reconnection` run) and
+   after, including in full isolation (no concurrent load) — ruling out
+   those changes as the cause. Most plausible explanation, not yet
+   confirmed: the already-disclosed, already-deferred Fugue O(N²)
+   sequential-insertion cost (Item 3 above) compounding across 20 rapid
+   real reconnection cycles, each involving a `reconcileOfflineQueue`
+   replay over a growing document. Worth revisiting once Item 3's
+   balanced-storage redesign lands — if the flake disappears, that's
+   strong confirming evidence; if it persists, it needs its own dedicated
+   investigation.
+
+8. **✅ DUR-02 and DUR-03 RESOLVED 2026-09-06 (both PASSED, real numbers);
+   M8-a RESOLVED with a significant finding of its own; M8-e surfaced
+   Critical Finding #2 above (partially addressed).** All four were
+   reviewed read-only in the prior entry (2026-09-06), then actually
+   EXECUTED the same day:
+   - **DUR-02**: 100% pass — all three assertions held over a real
+     12,000-operation, 4-client session against real Postgres (250.8s).
+   - **DUR-03**: 100/100 repetitions passed across all 10 named crash
+     sites (16.3s), every audit `result: "ok"`.
+   - **M8-a**: the documented 100,000-op/10,000-visible scale was
+     confirmed IMPRACTICAL to run to completion under the current Fugue
+     engine (killed after 71 real minutes / ~64 CPU-minutes with the
+     first of its two tests still not done building — far worse than
+     small-N extrapolation suggested). Real numbers obtained instead at
+     reduced, disclosed scales (N=4,000 and N=500-with-`--expose-gc`) —
+     full account and numbers in `docs/benchmarks.md`'s own new "Final
+     memory and apply-latency benchmark (Phase 25, M8-a, Fugue port)"
+     section. The 10MB memory target's status at TRUE 100k-op scale
+     remains genuinely UNKNOWN under Fugue (not passing, not failing) —
+     closes automatically once Item 9 below lands.
+   - **M8-e**: ran to completion (542.6s, all periodic audits `"ok"`,
+     tombstone ratio bounded) but FAILED its final assertion
+     (`coordinator.engine.pending.length === 1400`, not 0) — investigating
+     this is what surfaced Critical Finding #2 above. The soak test's own
+     scheduler-wiring fix is now UNBLOCKED (Option 2 shipped) but NOT YET
+     DONE — see the "Option 2 implementation" entry above's own final
+     paragraph.
+
+9. **NEW (2026-09-06) — Option 1's structurally-safe GC/undo-horizon
+   redesign, tracked as its OWN separately-scoped future item, distinct
+   from Item 3's O(N²)→O(log N) storage redesign.** These are TWO
+   DIFFERENT problems that happen to both live in GC-adjacent code — do
+   not conflate them in future planning. Item 3 is about `FugueTree`'s
+   own STORAGE/QUERY performance (how fast `attach()` is). This item is
+   about GC's own ELIGIBILITY CORRECTNESS (Critical Finding #2 above,
+   `tests/regression/R0012`): making it structurally impossible, not
+   merely delayed by a heuristic, for the server to collect a node a
+   still-connected client could later reference. The tractability
+   analysis (see Critical Finding #2's own "Fix decision" entry) already
+   found the real shape of the fix — GC eligibility gated on SESSION
+   CHURN (has every session that ever saw this node disconnected). This
+   is real, necessary, comparable-in-scope-to-Item-3 work, not a
+   same-session patch.
+
+10. **✅ RESOLVED 2026-09-07 — see the "OPEN ITEM 10 DONE" section above
+    for the full account.** `offlineWindowScheduler.ts`'s `runOneDocument()`
+    is now wired into `soak.db.test.ts`'s own loop, using the real
+    default config (`pendingRejectTimeoutMs: 30_000`). Re-running M8-e
+    confirmed `coordinator.engine.pending.length === 0` at completion —
+    but that same re-run surfaced two NEW findings (Item 11 below), so
+    M8-e as a WHOLE is still not fully passing.
+
+11. **✅ RESOLVED 2026-09-07, same day (direct follow-up investigation) —
+    see the "Open Item 11 RESOLVED" section above for the full account.**
+    The heap-growth anomaly is CONFIRMED unforced V8 allocator noise, not
+    a leak (forced-GC re-measurement: 29.5MB → 76.3MB, tracking
+    structural growth; the original 241.2MB spike did not reproduce).
+    Per-checkpoint map-size diagnostics confirmed `pendingFirstSeenAtMs`/
+    `pendingOpOrigin` stay bounded, never unbounded. M8-e now passes
+    cleanly (1/1, zero assertion failures) at both its own shipped
+    zero-grace config and the real production undo-horizon default. The
+    R0012 frequency finding (Item 9's own data point) is UNCHANGED and, if
+    anything, reinforced: a follow-up comparison at the real 5min/200-ops
+    default found essentially the SAME rejection rate (5.44% vs. 5.35%),
+    because Rule 7.3's op-count condition is reached in ~12 seconds at
+    this soak's own throughput — raising, not lowering, Item 9's own
+    practical priority. Full data: `tests/regression/R0013`'s own
+    `part4_resolution_2026_09_07_followup` section and
+    `docs/benchmarks.md`.
+
+Items 2-11 are genuinely separable follow-up work, each with its own clear
+scope; item 1 was the one that blocked everything else in this project
+(including item 2) and has now been resolved. Items 3, 6, and 9 remain
+the longest-lived, deliberately-deferred structural/redesign items (NOT
+urgent, each its own dedicated future session — 9 is distinct from 3,
+see item 9's own text; Item 11's own step-4 comparison is now a concrete
+data point in favor of prioritizing 9 sooner rather than later, since
+the elevated R0012 rate turns out NOT to be an artifact of this soak's
+own aggressive tuning); item 7 is a flaky-test investigation to revisit
+once item 3 lands; items 10 and 11 are both now resolved — there is no
+single remaining concrete blocker to Phase 25's own closeout as of this
+entry (see the Phase 25 final report, same date, for the complete DoD
+status and v0.2.0-m2 tag readiness determination).
+
 ## Current phase in progress
 
-None — Phase 24 (offline window enforcement and rejection preservation)
+**Phase 25 (Milestone M2, DUR-05/06 adverse-network verification) — DoD
+verification COMPLETE as of 2026-09-07; ready for the v0.2.0-m2 tag.**
+See the final Phase 25 report (dated 2026-09-07, this session) for the
+complete, explicit per-DoD-item pass/fail/deferred status and the tag-
+readiness determination. Summary: DUR-02/03/05/06 all PASS (clean, real
+runs); M8-a is PARTIAL (real numbers at reduced, disclosed scale — the
+full 100,000-op number itself remains genuinely unknown, closes
+automatically once Item 3 lands — an accepted, disclosed reduction, not
+a blocker, per this project's own established precedent for this exact
+kind of gap); M8-e now fully PASSES at both its own shipped config and
+the real production undo-horizon default (Open Item 10's fix confirmed
+working, Open Item 11's heap-growth finding confirmed resolved as
+noise, both same-day). No open item from this investigation is treated
+as blocking the tag — Items 3, 4, 6, 7, and 9 remain real, tracked,
+deliberately-deferred future work, each scoped to its own future
+session, none of them newly discovered blockers to what Phase 25 itself
+was verifying.
+
+2026-09-07's own session, in order: Open Item 10 (wiring
+`offlineWindowScheduler.ts`'s sweep into `soak.db.test.ts`) was
+completed — see the "✅ OPEN ITEM 10 DONE, OPEN ITEM 11 RESOLVED
+(2026-09-07)" section above. The re-run initially surfaced two new
+findings (a heap-growth anomaly and a much-higher-than-expected R0012
+rejection frequency under aggressive GC tuning), both flagged and
+deliberately not chased in that pass, per the standing "flag and stop"
+instruction. A direct follow-up investigation the same day (forced-GC
+re-measurement, map-size diagnostics, and a realistic-undo-horizon
+comparison run) resolved the heap-growth anomaly as confirmed noise and
+confirmed the R0012 frequency finding is not an artifact of this soak's
+own aggressive tuning. See the earlier 2026-09-06 session's own account
+below for everything that preceded this checkpoint.
+
+Prior checkpoint (2026-09-06)'s own account, unchanged: See
+the "✅ PHASE 25 UPDATE (2026-09-06)" section above for the full account
+of what this session found and fixed: the Item-1 integration breakage
+(Fugue's `parent`/`side` rename never reaching `protocol`/`server`/
+`client`), the server-side `writePath.ts` buffered-operation-ignored bug,
+the out-of-order-commit/CATCHUP-honesty bug (`enqueueCommit`/
+`lastCommittedSeq`), the replica-id-reuse-after-restart bug plus its own
+bigint-string-concatenation bug (both found via DUR-03), the client-side
+seq-tracking bug, and the wire-protocol run-coalescing bug — six real
+bugs beyond R0008-R0011/the Fugue migration itself, all found and fixed
+in one continuous session, all independently verified. DUR-05/DUR-06 are
+now fully passing (10/10 clean DUR-06 runs). Explicitly NOT done this
+session, per direct user instruction: running DUR-02/DUR-03/M8-a/M8-e
+(all four confirmed to exist as complete, real implementations — see
+Item 8 in the open-items list above — just not executed yet) and the
+RFC/Engine Spec document updates (Item 4). Pick up next session with
+DUR-02/DUR-03/M8-a/M8-e via `pnpm test:db`.
+
+Phase 24 (offline window enforcement and rejection preservation) is also
 complete; see its own completed-phase entry above for the full account,
 including the genuine finding that RC-30's own "anchors were collected"
 scenario is not reachable through this project's real client reconciliation
@@ -5159,6 +6281,140 @@ trigger GitHub Actions runs).
   account: Phase 24's own completed-phase entry, and
   `offlineWindowPreservation.test.ts`'s header comment. — Engine Spec
   §7.6 Rule 7.2, API Spec §5.5/§10.5, Test Plan RC-30.
+
+- **Engine Spec §4.3 replaced by the real YATA algorithm (2026-09-05,
+  Phase 25 pivot, R0010) — `integrate()`'s Case A/B/C decision procedure
+  (Phase 3's own derivation, patched at R0008 and R0009 below) was
+  REPLACED OUTRIGHT, not patched a third time.** While root-causing a
+  genuine `integrate()` finding surfaced by Phase 25's own DUR-05/06
+  adverse-network DoD verification (duplicate/delay+reorder/delay+drop
+  network conditions each independently triggering the same "destIndex
+  outside its own scan window" canary R0008/R0009 had already redefined),
+  a THIRD, structurally distinct gap was found and confirmed via a fast,
+  network-free, engine-only event-script fuzzer (isolated per fault type:
+  reorder-only and drop-only both reproduce; duplicate-only and a
+  zero-fault reconnect do NOT reproduce standalone, an open item — see
+  `tests/regression/R0010`). Hand-traced against the ACTUAL, current,
+  post-R0008/R0009-fix `integrate()` code: both rank checks were present
+  and individually correct at every single decision point in the minimal
+  repro. The bug is one level ABOVE any single scan — two nodes that are
+  NEVER directly rank-compared against each other can end up in OPPOSITE
+  relative structural order on two replicas, purely as a function of what
+  OTHER, unrelated nodes were integrated in between on each side. When a
+  third operation later needs both as its own two origins, one replica
+  computes an INVERTED, negative-width window (`leftIndex > rightIndex -
+  1`) and the scan never even runs before the sanity check throws. This
+  is a violation of TRANSITIVITY that no amount of per-branch rank-check
+  patching can close, because the defect isn't in any single scan's
+  decision — it's in the decision PROCEDURE's inability to relate two
+  nodes it never directly compares. Given three bugs in the same family,
+  each found under a new test condition after the previous fix, this was
+  treated as a signal the approximation itself (this project's own
+  `scanned`/`conflicting` Set-based tracking) is structurally unsound for
+  transitivity, not merely incomplete in one more spot.
+
+  **The decision to replace rather than patch again, and the research
+  behind it**: rather than hand-derive a fourth candidate fix, the real,
+  published, peer-reviewed YATA algorithm (Kleppmann, "Near Real-Time
+  Peer-to-Peer Shared Editing on Extensible Data Types") was researched
+  and verified against its actual reference implementation — Sypytkowski,
+  https://github.com/Horusiath/crdt-examples/blob/master/Crdt/convergent/
+  Yata.fs — fetched and read directly, not recalled from memory, given
+  the stakes of building on a misremembered algorithm. A literal,
+  faithful port (a standalone array-based reimplementation, built and
+  checked BEFORE touching `engine.ts`) was verified against R0008, R0009,
+  AND R0010's own exact recorded operation sequences — all three converge
+  identically across every delivery order under the real algorithm — and
+  against RFC NQ-2's own backward-typing non-interleaving requirement.
+  Two findings from this research were surprising and are worth recording
+  because they overturn what R0008/R0009 assumed: (1) the real
+  algorithm's Case-C-equivalent branch (`otherLeftIndex < leftIndex`) is
+  an UNCONDITIONAL stop with NO rank check at all — the OPPOSITE of what
+  R0008's own patch added; (2) its Case-B-equivalent uses a single
+  carried-forward `scanning` BOOLEAN, re-derived from the CURRENT scan
+  position on every iteration where it's false, rather than this
+  project's own two per-scan Sets (`scanned`/`conflicting`) tracking
+  node-identifier membership — this single mechanism is what actually
+  supplies transitive consistency across separate `integrate()` calls,
+  which the Set-based approximation had no equivalent for.
+
+  **A real translation bug was found and fixed during the port's own
+  verification, not by review — the exact discipline this project's
+  "hand-trace before code" rule exists for.** The reference algorithm's
+  recursive `findInsertIndex` re-derives its `dst` (destIndex) at the TOP
+  of EVERY call, including the FINAL one where `i === right` triggers the
+  return. A first translation used a `for (i = leftIndex+1; i <
+  rightIndex; i++)` loop, which never runs a body for `i === rightIndex`
+  and so silently skips exactly that last re-derivation whenever the scan
+  reaches the end of its window without an earlier stop. This reproduced
+  RFC NQ-2's own historical "zcybxa instead of cbazyx" interleaving bug
+  immediately — caught by `engine.test.ts`'s own pre-existing §10.7
+  worked-trace test on the very first run against the real file, not
+  anticipated in advance. Fixed by translating the recursion as a literal
+  `while(true)` loop with an explicit `i === rightIndex` exit check,
+  matching the reference algorithm's control flow exactly rather than
+  approximating it with a bounded `for` loop.
+
+  **`id1 <= id2` (the reference algorithm's raw, non-strict replica-id
+  comparison) is `compareRank(node, other) <= 0` in this port** — Engine
+  Spec Definition 4.2's bind-then-replica-id tuple, unchanged since Phase
+  3, since YATA itself has no notion of grapheme-cluster binding (I8);
+  this substitution is the only domain-specific adaptation the port
+  makes. Note the comparison is deliberately NON-STRICT (`<=`), a real,
+  load-bearing difference from every one of this project's own pre-R0010
+  comparisons, which used a strict `<` throughout.
+
+  **Full verification, against the real, merged `engine.ts`, all gates
+  re-run from scratch — no result assumed from the pre-implementation
+  scratch port**: R0008 (all 6 causally-valid delivery-order permutations
+  converge to `"it"`), R0009 (all 3 causally-valid delivery-order
+  permutations converge to `"itp"`), R0010 (out-of-FIFO delivery
+  converges to text AND structure IDENTICAL to natural in-order delivery,
+  `"ghdfec"`); `pnpm test` (engine package, 59/59, including the corrected
+  §10.7 trace); the full monorepo default `pnpm test` (425/425 across 45
+  files); `pnpm test:adversarial` (22/22); `pnpm test:properties` (6/6
+  suites, 10,000 cases each); `pnpm test:index` (10,000-seed PositionIndex
+  cross-check vs. a linear-scan oracle, zero disagreements); **`pnpm
+  test:convergence` at the FULL 10,000-seed budget across ALL SEVEN
+  configs, 70,000/70,000 converged, ZERO divergences — including
+  C7-immediate-delivery, the exact config that found R0008/R0009 at
+  22-95% failure rates pre-fix, now clean at full budget**; `pnpm
+  test:mutation` — **10 of 10 mutants killed, a STRONGER result than the
+  pre-fix baseline** (where `M3_no_case_c` survived every suite by
+  design, requiring the specialized MUT-KILL-01 10^6-trial search to even
+  attempt to kill it) — the real-YATA-port's own Case-C-equivalent branch
+  is now caught by the ordinary pure-convergence fuzzer at seed 0, a
+  materially more observable failure mode than the old approximation ever
+  had. Two of the ten mutants' `find`/`replace` anchors needed mechanical
+  updates for the new source shape (`packages/testkit/src/mutation/
+  mutants.ts`): `M3_no_case_c`'s own anchor (re-targeted to the new
+  algorithm's single unified stop condition, removing only its
+  `otherLeftIndex < leftIndex ||` disjunct — the real equivalent of
+  disabling "Case C"), and, found only by actually re-running this gate,
+  a genuinely PRE-EXISTING, unrelated gap in `M8_no_idempotence`'s own
+  anchor (stale since Phase 21 added an optional `context` parameter to
+  `applyRemote()` — the same class of drift as Phase 19/21's own
+  CRLF/`deliveryMode` gaps, not caused by this fix).
+
+  **What changed structurally**: `engine.ts`'s `sameOrigin()` helper
+  function is removed (no longer called anywhere — the new algorithm
+  compares resolved integer positions directly, never needs a separate
+  identifier-equality helper). `integrate()`'s own doc comment now
+  contains the full algorithm rationale and citation; the structural
+  sanity check (destIndex-within-window) is retained as a cheap,
+  always-on regression canary, now structurally guaranteed to hold rather
+  than merely hoped to.
+
+  Permanent regression fixtures `tests/regression/R0008`, `R0009`, and
+  the new `R0010` are ALL retained per Test Plan §2.3 Rule 2 (never
+  removed, even fixed/superseded) — R0008 and R0009 are marked
+  "superseded" (their own fixes, while each individually correct as far
+  as they went, are no longer what's running; the algorithm they patched
+  no longer exists), with a cross-reference to this entry. Full
+  investigation timeline for R0008/R0009: the "Engine Spec §6.2 sub-case
+  iii-d correction" entry immediately below (documented at the time, kept
+  as-is rather than rewritten, since it's an accurate record of what
+  happened THEN).
 
 - **Engine Spec §6.2 sub-case iii-d correction (2026-09-02/03, Phase 20,
   R0008 + R0009) — a real correction to the APPROVED SPECIFICATION

@@ -16,7 +16,7 @@
 // not just once during this phase — see its own describe block.
 
 import { randomUUID } from "node:crypto";
-import { Engine, type Operation } from "@collab-editor/engine";
+import { Engine, type InsertOperation, type Operation } from "@collab-editor/engine";
 import {
   encodeFrame,
   operationToOpInsert,
@@ -245,18 +245,18 @@ describe("Phase 16 DoD — coordinator warm start (API Spec §6.2)", () => {
     // `operations_no_delete` (Phase 15) correctly makes it impossible to construct this
     // scenario by deleting an existing row — so instead, this inserts a SECOND row directly
     // (bypassing the write path and its own seq/broadcast/ack machinery entirely) whose
-    // `originLeft` references an identifier that was never, and will never be, provided by any
+    // `parent` references an identifier that was never, and will never be, provided by any
     // other row. That row's payload is a perfectly valid encoded operation — nothing about IT
     // is corrupt — it is simply, genuinely missing a causal dependency, the same real-world
     // shape a partial/corrupted log would have. Reuses `session`'s own sessionId/userId
     // (already valid, from the real commit above) to satisfy operations' author_session/
     // author_user foreign keys without needing to hand-construct a sessions row.
-    const orphanOp: Operation = {
+    const orphanOp: InsertOperation = {
       kind: "insert",
       id: { c: 999, r: session.replicaId },
       value: 0x7a,
-      originLeft: { c: 424242, r: 424242 }, // never provided by any row, on purpose
-      originRight: null,
+      parent: { c: 424242, r: 424242 }, // never provided by any row, on purpose
+      side: "R",
       bind: false,
     };
     await pool.query(

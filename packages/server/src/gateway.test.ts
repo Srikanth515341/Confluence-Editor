@@ -175,8 +175,8 @@ function sendInsert(ws: WebSocket, op: ReturnType<Engine["localInsert"]>): void 
     kind: "opInsert",
     seq: 0,
     id: op.id,
-    originLeft: op.originLeft,
-    originRight: op.originRight,
+    parent: op.parent,
+    side: op.side,
     bind: op.bind,
     value: op.value,
   };
@@ -335,8 +335,8 @@ describe("Two clients, one document — operations reach the other peer and both
         kind: "insert",
         id: relayedMsg.id,
         value: relayedMsg.value,
-        originLeft: relayedMsg.originLeft,
-        originRight: relayedMsg.originRight,
+        parent: relayedMsg.parent,
+        side: relayedMsg.side,
         bind: relayedMsg.bind,
       });
       expect(relayedMsg.seq).toBeGreaterThan(0);
@@ -524,12 +524,11 @@ describe("Offline-window sweep, end to end over the real wire protocol (Phase 24
       }
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    // writePath.ts acks EVERY durably-committed operation unconditionally, regardless of
-    // whether it ended up ready or pending (API Spec §6.3's ack-implies-DURABILITY design,
-    // Phase 16 -- readiness is a separate, live-structure-only concern) -- so `staleOp` gets a
-    // real OP_ACK here too, which must be drained before the LATER OP_REJECT can be read.
-    await frames.nextOps();
-
+    // Phase 25's DUR-06 fix: `staleOp` is buffered (not ready), so writePath.ts does NOT ack it
+    // here -- acking-implies-durability (API Spec §6.3, PRD FR-PS-2) means an operation the
+    // server's own engine just reported as not-yet-integrated must never be acked as if it had
+    // succeeded. No OP_ACK arrives for it at all; the next OPS-channel frame this socket
+    // receives is the OFFLINE_WINDOW_EXCEEDED rejection itself, below.
     const config = { pendingRejectTimeoutMs: 30, sweepIntervalMs: 1_000 };
     runOneOfflineWindowSweep(coordinator, config); // first sighting -- not yet overdue
     await new Promise((resolve) => setTimeout(resolve, 60));

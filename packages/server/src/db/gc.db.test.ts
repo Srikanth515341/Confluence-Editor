@@ -152,8 +152,8 @@ function buildAppendChain(
       kind: "insert",
       id,
       value: valueAt(i),
-      originLeft: prevId,
-      originRight: null,
+      parent: prevId,
+      side: "R",
       bind: false,
     });
     prevId = id;
@@ -231,20 +231,19 @@ async function seedAppendChainDocument(
   return { ops, sessionId, userId, replicaId };
 }
 
-/** Exhaustive per-Test-Plan-M8-c check: for EVERY remaining node, its originLeft/originRight
- * (if non-null) must resolve to some OTHER remaining node — i.e. no live node names a
- * collected node as an origin (Engine Spec I5). This duplicates what `assertInvariants`'s I4
- * check already does internally, independently re-implemented here (not calling into the
- * same code path) specifically because Phase 20's investigation showed "the same mechanism
- * checks itself" is not enough confidence for exactly this class of anchor-tracking bug. */
+/** Exhaustive per-Test-Plan-M8-c check: for EVERY remaining node, its `parent` (Fugue port,
+ * 2026-09-05 — the single causal-dependency reference replacing the retired originLeft/
+ * originRight pair; if non-null) must resolve to some OTHER remaining node — i.e. no live node
+ * names a collected node as an origin (Engine Spec I5). This duplicates what
+ * `assertInvariants`'s I4 check already does internally, independently re-implemented here (not
+ * calling into the same code path) specifically because Phase 20's investigation showed "the
+ * same mechanism checks itself" is not enough confidence for exactly this class of
+ * anchor-tracking bug. */
 function assertNoDanglingOrigins(engine: Engine): void {
   const ids = new Set(engine.nodes.map((n) => serializeId(n.id)));
   for (const node of engine.nodes) {
-    if (node.originLeft !== null) {
-      expect(ids.has(serializeId(node.originLeft))).toBe(true);
-    }
-    if (node.originRight !== null) {
-      expect(ids.has(serializeId(node.originRight))).toBe(true);
+    if (node.parent !== null) {
+      expect(ids.has(serializeId(node.parent))).toBe(true);
     }
   }
 }
@@ -527,8 +526,8 @@ describe("Phase 21 safety cap — a pathological GC cycle does not freeze the ev
         kind: "insert",
         id,
         value: 97 + (i % 26),
-        originLeft: prevId,
-        originRight: null,
+        parent: prevId,
+        side: "R",
         bind: false,
       });
       ids.push(id);

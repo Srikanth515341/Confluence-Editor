@@ -18,20 +18,68 @@
 //
 // Steps 1-3 are evaluated AFTER step 4's expansion in the code below (not step order 1,2,3,4)
 // -- see the code's own comment at that point for why.
+//
+// Phase 25 (DUR-06 fix) — steps 5 through 9 above describe the FAST PATH only: every operation
+// in the incoming message is immediately causally ready, and nothing else was waiting on it.
+// That is overwhelmingly the common case, and the fast path below is byte-for-byte the same
+// code that ran before this fix (down to the exact `maybeCrash` site placement DUR-03 depends
+// on) — it is not a new, parallel implementation.
+//
+// The fix this phase adds is for the OTHER case: `Engine.applyRemote` can report an operation
+// as `{buffered: true}` — its causal dependency (e.g. a concurrently-dropped/delayed peer
+// operation) hasn't arrived at the SERVER yet. Before this fix, writePath.ts ignored that
+// return value entirely and broadcast/committed/acked the operation anyway — a direct
+// violation of PRD FR-PS-2 ("acknowledgement implies durability"), since the server's own
+// engine had just reported it was NOT ready, and worse, could hand a peer an operation whose
+// own dependency the SERVER ITSELF doesn't have yet, risking a PERMANENT orphan if that
+// dependency is later dropped for good (this is exactly DUR-06's own root cause).
+//
+// The SLOW PATH (`finalizeSlowPath` below) is taken whenever any operation in the incoming
+// message is buffered, OR whenever readiness-checking this message's own operations happens to
+// resolve some UNRELATED, previously-buffered operation as a side effect of `Engine.drain()`
+// (e.g. this message finally supplies operation X's missing dependency, and X was submitted by
+// a completely different session in an earlier message). In the slow path:
+//   - seq is assigned LAZILY, only at the moment an operation is actually finalized — never
+//     reserved up front for an operation that might still be sitting in `engine.pending` —
+//     so `coordinator.currentSeq` can never race ahead of a lower-seq operation that isn't
+//     ready yet (which would make a CATCHUP query silently skip that operation forever, since
+//     CATCHUP's own range query is `seq > lastServerSeq`, not "whatever seq was reserved").
+//   - a delete's GC context (Engine Spec §7.3, Phase 21) is recorded via `Engine.
+//     setDeleteContext` explicitly, at the same moment its real seq is assigned, since seq
+//     isn't known at the time `applyRemote` first determines readiness.
+//   - `DocumentCoordinator.pendingOpOrigin` recovers the ORIGINAL sender's identity for an
+//     operation that resolves as someone else's side effect — needed because the session
+//     object handling THIS message has no other way to know whose operation just finalized.
+//   - each finalized operation is broadcast/committed/acked INDIVIDUALLY (a mixed-readiness
+//     batch has no single compact run/batch wire shape left to relay), never as the original
+//     message's own compact frame.
 
-import type { Operation } from "@collab-editor/engine";
+import { serializeId, type Operation } from "@collab-editor/engine";
 import {
   encodeFrame,
+  operationToOpDelete,
+  operationToOpInsert,
+  operationToOpUndelete,
   RejectReason,
   SessionRole,
   type AckEntry,
+  type OpAckMessage,
+  type OpDeleteMessage,
+  type OpInsertMessage,
+  type OpRejectMessage,
   type OpsMessage,
+  type OpUndeleteMessage,
   type RejectEntry,
 } from "@collab-editor/protocol";
-import type { CoordinatorSession, DocumentCoordinator } from "./documentCoordinator.js";
+import type {
+  CoordinatorSession,
+  DocumentCoordinator,
+  PendingOpOrigin,
+} from "./documentCoordinator.js";
 import { toOperations } from "./ingest.js";
 import { logger } from "./logger.js";
 import { maybeScheduleSnapshot } from "./snapshotter.js";
+import { maybeCrash } from "./testOnlyCrashInjection.js";
 
 /**
  * DUR-04's mutation switch. Reading `process.env` (not a constructor
@@ -68,6 +116,9 @@ export interface WritePathDeps {
 export interface WritePathTestHooks {
   readonly simulateCrashAtCommitPoint?: () => void;
 }
+
+/** `OpsMessage` minus the two server-only, seq-less kinds — narrowed once here rather than at every downstream call site, since `processIncomingOperation`'s own early throw guard only narrows within that function's own body, not across the `runFastPath`/`runSlowPath` function boundary. */
+type ClientOpsMessage = Exclude<OpsMessage, OpAckMessage | OpRejectMessage>;
 
 /**
  * Step 1: authorize. Phase 24 gives this its first REAL (if still minimal) check: a session
@@ -122,6 +173,12 @@ export async function processIncomingOperation(
   // the CODE relative to the spec's own step NUMBERING, not its effect: a rejection at any
   // step still needs the same expand-then-name mechanics regardless of which check fired it
   // (matching step 2's own pre-existing precedent, already evaluated after expansion below).
+  // DUR-03 site (a) "after frame receipt, before authorization" -- checked at this function's
+  // own entry, since every DUR-03 test in this codebase drives processIncomingOperation
+  // directly (the same headless-simulated-client pattern Phase 18/21's own DB tests already
+  // established as sufficient), so "frame receipt" for those tests IS this call.
+  maybeCrash("afterFrameReceipt");
+
   const ops = toOperations(msg);
   if (ops.length === 0) {
     return;
@@ -158,24 +215,93 @@ export async function processIncomingOperation(
     return;
   }
 
-  // Step 5/6, reordered relative to their numbering but not their EFFECT: `startSeq` is
-  // computed (not yet committed to `coordinator.currentSeq`) BEFORE applying, so each
-  // operation's seq is known AT apply time and can be threaded into `applyRemote`'s optional
-  // GC context (Phase 21, Engine Spec §7.3) — a Delete's causal-stability check needs to know
-  // its OWN seq, which didn't exist yet under the original apply-then-assign order. Still
-  // fully synchronous end to end (no `await` between reading `coordinator.currentSeq` and
-  // advancing it below), so the "no other write path can interleave here" monotonicity
-  // argument this step's own original comment made is unaffected.
-  //
+  // DUR-03 site (b) "after authorization, before engine.applyRemote": every pre-apply
+  // validation step (1-3) has now passed, and nothing below has touched the engine yet.
+  maybeCrash("afterAuthorization");
+
   // Step 5: apply to the server's own engine, same order as the wire representation (a
-  // run/batch's internal ordering is already causally correct per expand.ts). `atMs` is
-  // wall-clock time ONLY the server ever supplies — packages/engine itself never reads a
-  // clock (Engine Spec C9); this is server code, outside that purity boundary.
+  // run/batch's internal ordering is already causally correct per expand.ts). Applied WITHOUT
+  // a GC context here — deliberately: seq is not known yet (Phase 25's own lazy-assignment
+  // fix, see this file's header comment), and a delete's GC context is recorded separately,
+  // via `Engine.setDeleteContext`, at whichever point (fast or slow path) its real seq is
+  // actually assigned.
+  //
+  // `pendingBefore` snapshots BOTH the identifiers AND the Operation objects themselves,
+  // captured before this message's own ops are applied — this is what lets the slow path
+  // recover the actual Operation (not just its id) for anything that drains as a SIDE EFFECT
+  // of this message, since `engine.pending` is mutated in place and the departed object would
+  // otherwise be unrecoverable after the fact.
+  const pendingBefore = new Map<string, Operation>();
+  for (const p of coordinator.engine.pending) {
+    pendingBefore.set(serializeId(p.id), p);
+  }
+
+  const applyResults: Array<{ op: Operation; buffered: boolean }> = [];
+  for (const op of ops) {
+    const { buffered } = coordinator.engine.applyRemote(op);
+    applyResults.push({ op, buffered });
+    if (buffered) {
+      coordinator.pendingOpOrigin.set(serializeId(op.id), {
+        sessionId: session.sessionId,
+        userId: session.userId,
+        displayName: session.displayName,
+        replicaId: session.replicaId,
+      });
+    }
+  }
+
+  // DUR-03 site (c) "after applyRemote, before sequence assignment": no seq has been assigned
+  // yet in either path at this point.
+  maybeCrash("afterApplyRemote");
+
+  const stillPendingIds = new Set(coordinator.engine.pending.map((p) => serializeId(p.id)));
+  const sideEffectResolved: Operation[] = [];
+  for (const [id, op] of pendingBefore) {
+    if (!stillPendingIds.has(id)) {
+      sideEffectResolved.push(op);
+    }
+  }
+
+  const allThisMessageReady = applyResults.every((r) => !r.buffered);
+
+  if (allThisMessageReady && sideEffectResolved.length === 0) {
+    await runFastPath({ coordinator, session, msg, ops }, hooks);
+    return;
+  }
+
+  await runSlowPath({ coordinator, session, applyResults, sideEffectResolved });
+}
+
+/**
+ * The common case, unchanged in behavior (down to `maybeCrash` site placement) from before
+ * Phase 25's DUR-06 fix: every operation in `ops` was already confirmed ready by the caller.
+ * Steps 6-9 (API Spec §6.3), exactly as originally implemented.
+ */
+async function runFastPath(
+  deps: {
+    coordinator: DocumentCoordinator;
+    session: CoordinatorSession;
+    msg: ClientOpsMessage;
+    ops: readonly Operation[];
+  },
+  hooks: WritePathTestHooks,
+): Promise<void> {
+  const { coordinator, session, msg, ops } = deps;
+
+  // Step 5/6, reordered relative to their numbering but not their EFFECT: `startSeq` is
+  // computed (not yet committed to `coordinator.currentSeq`) here, and each operation's seq is
+  // threaded into `Engine.setDeleteContext` for GC (Phase 21, Engine Spec §7.3) — a Delete's
+  // causal-stability check needs to know its OWN seq. Still fully synchronous end to end (no
+  // `await` between reading `coordinator.currentSeq` and advancing it below), so the "no other
+  // write path can interleave here" monotonicity argument this step's own original comment
+  // made is unaffected.
   const startSeq = coordinator.currentSeq + 1n;
   const appliedAtMs = Date.now();
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i]!;
-    coordinator.engine.applyRemote(op, { seq: startSeq + BigInt(i), atMs: appliedAtMs });
+    if (op.kind === "delete") {
+      coordinator.engine.setDeleteContext(op.id, { seq: startSeq + BigInt(i), atMs: appliedAtMs });
+    }
   }
 
   // Step 6: assign seq. PER OPERATION, not per frame — operations.seq is the operations
@@ -186,6 +312,10 @@ export async function processIncomingOperation(
   // the relayed/acked seq below is the STARTING seq of that range, not a single shared value.
   coordinator.currentSeq += BigInt(ops.length);
 
+  // DUR-03 site (d) "after sequence assignment, before broadcast": `coordinator.currentSeq`
+  // is now advanced, but no peer has been told anything yet.
+  maybeCrash("afterSeqAssignment");
+
   // Step 7: BROADCAST to peers, BEFORE the transaction below. The relay keeps msg's ORIGINAL
   // compact run/batch wire shape — never expanded into individual OP_INSERT frames — only its
   // `seq` field changes, to the range's start. No `await` has happened yet at this point, so
@@ -193,11 +323,17 @@ export async function processIncomingOperation(
   // single-threaded event loop guarantees no other message's write path can interleave here) —
   // that's what keeps `coordinator.currentSeq` monotonic across concurrent senders without
   // needing an explicit per-document lock.
-  const relay: OpsMessage = { ...msg, seq: Number(startSeq) };
+  const relay: ClientOpsMessage = { ...msg, seq: Number(startSeq) };
   const relayBytes = encodeFrame(relay);
   for (const other of coordinator.otherSessions(session.sessionId)) {
     other.queues.enqueue("ops", relayBytes);
   }
+
+  // DUR-03 site (e) "after broadcast, before BEGIN TRANSACTION": peers have already integrated
+  // this operation (the exact "CORRECT and EXPECTED" scenario the reference text names --
+  // the originating client never got an ack, so it's still in its own durable queue and
+  // resends on reconnection).
+  maybeCrash("afterBroadcast");
 
   const mutated = isAckBeforeCommitMutationActive();
   const ackEntries: AckEntry[] = ops.map((op, i) => ({
@@ -212,9 +348,16 @@ export async function processIncomingOperation(
     hooks.simulateCrashAtCommitPoint?.();
   }
 
-  try {
-    // Step 8. Resolves only once the transaction has actually committed.
-    await coordinator.operationStore.commitOperations({
+  // Step 8, enqueued through the per-document commit queue (Phase 25, DUR-06 fix's own
+  // follow-up finding) rather than called directly — `enqueueCommit` itself is synchronous
+  // (it only schedules `fn` onto the queue's tail; nothing has awaited yet since the seq bump
+  // above), which is what keeps commit EXECUTION order pinned to seq RESERVATION order even
+  // when this call's own `await` below is racing against some OTHER message's write path for
+  // the same document. See DocumentCoordinator.enqueueCommit's own doc comment for the full
+  // hand-traced reasoning (two-author interleaving producing a permanently-skipped CATCHUP
+  // row) this exists to close.
+  const commitPromise = coordinator.enqueueCommit(coordinator.currentSeq, () =>
+    coordinator.operationStore.commitOperations({
       documentId: coordinator.documentId,
       startSeq,
       ops,
@@ -222,12 +365,16 @@ export async function processIncomingOperation(
       authorUser: session.userId,
       replicaId: session.replicaId,
       displayName: session.displayName,
-    });
+    }),
+  );
+  try {
+    // Resolves only once the transaction has actually committed.
+    await commitPromise;
   } catch (err) {
     logger.error("writePath.commitFailed", {
       documentId: coordinator.documentId,
       sessionId: session.sessionId,
-      message: err instanceof Error ? err.message : String(err),
+      errorMessage: err instanceof Error ? err.message : String(err),
     });
     // No ack for a commit that failed (real ordering only reaches here before ever queuing
     // one) — matching DUR-04's own reasoning: the commit never happened, so the client
@@ -240,7 +387,20 @@ export async function processIncomingOperation(
     // Step 9, REAL ORDERING — the commit above has ALREADY happened by the time this line
     // runs, which is the entire point: nothing from here on can un-durable it.
     hooks.simulateCrashAtCommitPoint?.();
+
+    // DUR-03 site (g) "after COMMIT, before OP_ACK is emitted": the row is durably committed
+    // but no ack has been queued yet — the reference text's own "durably committed but the
+    // client was never told" scenario, resolved on reconnect by ALREADY_HAVE/operations_stamp_uq.
+    maybeCrash("afterCommit");
+
     session.ackBatcher.add(ackEntries);
+
+    // DUR-03 site (h) "after OP_ACK, before the client processes it": interpreted as
+    // immediately after the ack has been handed to AckBatcher (queued for send) — the
+    // furthest point reachable synchronously in this process without waiting on a real network
+    // round trip to the client, which is the only thing "before the client processes it" could
+    // still mean once the ack has already been queued for transmission.
+    maybeCrash("afterAck");
   }
 
   // Not one of API Spec §6.3's nine steps — this project's own addition, RFC §13.2's
@@ -250,4 +410,144 @@ export async function processIncomingOperation(
   // completion entirely (snapshotter.ts) — this line must never be what makes
   // processIncomingOperation take longer to resolve.
   maybeScheduleSnapshot(coordinator, ops.length);
+}
+
+function toWireMessage(op: Operation, seq: number): OpInsertMessage | OpDeleteMessage | OpUndeleteMessage {
+  switch (op.kind) {
+    case "insert":
+      return operationToOpInsert(op, seq);
+    case "delete":
+      return operationToOpDelete(op, seq);
+    case "undelete":
+      return operationToOpUndelete(op, seq);
+  }
+}
+
+interface FinalizeItem {
+  readonly op: Operation;
+  readonly origin: PendingOpOrigin;
+  seq: bigint;
+}
+
+/**
+ * The DUR-06-fix path: at least one operation in this message was buffered, or applying this
+ * message's own operations resolved some OTHER, previously-buffered operation as a side
+ * effect. Nothing in `applyResults`/`sideEffectResolved` has been broadcast, committed, or
+ * acked yet — this function is the only place that happens, for exactly the operations that
+ * are actually ready RIGHT NOW, never for one still sitting in `engine.pending`.
+ */
+async function runSlowPath(deps: {
+  coordinator: DocumentCoordinator;
+  session: CoordinatorSession;
+  applyResults: ReadonlyArray<{ op: Operation; buffered: boolean }>;
+  sideEffectResolved: readonly Operation[];
+}): Promise<void> {
+  const { coordinator, session, applyResults, sideEffectResolved } = deps;
+
+  const toFinalize: Array<Omit<FinalizeItem, "seq">> = [];
+  const thisMessageOrigin: PendingOpOrigin = {
+    sessionId: session.sessionId,
+    userId: session.userId,
+    displayName: session.displayName,
+    replicaId: session.replicaId,
+  };
+  for (const { op, buffered } of applyResults) {
+    if (!buffered) {
+      toFinalize.push({ op, origin: thisMessageOrigin });
+    }
+  }
+  for (const op of sideEffectResolved) {
+    const key = serializeId(op.id);
+    const origin = coordinator.pendingOpOrigin.get(key);
+    coordinator.pendingOpOrigin.delete(key);
+    if (!origin) {
+      // Should not happen for anything that was ever live in `engine.pending` on this
+      // process (every buffering `applyRemote` call above records an origin first) — a
+      // defensive guard, not an expected path. Logged, not thrown: the operation is already
+      // structurally integrated into the engine regardless, so refusing to finalize it would
+      // just create a second, worse bug (a node peers can never learn about).
+      logger.error("writePath.missingPendingOrigin", {
+        documentId: coordinator.documentId,
+        opId: key,
+      });
+      continue;
+    }
+    toFinalize.push({ op, origin });
+  }
+
+  if (toFinalize.length === 0) {
+    // This message's own operation(s) all buffered, and nothing else resolved as a side
+    // effect — nothing to broadcast/commit/ack yet. The offline-window sweep
+    // (offlineWindowScheduler.ts) is what eventually rejects this if it never resolves.
+    return;
+  }
+
+  // Assign seq LAZILY, synchronously, in one pass with no `await` — see this file's header
+  // comment for why this must never race ahead of a still-buffered lower-seq operation.
+  const appliedAtMs = Date.now();
+  let seq = coordinator.currentSeq;
+  const finalized: FinalizeItem[] = [];
+  for (const item of toFinalize) {
+    seq += 1n;
+    if (item.op.kind === "delete") {
+      coordinator.engine.setDeleteContext(item.op.id, { seq, atMs: appliedAtMs });
+    }
+    finalized.push({ ...item, seq });
+  }
+  coordinator.currentSeq = seq;
+
+  // Broadcast each finalized operation individually — a mixed-readiness batch has no single
+  // compact run/batch wire shape left to relay (protocol/src/catchupOps.ts already established
+  // this exact single-operation frame shape for CATCHUP_CHUNK; reused here).
+  for (const item of finalized) {
+    const bytes = encodeFrame(toWireMessage(item.op, Number(item.seq)));
+    for (const other of coordinator.otherSessions(item.origin.sessionId)) {
+      other.queues.enqueue("ops", bytes);
+    }
+  }
+
+  // Enqueue EVERY finalized item's commit synchronously, in one tight loop, BEFORE awaiting any
+  // of them (Phase 25, DUR-06 fix's own follow-up finding). This is the load-bearing property:
+  // enqueueing here happens in the exact same synchronous stretch as the seq assignment above
+  // (no `await` anywhere in between, for any item) — so enqueue order, and therefore commit
+  // EXECUTION order (DocumentCoordinator.enqueueCommit serializes strictly FIFO), is provably
+  // identical to seq order regardless of how many items or distinct authors are in `finalized`,
+  // and regardless of what any OTHER concurrently-processing message for this same document
+  // does in between. Awaiting them one at a time, in order, below is what preserves this file's
+  // existing "ack only after ITS OWN commit resolves" guarantee — it does not reintroduce the
+  // ordering risk, since the actual DB writes are already pinned to the right order by the time
+  // any of these awaits even begin.
+  const commitPromises = finalized.map((item) =>
+    coordinator.enqueueCommit(item.seq, () =>
+      coordinator.operationStore.commitOperations({
+        documentId: coordinator.documentId,
+        startSeq: item.seq,
+        ops: [item.op],
+        authorSession: item.origin.sessionId,
+        authorUser: item.origin.userId,
+        replicaId: item.origin.replicaId,
+        displayName: item.origin.displayName,
+      }),
+    ),
+  );
+
+  for (let i = 0; i < finalized.length; i++) {
+    const item = finalized[i]!;
+    try {
+      await commitPromises[i];
+    } catch (err) {
+      logger.error("writePath.commitFailed", {
+        documentId: coordinator.documentId,
+        sessionId: item.origin.sessionId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+      });
+      continue; // no ack for a commit that failed — same reasoning as the fast path.
+    }
+    const liveSession = coordinator.getSession(item.origin.sessionId);
+    if (liveSession) {
+      liveSession.ackBatcher.add([{ ackSeq: Number(item.seq), ackedId: item.op.id }]);
+    }
+  }
+
+  maybeScheduleSnapshot(coordinator, finalized.length);
 }

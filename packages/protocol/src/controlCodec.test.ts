@@ -19,8 +19,8 @@ const insertOpArb = fc.record({
   kind: fc.constant("insert" as const),
   id: fc.record({ c: fc.integer({ min: 1, max: 5_000_000 }), r: fc.nat({ max: 500 }) }),
   value: fc.integer({ min: 0x20, max: 0x7e }),
-  originLeft: fc.constant(null),
-  originRight: fc.constant(null),
+  parent: fc.constant(null),
+  side: fc.constant("R" as const),
   bind: fc.boolean(),
 });
 
@@ -228,8 +228,8 @@ describe("CONTROL codec — CATCHUP_CHUNK carries real operations (Phase 23, API
           kind: "insert",
           id: { c: 5, r: 2 },
           value: 0x68,
-          originLeft: null,
-          originRight: null,
+          parent: null,
+          side: "R",
           bind: false,
         },
         { kind: "delete", id: { c: 6, r: 2 }, target: { c: 5, r: 2 } },
@@ -244,8 +244,8 @@ describe("CONTROL codec — CATCHUP_CHUNK carries real operations (Phase 23, API
         kind: "insert",
         id: { c: 5, r: 2 },
         value: 0x68,
-        originLeft: null,
-        originRight: null,
+        parent: null,
+        side: "R",
         bind: false,
       });
       expect(decoded.ops[1]).toEqual({ kind: "delete", id: { c: 6, r: 2 }, target: { c: 5, r: 2 } });

@@ -159,8 +159,8 @@ describe("SyncClient — handshake and messaging, against a fake socket", () => 
       {
         id: { c: 1, r: 5 },
         value: 0x68,
-        originLeft: null,
-        originRight: null,
+        parent: null,
+        side: "R",
         bind: false,
         deleted: false,
         deletedBy: null,
@@ -168,8 +168,8 @@ describe("SyncClient — handshake and messaging, against a fake socket", () => 
       {
         id: { c: 2, r: 5 },
         value: 0x69,
-        originLeft: { c: 1, r: 5 },
-        originRight: null,
+        parent: { c: 1, r: 5 },
+        side: "R",
         bind: false,
         deleted: false,
         deletedBy: null,
@@ -296,8 +296,8 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
       kind: "opInsert",
       seq,
       id: { c, r: 99 },
-      originLeft: null,
-      originRight: null,
+      parent: null,
+      side: "R",
       bind: false,
       value: 0x7a,
     });

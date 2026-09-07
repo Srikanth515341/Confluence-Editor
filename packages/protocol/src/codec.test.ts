@@ -22,12 +22,14 @@ const rejectReasonArb = fc.constantFrom(
   ...(Object.values(RejectReason).filter((v) => typeof v === "number") as RejectReason[]),
 );
 
+const sideArb = fc.constantFrom("L" as const, "R" as const);
+
 const opInsertArb: fc.Arbitrary<OpsMessage> = fc.record({
   kind: fc.constant("opInsert" as const),
   seq: fc.constant(0),
   id: idArb,
-  originLeft: optionalIdArb,
-  originRight: optionalIdArb,
+  parent: optionalIdArb,
+  side: sideArb,
   bind: fc.boolean(),
   value: scalarArb,
 });
@@ -37,8 +39,8 @@ const opInsertRunArb: fc.Arbitrary<OpsMessage> = fc.record({
   kind: fc.constant("opInsertRun" as const),
   seq: fc.constant(0),
   firstId: idArb,
-  originLeft: optionalIdArb,
-  originRight: optionalIdArb,
+  firstParent: optionalIdArb,
+  firstSide: sideArb,
   bind: fc.boolean(),
   values: fc.array(scalarArb, { minLength: 2, maxLength: 20 }),
 });
@@ -183,8 +185,8 @@ describe("codec — OP_INSERT_RUN expansion (§3.5.2)", () => {
 
     // Engine A originates the run the normal way: 2,000 sequential
     // localInsert() calls at the end of the document produce consecutive
-    // counters and the exact chained-originLeft / shared-originRight shape
-    // expand.ts documents.
+    // counters and the exact chained-parent / side:"R" shape expand.ts
+    // documents (Fugue port, 2026-09-05).
     const originEngine = new Engine(REPLICA_A);
     const chars = Array.from({ length: N }, (_, i) => 0x61 + (i % 26));
     const ops = chars.map((value) => originEngine.localInsert(originEngine.text().length, value));
@@ -193,8 +195,8 @@ describe("codec — OP_INSERT_RUN expansion (§3.5.2)", () => {
       kind: "opInsertRun" as const,
       seq: 0,
       firstId: ops[0]!.id,
-      originLeft: ops[0]!.originLeft,
-      originRight: ops[0]!.originRight,
+      firstParent: ops[0]!.parent,
+      firstSide: ops[0]!.side,
       bind: ops[0]!.bind, // ASCII, so uniformly false across the whole run — satisfies §3.5.2's "bind applies to the WHOLE run"
       values: chars,
     };
@@ -220,8 +222,8 @@ describe("codec — OP_INSERT_RUN expansion (§3.5.2)", () => {
         kind: "opInsert" as const,
         seq: 0,
         id: op.id,
-        originLeft: op.originLeft,
-        originRight: op.originRight,
+        parent: op.parent,
+        side: op.side,
         bind: op.bind,
         value: op.value,
       };
@@ -423,8 +425,8 @@ describe("codec — debugProject (mandatory, used by all logging and test failur
       kind: "opInsert",
       seq: 0,
       id: sampleId,
-      originLeft: null,
-      originRight: null,
+      parent: null,
+      side: "R",
       bind: false,
       value: 0x61,
     },
@@ -432,8 +434,8 @@ describe("codec — debugProject (mandatory, used by all logging and test failur
       kind: "opInsertRun",
       seq: 0,
       firstId: sampleId,
-      originLeft: null,
-      originRight: null,
+      firstParent: null,
+      firstSide: "R",
       bind: false,
       values: [0x61, 0x62, 0x63],
     },
@@ -477,20 +479,39 @@ describe("codec — debugProject (mandatory, used by all logging and test failur
 });
 
 describe("codec — measured frame size (API/Protocol/Data Spec §1.3)", () => {
-  it("a single insert at counters near 50,000, replica ids 1-8, encodes to exactly 18 bytes", () => {
+  it("a single insert at counters near 50,000, replica ids 1-8, encodes to exactly 18 bytes (pre-Fugue baseline, two origin stamps)", () => {
+    // Historical baseline, kept for its own narrative value (see the test immediately below
+    // for the CURRENT, post-Fugue-port measurement): §1.3's "One insert = 18 B" held for the
+    // retired originLeft/originRight (two-optional-stamp) wire shape. This exact scenario is
+    // no longer directly reproducible on the CURRENT OpInsertMessage type (there is no second
+    // origin field to populate any more) — reconstructed here via raw byte arithmetic instead
+    // of a real encodeFrame call, purely to keep the historical number's derivation visible and
+    // checkable rather than deleting it outright.
+    // envelope(3) + seq(1) + flags(1) + id stamp(4: c=50000 costs 3 varint bytes, r=2 costs 1)
+    // + originLeft stamp(4: c=49999 costs 3, r=2 costs 1) + originRight stamp(4: c=49998 costs
+    // 3, r=1 costs 1) + value(1) = 18.
+    expect(3 + 1 + 1 + 4 + 4 + 4 + 1).toBe(18);
+  });
+
+  it("a single insert at counters near 50,000, replica ids 1-8, encodes to exactly 14 bytes as of the Fugue port — a real, measured wire-size REDUCTION, not just a rename", () => {
+    // Fugue port (2026-09-05): OpInsertMessage carries ONE optional causal-dependency stamp
+    // (`parent`) instead of two (`originLeft`/`originRight`) — `side` costs a single bit inside
+    // the existing flags byte, not a whole extra optional stamp. This is a genuine, measured
+    // improvement over the pre-Fugue baseline above (18 bytes), not a coincidence of this
+    // specific test's own numbers — see codec.ts's own FLAG_HAS_PARENT/FLAG_SIDE_R comment.
     const near50k = 50_000;
     const msg: OpsMessage = {
       kind: "opInsert",
       seq: 0,
       id: { c: near50k, r: 2 },
-      originLeft: { c: near50k - 1, r: 2 },
-      originRight: { c: near50k - 2, r: 1 },
+      parent: { c: near50k - 1, r: 2 },
+      side: "R",
       bind: false,
       value: 0x61, // ASCII 'a'
     };
     const bytes = encodeFrame(msg);
-    // §1.3: "Binary (chosen): One insert = 18 B" — measured exactly, not approximately,
-    // now that the envelope carries no extraneous frame-level flags byte.
-    expect(bytes.length).toBe(18);
+    // envelope(3) + seq(1) + flags(1) + id stamp(4: c=50000 costs 3 varint bytes, r=2 costs 1)
+    // + parent stamp(4: c=49999 costs 3, r=2 costs 1) + value(1) = 14.
+    expect(bytes.length).toBe(14);
   });
 });

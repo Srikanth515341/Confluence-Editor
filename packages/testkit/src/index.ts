@@ -8,3 +8,8 @@
 export const TESTKIT_PACKAGE_NAME = "@collab-editor/testkit";
 
 export * from "./fuzz/index.js";
+export {
+  startFaultRelay,
+  type FaultRelay,
+  type FaultRelayOptions,
+} from "./faultrelay/faultRelay.js";

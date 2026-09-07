@@ -11,8 +11,8 @@
 import { Engine } from "@collab-editor/engine";
 
 /** Builds the exact pathological shape the 853s figure came from: `count` sequential
- * append-chain characters (originLeft chains to the immediate predecessor — real sequential
- * typing produces exactly this shape), the first `deleteCount` of them tombstoned with real
+ * append-chain characters (`parent` chains to the immediate predecessor, `side: "R"` — real
+ * sequential typing produces exactly this shape under Fugue), the first `deleteCount` of them tombstoned with real
  * GC context, leaving an UNRESOLVED anchor chain (the still-live character right after the
  * deleted prefix permanently references the last deleted one — Engine Spec I4/I5 correctly
  * refuses to ever collect any of them). */
@@ -26,8 +26,8 @@ function buildPathologicalChain(count: number, deleteCount: number): Engine {
       kind: "insert",
       id,
       value: 97 + (i % 26),
-      originLeft: prevId,
-      originRight: null,
+      parent: prevId,
+      side: "R",
       bind: false,
     });
     ids.push(id);

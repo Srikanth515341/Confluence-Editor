@@ -53,8 +53,8 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
         kind: "insert",
         id: node.id,
         value: node.value,
-        originLeft: node.originLeft,
-        originRight: node.originRight,
+        parent: node.parent,
+        side: node.side,
         bind: node.bind,
       };
       markEngine.applyRemote(op);
@@ -93,8 +93,8 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
         kind: "insert",
         id: node.id,
         value: node.value,
-        originLeft: node.originLeft,
-        originRight: node.originRight,
+        parent: node.parent,
+        side: node.side,
         bind: node.bind,
       };
       replicaX.applyRemote(op);
@@ -134,32 +134,24 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
     assertEqual(engine.text(), "AC", "text after delete");
   });
 
-  // Catches M7_no_right_readiness: an insert with a missing originRight
-  // must buffer, never integrate against a nonexistent origin.
-  record(results, "readiness: an insert with a missing originRight must buffer, not apply", () => {
-    const seed = new Engine(100);
-    seed.localInsert(0, cp("A"));
-    const aId = seed.nodes[0]!.id;
+  // Fugue port (2026-09-05) re-derivation: the retired M7_no_right_readiness mutant tested
+  // readiness against the retired originRight dependency specifically — Fugue has exactly
+  // ONE causal dependency per insert (`parent`), so the direct analogue is simply "an insert
+  // whose parent has never been applied must buffer, never integrate against a nonexistent
+  // origin" (Engine Spec §4.2/Definition 4.1, Fugue-era single-reference restatement).
+  record(results, "readiness: an insert whose parent is missing must buffer, not apply", () => {
     const receiver = new Engine(1);
-    receiver.applyRemote({
-      kind: "insert",
-      id: aId,
-      value: cp("A"),
-      originLeft: null,
-      originRight: null,
-      bind: false,
-    });
     const phantomId = { c: 999, r: 999 }; // never applied anywhere
     const result = receiver.applyRemote({
       kind: "insert",
       id: { c: 1, r: 1 },
       value: cp("x"),
-      originLeft: aId,
-      originRight: phantomId,
+      parent: phantomId,
+      side: "R",
       bind: false,
     });
     if (!result.buffered) {
-      throw new Error("insert with a missing originRight applied immediately instead of buffering");
+      throw new Error("insert with a missing parent applied immediately instead of buffering");
     }
     assertEqual(receiver.pending.length, 1, "pending count");
   });
@@ -176,8 +168,8 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
         kind: "insert",
         id: node.id,
         value: node.value,
-        originLeft: node.originLeft,
-        originRight: node.originRight,
+        parent: node.parent,
+        side: node.side,
         bind: node.bind,
       };
       author.applyRemote(op);
@@ -220,8 +212,8 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
           kind: "insert",
           id: node.id,
           value: node.value,
-          originLeft: node.originLeft,
-          originRight: node.originRight,
+          parent: node.parent,
+          side: node.side,
           bind: node.bind,
         };
         engine.applyRemote(op);
@@ -268,8 +260,8 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
           kind: "insert",
           id: node.id,
           value: node.value,
-          originLeft: node.originLeft,
-          originRight: node.originRight,
+          parent: node.parent,
+          side: node.side,
           bind: node.bind,
         };
         low.applyRemote(op);

@@ -8,7 +8,7 @@ import type {
   UndeleteOperation,
 } from "./operation.js";
 import { isClusterContinuing } from "./grapheme.js";
-import { PositionIndex } from "./positionIndex.js";
+import { FugueTree } from "./fugueTree.js";
 
 /** Structural metrics feeding PRD M8 / RFC §7.8's tombstone-ratio observability. */
 export interface EngineStats {
@@ -34,39 +34,23 @@ export type ClockEvent =
   { readonly kind: "mint" } | { readonly kind: "observe"; readonly remoteCounter: number };
 
 /**
- * Disambiguator rank (Engine Spec Definition 4.2). Binding rank precedes
- * replica id so a combining mark always sorts nearer its base than a
- * concurrently-inserted ordinary character. Engine Spec I8; the failure
- * is order-dependent and invisible in one of two replica-id orderings — §10.8.
- */
-function rank(n: Node): readonly [number, number] {
-  return [n.bind ? 0 : 1, n.id.r];
-}
-
-/** Negative iff `a` outranks `b` (sorts nearer the left origin). */
-function compareRank(a: Node, b: Node): number {
-  const ra = rank(a);
-  const rb = rank(b);
-  return ra[0] !== rb[0] ? ra[0] - rb[0] : ra[1] - rb[1];
-}
-
-/** Identifier equality, treating `null` (⊥, a structure boundary) as equal only to itself. */
-function sameOrigin(a: Identifier | null, b: Identifier | null): boolean {
-  if (a === null || b === null) {
-    return a === b;
-  }
-  return compareIds(a, b) === 0;
-}
-
-/**
- * OBSEQ convergence engine — Phase 1 shell.
+ * OBSEQ convergence engine.
  *
- * This phase implements only the data structures and identifier generation
- * (Engine Spec §2, §3). integrate() / applyRemote() / applyDelete() /
- * applyUndelete() (Engine Spec §4.3–§4.6) are Phase 3; the index (§8.5,
- * {@link PositionIndex}) was added Phase 19; garbage collection (§7) is
- * Phase 21; undo (§9) is Phase 36. The shape below exists now so later
- * phases extend one class rather than re-deriving its fields.
+ * As of 2026-09-05 (the "Fugue port"), positioning is implemented via
+ * {@link FugueTree} — Weidner & Kleppmann's Fugue algorithm
+ * (arXiv:2305.00583) — REPLACING the prior YATA-family scan entirely
+ * (Phase 3's own Case A/B/C derivation, later a direct port of the real
+ * published YATA algorithm as of the R0010 correction). See CLAUDE.md's
+ * "Fugue port" entry for the full investigation: FOUR distinct
+ * convergence defects (R0008, R0009, R0010, R0011) were found across
+ * this project's own hand-derived scan, the real published YATA
+ * algorithm, AND production Yjs's own shipped code — all stemming from
+ * the SAME root cause (a scan window between two separately-tracked
+ * origin identifiers must be re-resolved against the CURRENT structure on
+ * every integration, and two nodes never directly compared can end up in
+ * opposite relative order on different replicas). Fugue's own design has
+ * no analogue of that mechanism: a node's tree attachment (`parent` +
+ * `side`) is decided ONCE, at creation, and never recomputed.
  *
  * Purity: this class touches nothing but its own in-memory fields. No DOM,
  * no network, no storage, no wall clock — enforced independently by
@@ -82,22 +66,16 @@ export class Engine {
   private clock = 0;
 
   /**
-   * Ordered node sequence S (Engine Spec Definition 2.2), backed as of
-   * Phase 19 by {@link PositionIndex} — a balanced tree, not a flat array
-   * (Engine Spec §8.5). `nodes` itself stays a public GETTER returning a
-   * fresh in-order traversal, preserving the exact same external shape
-   * (`readonly Node[]`) every existing caller across the workspace already
-   * relies on (server's replay endpoints, snapshotting, the audit module,
-   * every invariant check) — none of them needed to change. This getter is
-   * O(N), same as the flat array it replaces would cost for the same
-   * "materialize the whole sequence" operation; the actual fix is that nothing
-   * on the hot path (integrate()'s origin lookups, localInsert/localDelete's
-   * visible-position lookups) calls this getter anymore — see `index` below.
+   * Ordered node sequence S (Engine Spec Definition 2.2), backed by
+   * {@link FugueTree} — a tree, not a flat array or treap. `nodes` stays a
+   * public GETTER returning a fresh in-order traversal, preserving the
+   * exact same external shape (`readonly Node[]`) every existing caller
+   * across the workspace already relies on.
    */
-  private readonly index = new PositionIndex();
+  private readonly tree = new FugueTree();
 
   get nodes(): readonly Node[] {
-    return this.index.toArray();
+    return this.tree.toArray();
   }
 
   /**
@@ -159,14 +137,9 @@ export class Engine {
    * the freshly-minted operation was applied locally. Convergence was
    * completely unaffected — identifiers stayed unique and totally ordered,
    * and all 60,000 fuzz seeds passed — but counters for sequential typing
-   * ran 1,3,5,7,9 instead of 1,2,3,4,5. Consecutive counters are exactly
-   * what RFC §7.5's block run-length encoding requires (Engine Spec
-   * Definition 7.5, condition 2), so block compression on ordinary typing
-   * silently collapsed from a measured 20,000x to 1.0x — the entire M8
-   * memory-recovery strategy stopped working, with every correctness test
-   * still green. Invariant I0 exists because of this exact failure, and it
-   * is why mint() and observe() are separate methods below and must NEVER
-   * be merged into one "tick-and-merge" routine, no matter how convenient
+   * ran 1,3,5,7,9 instead of 1,2,3,4,5. This is Invariant I0, and it is why
+   * mint() and observe() are separate methods below and must NEVER be
+   * merged into one "tick-and-merge" routine, no matter how convenient
    * that looks at a call site.
    */
   mint(): Identifier {
@@ -197,7 +170,7 @@ export class Engine {
    * Visible sequence vis(S): non-tombstoned nodes, in structure order
    * (Definition 2.3). O(N) — used only for whole-document reads (`text()`,
    * `stats()`); the per-character hot paths (`localInsert`/`localDelete`)
-   * no longer call this (Phase 19) and go straight through `index`.
+   * go straight through the tree's own O(log N)-ish (O(depth)) lookups.
    */
   visible(): readonly Node[] {
     return this.nodes.filter((n) => !n.deleted);
@@ -212,13 +185,12 @@ export class Engine {
 
   /**
    * Structural metrics: total nodes, tombstone count, visible length. Reads
-   * `index.size`/`index.visibleSize` directly (O(1), Phase 19) rather than
-   * traversing `this.nodes` — the augmented counts the tree already
-   * maintains for every other operation are exactly what this needs too.
+   * `tree.size`/`tree.visibleSize` directly (O(1) — the tree's own
+   * augmented subtree counts) rather than traversing `this.nodes`.
    */
   stats(): EngineStats {
-    const totalElements = this.index.size;
-    const visibleLength = this.index.visibleSize;
+    const totalElements = this.tree.size;
+    const visibleLength = this.tree.visibleSize;
     return {
       totalElements,
       tombstones: totalElements - visibleLength,
@@ -226,217 +198,26 @@ export class Engine {
     };
   }
 
-  /**
-   * Live block count (Engine Spec §7.5, Phase 20) — diagnostic only, read
-   * by no ordering logic, exposed purely so compression can be measured
-   * directly (`stats().totalElements / blockCount`) rather than inferred.
-   */
-  get blockCount(): number {
-    return this.index.blockCount;
-  }
-
-  /**
-   * Resolves an identifier to its materialized Node view. As of Phase 20,
-   * {@link PositionIndex} is the SOLE source of truth for identifier
-   * resolution — this class no longer keeps its own `byKey` map of stable
-   * Node objects (Phase 3/19's design), because block storage means most
-   * nodes are no longer stable, persistent objects at all: they're decoded
-   * on demand from whichever block currently contains them. Keeping a
-   * separate `byKey: Map<string, Node>` here would have held one full Node
-   * object per character regardless of what `PositionIndex` did internally
-   * — exactly the memory cost block compression exists to eliminate
-   * (Engine Spec §7.5, M8-b).
-   */
-  private nodeById(id: Identifier | null): Node | null {
-    if (id === null) {
-      return null;
-    }
-    return this.index.nodeByIdentifier(id) ?? null;
-  }
-
   private isOriginPresent(id: Identifier | null): boolean {
-    return id === null || this.index.hasIdentifier(id);
+    return id === null || this.tree.hasIdentifier(id);
   }
 
   /**
-   * Total-order position of the node identified by `id`, via the O(log N)
-   * {@link PositionIndex.indexOf}. Only ever called on an origin that
-   * `ready()` has already confirmed present — the thrown error documents
-   * that precondition rather than being a reachable runtime case.
+   * Causal readiness (Engine Spec Definition 4.1). As of the Fugue port,
+   * an insert has exactly ONE causal dependency (`parent`), not two —
+   * Fugue's own correctness does not require a separately-tracked
+   * right-boundary reference at all (see `fugueTree.ts`'s own header
+   * comment for why this simplification is sound, not merely convenient).
    */
-  private indexOfOrigin(id: Identifier): number {
-    const position = this.index.indexOf(id);
-    if (position === undefined) {
-      throw new Error(
-        `integrate(): origin ${serializeId(id)} is not present — ready() must be checked before integrating`,
-      );
-    }
-    return position;
-  }
-
-  /** Causal readiness (Engine Spec Definition 4.1). */
   private ready(op: Operation): boolean {
     if (op.kind === "insert") {
-      return this.isOriginPresent(op.originLeft) && this.isOriginPresent(op.originRight);
+      return this.isOriginPresent(op.parent);
     }
-    return this.index.hasIdentifier(op.target);
-  }
-
-  /**
-   * Origin-bounded integration (Engine Spec §4.3). Places `node` into
-   * `this.nodes` at the position the total order requires, scanning only
-   * the region strictly between its origins and resolving every
-   * concurrent insert anchored there without ever consulting arrival
-   * order — see Engine Spec §10.1–§10.8 for the worked traces this
-   * algorithm is checked against.
-   */
-  private integrate(node: Node): void {
-    const leftIndex = node.originLeft === null ? -1 : this.indexOfOrigin(node.originLeft);
-    const rightIndex =
-      node.originRight === null ? this.index.size : this.indexOfOrigin(node.originRight);
-
-    if (leftIndex + 1 === rightIndex) {
-      // Nothing currently sits between our origins — no conflict to resolve.
-      this.index.insertAt(leftIndex + 1, node);
-      return;
-    }
-
-    let destIndex = leftIndex + 1;
-    // Keyed by serialized identifier, not Node object identity — as of Phase 20, `nodeAt`/
-    // `nodeById` decode a FRESH Node object on every call (block storage no longer keeps stable,
-    // persistent objects per node, Phase 19's design), so an object-identity Set (`Set<Node>`,
-    // Phase 3-19's original shape) would silently never find a match: the SAME logical node read
-    // via `nodeAt` at one iteration and via `nodeById` at another would be two different object
-    // instances. Re-keying by identifier is the only change here — the algorithm's control flow
-    // and comparisons below are byte-for-byte what Phase 3 established.
-    const scanned = new Set<string>();
-    const conflicting = new Set<string>();
-
-    // Engine Spec §8.2: this window is already effectively constant (p50=0, p95=4, p99=9 on a
-    // 20,000-node structure) — direct positional reads here, one per scanned node, are the
-    // right call; only the boundary lookups above (leftIndex/rightIndex) and the final
-    // placement below needed to move to the O(log N) index (Phase 19).
-    for (let i = leftIndex + 1; i < rightIndex; i++) {
-      const other = this.index.nodeAt(i);
-      if (!other) {
-        break;
-      }
-      const otherKey = serializeId(other.id);
-      scanned.add(otherKey);
-      conflicting.add(otherKey);
-
-      if (sameOrigin(node.originLeft, other.originLeft)) {
-        // Case A: `other` was anchored at the same left origin as `node`.
-        if (compareRank(other, node) < 0) {
-          destIndex = i + 1;
-          conflicting.clear();
-        } else if (sameOrigin(node.originRight, other.originRight)) {
-          // Case A line 13: the originRight equality test. This is what prevents two users'
-          // concurrently-typed runs from interleaving character-by-character. Without it,
-          // the RFC's prototype produced "[zcybxa]" instead of "[cbazyx]" — convergent but
-          // intention-violating. Engine Spec §4.3, resolved as RFC NQ-2; trace at §10.7.
-          break;
-        }
-        // else: same left origin, different right origin, `other` outranks `node` —
-        // still undetermined, keep scanning without moving destIndex.
-      } else {
-        const otherOriginNode = this.nodeById(other.originLeft);
-        const otherOriginKey = otherOriginNode !== null ? serializeId(otherOriginNode.id) : null;
-        if (otherOriginKey !== null && scanned.has(otherOriginKey)) {
-          // Case B (nested inside scanned region): the group set test.
-          //
-          // *** ENGINE SPEC §6.2 SUB-CASE III-D CORRECTION, PART 2 (2026-09-02/03, R0009) ***
-          // Group-membership alone ("has this group already lost?") is NOT sound when
-          // `other` is chained onto an already-resolved node that was compared against a
-          // DIFFERENT pair than the one actually in question. R0009: a wide-window candidate
-          // correctly beats a direct competitor via Case A; a later, structurally-unrelated
-          // node anchored onto that competitor then blindly inherited its loss via this
-          // branch, WITHOUT its own rank vs the candidate ever being consulted — producing
-          // SILENT, delivery-order-dependent text divergence ("ipt" vs "itp"), no throw, no
-          // canary. For a genuine single-author contiguous run, every member shares its
-          // anchor's own replica id, so `compareRank(other, node) < 0` is automatically
-          // consistent with the group's decision — this check is a no-op there and RFC NQ-2's
-          // non-interleaving guarantee is preserved (verified against a same-author run swept
-          // by a concurrent competitor, plus a depth-2 chain crossing an authorship boundary).
-          // It only changes behavior when a chain crosses an authorship/replica boundary,
-          // which isn't really "one run" to begin with. Full investigation: CLAUDE.md's
-          // "Engine Spec §6.2 sub-case iii-d correction" entry; tests/regression/R0009.
-          if (conflicting.has(otherOriginKey)) {
-            // `other`'s origin is itself still an undetermined member of the current
-            // conflict group — stays undecided, keep scanning without moving destIndex.
-          } else if (compareRank(other, node) < 0) {
-            destIndex = i + 1;
-            conflicting.clear();
-          } else {
-            // The group resolved to "advance," but `other` itself does not outrank `node` —
-            // do not blindly inherit. Stop here, mirroring Case A/C's own "other does not
-            // outrank us" -> break.
-            break;
-          }
-        } else {
-          // Case C: `other`'s own origin lies outside what THIS scan pass has walked
-          // (`scanned`) — either because it's ⊥ (the structure's own boundary) or because
-          // it's a real node genuinely outside the current scan window entirely.
-          //
-          // *** ENGINE SPEC §6.2 SUB-CASE III-D CORRECTION, PART 1 (2026-09-02, R0008) ***
-          // Sub-case iii-d, AS ORIGINALLY WRITTEN in the approved Engine Specification,
-          // claims a Case C node can NEVER outrank/affect where `node` lands, and until
-          // this fix this branch enforced that claim as a live assertion, throwing if
-          // violated. That claim is INCORRECT — confirmed as a flaw in the spec's own
-          // literal §4.3 pseudocode (line 17's "c.originLeft ≠ ⊥" conjunct), not an
-          // implementation deviation. R0008 found it firing at ~24% under ordinary
-          // randomized states once "immediate delivery" (a replica broadcasting an
-          // operation the instant it's minted — the ordinary shape of real, live
-          // multi-user editing) was fuzzed; a variant with no tombstoning at all produced
-          // direct, confirmed VISIBLE TEXT divergence ("ipt" vs "pit") from as few as 3
-          // operations. This correction has TWO parts — this is part 1; see the Case B
-          // branch above for part 2 (R0009), found while validating this fix. Full
-          // investigation, root cause, and both fixes: CLAUDE.md's "Engine Spec §6.2
-          // sub-case iii-d correction" entry; regression fixtures tests/regression/R0008
-          // and R0009 (both permanent, Test Plan §2.3).
-          //
-          // THE FIX: `other` now gets the SAME rank check Case A/B already give same-window
-          // competitors, instead of being unconditionally skipped. This is no longer a
-          // "canary that must never fire" — Case C legitimately participates in placement.
-          if (compareRank(other, node) < 0) {
-            destIndex = i + 1;
-            conflicting.clear();
-          } else {
-            break;
-          }
-        }
-      }
-    }
-
-    // Test-build structural sanity check (redefined 2026-09-02/03 — the ORIGINAL canary here
-    // asserted Engine Spec §6.2 sub-case iii-d, which R0008 and R0009 both disproved, in two
-    // different branches (Case C and Case B respectively); seeing FALSE below would mean
-    // `destIndex` was computed outside the window this scan is even allowed to place into —
-    // an unrelated, still-live correctness property, true regardless of which branch (A/B/C)
-    // decided `destIndex`, worth keeping a cheap, always-on regression canary for.
-    if (destIndex < leftIndex + 1 || destIndex > rightIndex) {
-      throw new Error(
-        `integrate(): computed destIndex ${destIndex} for candidate ${serializeId(node.id)} ` +
-          `outside its own scan window [${leftIndex + 1}, ${rightIndex}] — this is an ` +
-          "integrate() bookkeeping bug, unrelated to the retired Engine Spec §6.2 sub-case " +
-          "iii-d claim (see the Case B/Case C comments above).",
-      );
-    }
-
-    this.index.insertAt(destIndex, node);
+    return this.tree.hasIdentifier(op.target);
   }
 
   private applyInsert(op: InsertOperation): void {
-    const node: Node = {
-      id: op.id,
-      value: op.value,
-      originLeft: op.originLeft,
-      originRight: op.originRight,
-      bind: op.bind,
-      deleted: false,
-      deletedBy: null,
-    };
-    this.integrate(node);
+    this.tree.attach(op.id, op.value, op.bind, op.parent, op.side);
   }
 
   /**
@@ -447,19 +228,13 @@ export class Engine {
    * delete simply arrived last.
    */
   private applyDelete(op: DeleteOperation): void {
-    const node = this.nodeById(op.target);
-    if (node === null) {
+    const node = this.tree.nodeByIdentifier(op.target);
+    if (node === undefined) {
       throw new Error(`applyDelete(): target ${serializeId(op.target)} is not present`);
     }
-    // The new deletedBy is computed from the CURRENT read, then passed into setDeleted
-    // together with the tombstone flag in one call — Phase 19's version mutated
-    // `node.deletedBy` directly on a live object reference afterward, which cannot work
-    // now that a materialized Node view is a disposable snapshot, not a stable object
-    // block storage (Phase 20) can keep mutating underneath. PositionIndex.setDeleted is
-    // the SOLE place a node's deleted/deletedBy are ever written.
     const newDeletedBy =
       node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0 ? op.id : node.deletedBy;
-    this.index.setDeleted(op.target, true, newDeletedBy);
+    this.tree.setDeleted(op.target, true, newDeletedBy);
   }
 
   /**
@@ -469,8 +244,8 @@ export class Engine {
    * minimal shape that makes the operation type usable end to end.
    */
   private applyUndelete(op: UndeleteOperation): void {
-    const node = this.nodeById(op.target);
-    if (node === null) {
+    const node = this.tree.nodeByIdentifier(op.target);
+    if (node === undefined) {
       throw new Error(`applyUndelete(): target ${serializeId(op.target)} is not present`);
     }
     if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
@@ -480,7 +255,7 @@ export class Engine {
       if (node.deletedBy !== null) {
         this.deleteContext.delete(serializeId(node.deletedBy));
       }
-      this.index.setDeleted(op.target, false, null);
+      this.tree.setDeleted(op.target, false, null);
     }
   }
 
@@ -561,32 +336,53 @@ export class Engine {
   }
 
   /**
-   * Whether `id` currently resolves to a live node in this structure (Phase 24, Engine Spec
-   * §7.6). Used only for DIAGNOSTIC purposes by the server's offline-window sweep
-   * (packages/server/src/offlineWindowScheduler.ts) — WHICH origin a stuck operation is
-   * missing, for logging. It is deliberately NOT the mechanism that decides whether a pending
-   * operation gets evicted: every pending operation's missing origin is, by definition,
-   * currently absent from this index (that is exactly what "pending" means, Engine Spec §4.2),
-   * so this check cannot by itself distinguish a merely-slow, still-arriving dependency from a
-   * permanently garbage-collected one (§7.3/§7.6) — only elapsed TIME can (Scope-IN: "buffered
-   * > 30s"). See offlineWindowScheduler.ts's own header comment for the full reasoning.
+   * Explicitly records GC delete-context (Phase 21) for a delete operation whose seq is
+   * assigned LAZILY, after this engine already accepted (or buffered) it via `applyRemote`
+   * with NO context (Phase 25's DUR-06 fix, writePath.ts: seq is not known until a message's
+   * ops are actually finalized, which may happen strictly later than the `applyRemote` call
+   * that determined readiness — including, for a delete that was buffered at that time, an
+   * arbitrary later point when some OTHER message's own processing happens to resolve it as a
+   * side effect via `drain()`). Idempotent (overwrites any existing entry for this id); safe to
+   * call regardless of whether the delete has been applied yet. `applyRemote`'s own inline
+   * `context` parameter is unaffected and still used by callers that DO know seq up front (e.g.
+   * `DocumentCoordinator.warmStart`, replaying an already-persisted log with known seqs).
    */
-  hasIdentifier(id: Identifier): boolean {
-    return this.index.hasIdentifier(id);
+  setDeleteContext(deleteOpId: Identifier, context: { readonly seq: bigint; readonly atMs: number }): void {
+    this.deleteContext.set(serializeId(deleteOpId), context);
   }
 
   /**
-   * Explicitly removes a still-buffered operation from `pending` (Engine Spec §7.6 Rule 7.2:
-   * "an evicted replica's queued operations naming since-collected nodes must be explicitly
-   * REJECTED... never left in P indefinitely"). Phase 21 built {@link collect} but left this
-   * half of Rule 7.2 unbuilt; Phase 24's server-side offline-window sweep is the first and
-   * only caller. Matches by the OPERATION's own id (never the origin/target it references) —
-   * the same identity discipline `applyRemote()`'s idempotence check and `drain()`'s
-   * duplicate-discard already use (Engine Spec §4.5, §6.3): two different operations can
-   * legally reference the same target, so matching on anything but the operation's own id
-   * could evict the wrong one. Returns whether a matching operation was actually found and
-   * removed — `false` is not an error, just means it already drained normally (its dependency
-   * arrived) in the time between the caller's own check and this call.
+   * Whether `id` currently resolves to a live node in this structure (Phase 24, Engine Spec
+   * §7.6). Used only for DIAGNOSTIC purposes by the server's offline-window sweep
+   * (packages/server/src/offlineWindowScheduler.ts) — WHICH origin a stuck operation is
+   * missing, for logging.
+   */
+  hasIdentifier(id: Identifier): boolean {
+    return this.tree.hasIdentifier(id);
+  }
+
+  /**
+   * Whether an OPERATION with this id has already been applied to this engine — the SAME
+   * check `applyRemote`'s own idempotence guard and `drain()`'s duplicate-discard already use
+   * internally (Engine Spec §6.3), exposed publicly (Phase 25, DUR-05 fix). Unlike
+   * `hasIdentifier` (tree/node presence — meaningless for a delete/undelete operation's own
+   * id, which never becomes a node), this works uniformly for every operation kind, and is
+   * TRUE the instant an operation is structurally integrated — independent of whether it has
+   * been durably committed anywhere yet. This is exactly the distinction
+   * `handshake.ts`'s `buildAlreadyHaveMessage` needs: a client's own operation that is already
+   * LIVE here (already broadcast to peers) will always eventually be durably committed
+   * regardless of what that client does next, so re-sending/re-minting it on a reconnect that
+   * merely raced ahead of its own not-yet-resolved commit would create a genuine duplicate.
+   */
+  hasApplied(id: Identifier): boolean {
+    return this.applied.has(serializeId(id));
+  }
+
+  /**
+   * Explicitly removes a still-buffered operation from `pending` (Engine Spec §7.6 Rule 7.2).
+   * Matches by the OPERATION's own id (never the origin/target it references) — the same
+   * identity discipline `applyRemote()`'s idempotence check and `drain()`'s duplicate-discard
+   * already use (Engine Spec §4.5, §6.3).
    */
   rejectPending(id: Identifier): boolean {
     const index = this.pending.findIndex((op) => op.id.c === id.c && op.id.r === id.r);
@@ -598,24 +394,48 @@ export class Engine {
   }
 
   /**
+   * Phase 25 (Option 2 / R0012's own scoped mitigation, Engine Spec §7.6 Rule 7.2) — attempts to
+   * revert a LOCALLY-INTEGRATED insert this client applied synchronously at mint time (Phase
+   * 3/10's own real-time-feel design), after the server has explicitly rejected it
+   * (`OFFLINE_WINDOW_EXCEEDED`) — see `tests/regression/R0012` for the full scenario this exists
+   * to mitigate (a live client's ordinary keystroke anchoring to a node the server has since
+   * garbage-collected). Delegates directly to {@link FugueTree.tryRemoveLeaf}: succeeds (returns
+   * `true`) ONLY in the "clean" case, where nothing else currently anchors to this node; returns
+   * `false` in the "cascading" case (something — typically the SAME user's own very next
+   * keystroke — already chains onto it) WITHOUT attempting any partial or unsafe removal, since
+   * that would dangle the other node's own `parent` reference (Engine Spec I4/I5). The caller
+   * (`SyncClient`) is responsible for falling back to its own existing preserve-only behavior
+   * when this returns `false` — this method never does anything destructive on failure.
+   *
+   * Deliberately does NOT remove `id` from `this.applied` — this exact stamp must never be
+   * treated as "ready to be reapplied" again regardless of outcome (this project's design never
+   * resends a rejected operation under its own original identity).
+   */
+  tryRevertLocalInsert(id: Identifier): boolean {
+    return this.tree.tryRemoveLeaf(id) !== undefined;
+  }
+
+  /**
    * Mints and applies a local insert, returning the operation to broadcast
-   * (API Spec §1.4). O(log N) as of Phase 19 — origin lookups go straight
-   * through `index.nodeAtVisible()` rather than materializing the whole
-   * visible sequence via `visible()` first (the pre-Phase-19 O(N) approach).
+   * (API Spec §1.4). `parent`/`side` are decided here via
+   * {@link FugueTree.decidePlacement} — Fugue's own `createBetween` rule,
+   * computed ONCE from the CURRENT tree state at the visible position
+   * immediately before the insertion point, and carried on the wire
+   * (never re-derived by a receiver — see `operation.ts`'s own doc
+   * comment on why that would be unsound).
    */
   localInsert(
     visibleIndex: number,
     value: number,
     bind: boolean = isClusterContinuing(value),
   ): InsertOperation {
-    const leftNode = visibleIndex > 0 ? this.index.nodeAtVisible(visibleIndex - 1) : undefined;
-    const rightNode = this.index.nodeAtVisible(visibleIndex);
+    const { parent, side } = this.tree.decidePlacement(visibleIndex);
     const op: InsertOperation = {
       kind: "insert",
       id: this.mint(),
       value,
-      originLeft: leftNode ? leftNode.id : null,
-      originRight: rightNode ? rightNode.id : null,
+      parent,
+      side,
       bind,
     };
     this.applyInsert(op);
@@ -629,22 +449,18 @@ export class Engine {
    * call began), returning one operation per removed unit with
    * consecutive counters in return order (API Spec §1.4).
    *
-   * O(log N) per removed unit as of Phase 19 (no more `visible()`
-   * snapshot). Re-querying the SAME `visibleIndex` against the live,
-   * mutating index on every iteration is equivalent to indexing a static
-   * snapshot at `visibleIndex, visibleIndex+1, ..., visibleIndex+count-1`:
-   * each successful delete removes exactly one unit from vis(S) AT
+   * Re-querying the SAME `visibleIndex` against the live, mutating tree on
+   * every iteration is equivalent to indexing a static snapshot at
+   * `visibleIndex, visibleIndex+1, ..., visibleIndex+count-1`: each
+   * successful delete removes exactly one unit from vis(S) AT
    * `visibleIndex` itself, so whatever now occupies that same visible
    * position is exactly what would have been next in the original
-   * snapshot (removing position P shifts everything after P left by one —
-   * what's now at P is what was previously at P+1). This is what the
-   * doc comment above means by "as it stood when this call began": the
-   * TARGET SET is fixed at call time, even though each lookup is live.
+   * snapshot.
    */
   localDelete(visibleIndex: number, count: number): readonly DeleteOperation[] {
     const ops: DeleteOperation[] = [];
     for (let k = 0; k < count; k++) {
-      const target = this.index.nodeAtVisible(visibleIndex);
+      const target = this.tree.nodeAtVisible(visibleIndex);
       if (!target) {
         break;
       }
@@ -662,32 +478,32 @@ export class Engine {
    *   1. deleted;
    *   2. deleted by an operation that is causally STABLE — its seq is ≤ `frontier`, meaning
    *      every currently active replica has already observed it (Definition 7.3);
-   *   3. not the originLeft/originRight of any node that ISN'T (transitively) also being
-   *      collected — a live node may anchor to a dead one, so this is a fixpoint sweep, not a
-   *      per-node test (Definition 7.4's own framing);
+   *   3. not the `parent` of any node that ISN'T (transitively) also being collected — Fugue's
+   *      own analogue of the retired "not the originLeft/originRight of any node" condition;
+   *      Fugue has only ONE causal-reference field per node (`parent`), so this fixpoint is
+   *      simpler than the retired flat-array design's own (which had to check both
+   *      originLeft AND originRight per node) — a live node may still anchor to a dead one via
+   *      `parent`, so this is a fixpoint sweep, not a per-node test (Definition 7.4's own
+   *      framing);
    *   4. deleted longer ago than the undo horizon — `options.nowMs - <delete's arrival time>
    *      >= options.maxAgeMs`, OR the deleting replica has minted `options.maxOpsPerReplica`
-   *      or more further operations since (Rule 7.3's `min(5 minutes, 200 operations)` —
-   *      collection is allowed once EITHER bound is crossed, i.e. protection lasts only the
-   *      SHORTER of the two windows).
+   *      or more further operations since (Rule 7.3's `min(5 minutes, 200 operations)`).
    *
    * A node with NO recorded delete-context (its Delete was applied via a plain `applyRemote`
-   * call with no `context` — true for every caller except the server's own coordinator engine)
-   * can never satisfy condition 2 and is therefore never collectible — this is what makes
-   * collection entirely opt-in and safe to call on any engine, including ones a test built
-   * without ever supplying seq/time context.
+   * call with no `context`) can never satisfy condition 2 and is therefore never collectible.
    *
-   * Deliberately NOT wall-clock-reading itself (Engine Spec C9): `options.nowMs` is a plain
-   * parameter, exactly like `observe(remoteCounter)` never reads a clock — the caller (the
-   * server's GC scheduler) supplies the current time, keeping this method itself pure and
-   * deterministic given its inputs.
+   * Removal itself (steps 7-8) is ONE-AT-A-TIME via {@link FugueTree.remove}, not a
+   * contiguous-range splice (the retired flat-array design's own optimization, which doesn't
+   * apply to a tree — there is no single "structural position range" a set of tree nodes
+   * necessarily occupies). `FugueTree.remove()` throws if a node still has children, so this
+   * loop repeatedly removes whichever currently-childless members of `collectible` remain,
+   * fixpoint-style, until the whole batch is gone — safe by construction, since the
+   * "anchored" exclusion above already guarantees no node OUTSIDE `collectible` is a child of
+   * anything IN it; the only remaining question is REMOVAL ORDER among collectible nodes
+   * themselves, which this loop resolves by always taking leaves first.
    */
   collect(frontier: bigint, options: CollectOptions): CollectResult {
-    const allNodes = this.nodes; // O(N) materialize, in structural order — see below for why
-    // this method reasons over the fully-decoded Node[] view rather than PositionIndex/Block
-    // internals directly: Definition 7.4's conditions are node-level, and `nodes` already
-    // gives every node's real originLeft/originRight regardless of how blocks group them —
-    // block boundaries are a storage detail invisible to this algorithm, exactly as intended.
+    const allNodes = this.nodes; // O(N) materialize, in structural order
 
     // Step 1 (COLLECT line 1): candidates — deleted, causally stable, older than the horizon.
     const candidates = new Set<string>();
@@ -711,30 +527,12 @@ export class Engine {
       return { collectedCount: 0, incomplete: false };
     }
 
-    // Steps 2-6 (COLLECT lines 2-6): fixpoint anchor exclusion. `collectible` starts as every
-    // candidate and shrinks: on each pass, gather every origin referenced by a node NOT
-    // (currently) collectible — mathematically `S \ collectible`, which is exactly
-    // `(S \ candidates) ∪ (candidates \ collectible)`, the pseudocode's own `anchored` set,
-    // just recomputed fresh each pass instead of accumulated incrementally. Simpler to read
-    // and audit; same fixed point, since `collectible` only ever shrinks.
-    //
-    // *** WALL-CLOCK SAFETY CAP (2026-09-03, found via M8-c's own DoD verification) ***
-    // A long UNRESOLVED anchor chain (a deleted prefix whose immediately-following content is
-    // still live — see CLAUDE.md's Phase 21 entry) forces one fixpoint pass per cascade step,
-    // each pass O(N) — measured at 853s wall-clock for a 10,000-deep chain over 90,000 nodes
-    // (~680s in the fixpoint itself). Because this loop has no `await` anywhere, an uncapped
-    // run of that length would block the ENTIRE Node event loop — not just this document's own
-    // GC, but every other document's OPS/PING/HTTP traffic sharing the same process — for the
-    // full duration. `options.budgetMs`/`options.clock` (both optional; omitted = no cap, the
-    // pre-cap behavior, for every existing caller/test that doesn't care) bound this: the
-    // budget is checked ONLY after a FULLY-COMPLETED pass, never mid-pass — but completing a
-    // pass cleanly is NOT the same as the fixpoint being SAFE to act on early; see the cutoff
-    // site below (search "an incomplete sweep collects ZERO nodes") for the real correctness
-    // argument, including a bug an earlier version of this cap got wrong before shipping.
-    // `clock` is a plain injected function, invoked here, never a literal wall-clock read of
-    // this package's own — Engine Spec C9's purity rule is about this package never READING a
-    // clock itself, which an injected callback satisfies the same way `observe(remoteCounter)`
-    // and `context.atMs` already do.
+    // Steps 2-6 (COLLECT lines 2-6): fixpoint anchor exclusion — Fugue's own single-`parent`
+    // analogue of the retired dual-origin fixpoint. See this method's own doc comment above
+    // and CollectOptions.budgetMs's doc comment for the wall-clock safety cap this phase (21)
+    // found necessary and hand-traced before shipping (a pathological long anchor chain can
+    // force one fixpoint pass per cascade step) — kept verbatim in spirit, adapted to `parent`
+    // being the sole reference field now.
     const collectible = new Set(candidates);
     let changed = true;
     let incomplete = false;
@@ -746,13 +544,10 @@ export class Engine {
       const anchored = new Set<string>();
       for (const node of allNodes) {
         if (collectible.has(serializeId(node.id))) {
-          continue; // n itself is (still) being collected — its OWN origins don't protect anything
+          continue; // n itself is (still) being collected — its OWN parent reference doesn't protect anything
         }
-        if (node.originLeft !== null) {
-          anchored.add(serializeId(node.originLeft));
-        }
-        if (node.originRight !== null) {
-          anchored.add(serializeId(node.originRight));
+        if (node.parent !== null) {
+          anchored.add(serializeId(node.parent));
         }
       }
       for (const key of collectible) {
@@ -763,34 +558,15 @@ export class Engine {
       }
       if (startClock !== undefined && budgetMs !== undefined && clock) {
         if (clock() - startClock >= budgetMs) {
-          // `changed` reflects THIS just-completed pass: if it's still true, this pass found
-          // further shrinkage and the fixpoint had not yet naturally settled — genuinely
-          // incomplete. If it's false, this pass found nothing new, i.e. the fixpoint HAD
-          // already reached its true, natural conclusion at the same moment the budget was
-          // hit — not incomplete, just coincidentally timed.
           incomplete = changed;
           break;
         }
       }
     }
     // *** CORRECTNESS, NOT JUST PERFORMANCE — an incomplete sweep collects NOTHING ***
-    // A node still sitting in `collectible` when the loop is cut short is NOT a safe
-    // conservative under-approximation — `collectible` only ever SHRINKS as later passes run,
-    // which means a node present at THIS moment could still be excluded by a pass that hasn't
-    // run yet (i.e. it may in fact still be needed as an anchor, the cascade just hasn't
-    // reached it within the budget). Physically removing it now, before the fixpoint has
-    // PROVABLY reached its true, stable conclusion, risks leaving some OTHER remaining node's
-    // origin dangling — exactly the I4/I5 violation this whole algorithm exists to prevent.
-    // (An earlier version of this safety cap got this wrong — traced by hand against the exact
-    // R0008-shaped pathological case before being trusted: after just one pass, only the
-    // directly-anchored last node of a long chain is excluded, so collecting the rest of the
-    // still-`collectible` chain at that point would strand THAT excluded node's own origin.)
-    // The only definitely-correct behavior when the budget is hit before natural convergence
-    // is to collect ZERO nodes this cycle — bounding wall-clock time is still achieved, but
-    // safety is never traded for it. Making genuinely-deep-but-resolvable chains progress
-    // across MULTIPLE budget-capped cycles would require persisting fixpoint state between
-    // calls (an incremental fixpoint) — explicitly OUT of scope for this safety net; see
-    // CLAUDE.md's Phase 21 entry for that as documented future work.
+    // See the retired flat-array design's own extensive comment (CLAUDE.md's Phase 21 entry)
+    // for the full reasoning — unchanged here: a node still sitting in `collectible` when the
+    // loop is cut short is NOT a safe conservative under-approximation.
     if (incomplete) {
       return { collectedCount: 0, incomplete: true };
     }
@@ -798,38 +574,38 @@ export class Engine {
       return { collectedCount: 0, incomplete: false };
     }
 
-    // Steps 7-8 (COLLECT lines 7-8): physical removal. `allNodes` is still in structural
-    // position order (nothing above mutated the structure), so group `collectible` into
-    // maximal contiguous runs and remove each with one `splice` call — O(runs), not
-    // O(collectible.size) — processing runs back-to-front so earlier positions stay valid.
-    const ranges: Array<{ readonly start: number; readonly count: number }> = [];
-    let runStart = -1;
-    for (let i = 0; i < allNodes.length; i++) {
-      const inSet = collectible.has(serializeId(allNodes[i]!.id));
-      if (inSet && runStart === -1) {
-        runStart = i;
-      } else if (!inSet && runStart !== -1) {
-        ranges.push({ start: runStart, count: i - runStart });
-        runStart = -1;
-      }
-    }
-    if (runStart !== -1) {
-      ranges.push({ start: runStart, count: allNodes.length - runStart });
-    }
-
-    for (let i = ranges.length - 1; i >= 0; i--) {
-      const { start, count } = ranges[i]!;
-      const removed = this.index.splice(start, count);
-      for (const node of removed) {
-        if (node.deletedBy !== null) {
-          this.deleteContext.delete(serializeId(node.deletedBy)); // GC hygiene, same as applyUndelete
+    // Steps 7-8 (COLLECT lines 7-8): physical removal, one node at a time, leaves first (see
+    // this method's own doc comment above for why this is safe and sufficient).
+    let remaining = new Set(collectible);
+    let removedThisPass = true;
+    while (remaining.size > 0 && removedThisPass) {
+      removedThisPass = false;
+      for (const key of [...remaining]) {
+        const node = this.tree.nodeByIdentifier(parseKey(key));
+        if (node === undefined) {
+          remaining.delete(key);
+          continue;
         }
+        const hasNonRemovedChild = allNodes.some(
+          (n) => n.parent !== null && serializeId(n.parent) === key && remaining.has(serializeId(n.id)),
+        );
+        if (hasNonRemovedChild) continue;
+        const removedNode = this.tree.remove(node.id);
+        if (removedNode?.deletedBy !== null && removedNode?.deletedBy !== undefined) {
+          this.deleteContext.delete(serializeId(removedNode.deletedBy)); // GC hygiene, same as applyUndelete
+        }
+        remaining.delete(key);
+        removedThisPass = true;
       }
     }
 
-    // `incomplete` is always false here — the early return above handles the incomplete case.
     return { collectedCount: collectible.size, incomplete: false };
   }
+}
+
+function parseKey(key: string): Identifier {
+  const [c, r] = key.split(":").map(Number);
+  return { c: c!, r: r! };
 }
 
 /** {@link Engine.collect}'s tunables — Engine Spec §7.7 Rule 7.3's undo horizon, threaded in
@@ -844,18 +620,7 @@ export interface CollectOptions {
   /**
    * Optional wall-clock safety cap on the fixpoint sweep (Phase 21, found via a measured 853s
    * pathological case — CLAUDE.md's Phase 21 entry). Both `budgetMs` and `clock` must be
-   * supplied together to have any effect; omitting either means NO cap (the original,
-   * unbounded-fixpoint behavior — every pre-cap test and caller is unaffected). `clock` is
-   * INVOKED by `collect()`, never defined by it — this package still never reads a wall clock
-   * itself (Engine Spec C9); see {@link Engine.collect}'s own doc comment for the full
-   * reasoning — including a real bug found and fixed BEFORE shipping this: an earlier version
-   * of this cap collected whatever remained in the fixpoint's `collectible` set at cutoff,
-   * reasoning that set only ever shrinks so a partial result must be "conservative." That's
-   * false — a node still in an UNCONVERGED `collectible` set may yet be excluded by a pass
-   * that hasn't run, meaning it could still be needed as an anchor. Collecting it anyway risks
-   * stranding some OTHER node's origin. The fix (see {@link Engine.collect}'s own comment at
-   * the cutoff site): an incomplete sweep collects ZERO nodes, always — bounding wall-clock
-   * time without ever trading away correctness.
+   * supplied together to have any effect; omitting either means NO cap.
    */
   readonly budgetMs?: number;
   /** Supplies the current time in epoch milliseconds when invoked — typically a thin wrapper around the platform's own wall clock, defined and kept OUTSIDE this package (e.g. gcScheduler.ts). */
@@ -866,16 +631,7 @@ export interface CollectOptions {
 export interface CollectResult {
   /**
    * True iff the fixpoint sweep was cut short by `options.budgetMs` before naturally
-   * converging. When `true`, `collectedCount` is ALWAYS `0` — an incomplete sweep NEVER
-   * physically removes anything (see {@link CollectOptions.budgetMs}'s own doc comment for
-   * why a partial fixpoint result cannot safely be treated as a conservative under-
-   * approximation). A caller should expect that a document whose unresolved anchor chain is
-   * deeper than the budget allows will keep returning `incomplete: true, collectedCount: 0`
-   * on EVERY cycle, indefinitely, until either the budget is raised or (future work — see
-   * CLAUDE.md's Phase 21 entry) the fixpoint is made incremental across calls — this is NOT
-   * "eventually makes progress across several cycles" today. Worth surfacing as its own
-   * metric (`gc.cycle_incomplete_count`): a document that keeps hitting this every cycle
-   * without ever transitioning to `collectedCount > 0` is worth knowing about.
+   * converging. When `true`, `collectedCount` is ALWAYS `0`.
    */
   readonly incomplete: boolean;
   /** How many nodes were physically removed from S this call — 0 is normal (nothing due yet), and ALWAYS 0 when `incomplete` is true. */

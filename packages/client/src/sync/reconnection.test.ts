@@ -782,8 +782,8 @@ describe("RC-33 — the handshake interrupted and retried (20 runs each)", () =>
       kind: "insert" as const,
       id: { c: i + 2, r: 99 },
       value: 0x41,
-      originLeft: i === 0 ? null : { c: i + 1, r: 99 }, // anchored to the document start (⊥), not a seed op this synthetic test never applied — so the chain WOULD fully resolve if the (deliberately never-awaited) apply-microtask ran
-      originRight: null,
+      parent: i === 0 ? null : { c: i + 1, r: 99 }, // anchored to the document start (⊥), not a seed op this synthetic test never applied — so the chain WOULD fully resolve if the (deliberately never-awaited) apply-microtask ran
+      side: "R" as const,
       bind: false,
     }));
     socket!.triggerMessage(
