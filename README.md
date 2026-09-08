@@ -12,6 +12,28 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 27 — REST document lifecycle.** Create, list, read, rename, and
+revoke access to documents — `POST/GET /v1/documents`, `GET/PATCH/DELETE
+/v1/documents/{id}`, `GET /v1/users/search` — the first REST endpoints in
+this project actually behind real authentication (Phase 26's access
+token, now VERIFIED on every request, not just issued). One error
+envelope for every failure, a per-request id echoed in the response and
+in the server's own logs, and the 404-vs-403 rule from the spec text
+implemented literally: no permission on a document is 404 (indistinguishable
+from it not existing), some-but-insufficient permission is 403. Deleting
+a document sets a revocation flag, wipes its permission rows, and pushes
+a real GOODBYE to every currently-open WebSocket session for it — verified
+with an actual connected client — while the operation log and every
+snapshot are retained untouched, per PRD FR-VH-5. Idempotency-Key support
+(a new table, canonicalized-JSON body hashing so key order can never
+matter) makes a replayed create return the identical original response;
+a reused key with a different body is a clean 409. Two pre-existing,
+unrelated gaps were found via this phase's own regression sweep and
+handled honestly: a stale hardcoded table-count test (fixed) and an
+already-disclosed Fugue performance limit surfacing at a scale nobody had
+re-measured (left as tracked, not silently patched over). See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 27 entry for the full account.
+
 **Phase 26 — authentication and sessions.** Real user accounts for the
 first time: `POST /v1/auth/login`, `/refresh`, `/logout`, Argon2id
 password hashing, a 15-minute JWT access token, and a refresh token in an
@@ -324,7 +346,7 @@ cp .env.example .env   # fill in real values before running the server —
                         # local dev but must be real secrets in any shared/
                         # production environment
 docker compose up -d   # starts local Postgres (Phase 15)
-pnpm db:migrate         # creates all nine tables (packages/server/migrations/)
+pnpm db:migrate         # creates all ten tables (packages/server/migrations/)
 pnpm db:seed            # optional — one dev user + one dev document; prints a
                         # real, working login (email/password) for
                         # POST /v1/auth/login as of Phase 26
@@ -431,9 +453,10 @@ runs this at full scale on a schedule.
 | Offline window enforcement + rejection preservation | ✅ **Phase 24** (10min/2,000-op client cap; server-side explicit rejection, Engine Spec §7.6 Rule 7.2; API Spec §5.5 preserve-never-destroy for all 3 reason codes) |
 | Convergence engine — Fugue migration       | ✅ **Phase 25** (three real bugs found in the prior YATA-family scan; rebuilt on Fugue; six further integration bugs found & fixed; adverse-network DoD fully passing) |
 | Authentication (login/refresh/logout)      | ✅ **Phase 26** (Argon2id, JWT access tokens, refresh rotation + family revocation, SEC-11g timing-oracle-free — verified with a real statistical test) |
-| WS gateway authorization + presence        | ⏳ not started (Phase 27+, 31) — Phase 26 built the token PRIMITIVES only; the WS handshake does not verify one yet |
+| REST document lifecycle                    | ✅ **Phase 27** (create/list/get/rename/revoke-access, real Bearer-token auth, §5.1 error envelope, §9.2 idempotency, DELETE broadcasts a real GOODBYE) |
+| WS gateway authorization + presence        | ⏳ not started (31) — Phase 26/27 built real REST-side auth; the WS handshake still does not verify a token |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
-| Permissions (real owner/editor/viewer system) | ⏳ not started (Phase 27-30) — Phase 24's role-downgrade DEMO uses a test-only override, not this          |
+| Permissions (grant/share a document)       | ⏳ not started (Phase 28-30) — Phase 27 reads `document_permissions`; no endpoint grants a role yet          |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

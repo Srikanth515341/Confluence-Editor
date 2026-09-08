@@ -65,6 +65,19 @@ export interface CoordinatorSession {
    * how many of those sends the server actually saw arrive.
    */
   receivedFrameCount: number;
+  /**
+   * Phase 27 (API Spec §4.5 DELETE: "causes every open socket for the document to receive
+   * GOODBYE{reason: 2}") — a closure, set only in gateway.ts's own real session construction,
+   * that encodes and sends a GOODBYE control frame (reason PERMISSION_REVOKED) then closes the
+   * underlying socket. OPTIONAL, not required, deliberately: a dozen pre-existing test fixtures
+   * across this codebase construct a `CoordinatorSession` literal directly (writePath.test.ts,
+   * heartbeat.test.ts, every `db/*.db.test.ts` file, etc.) with no real `ws` object to close —
+   * making this required would force updating every one of them for a capability none of them
+   * exercise. `DocumentCoordinator.disconnectAllSessions()` below calls it via `?.()`, so a
+   * session with no closure attached (every one of those pre-existing fixtures) is silently
+   * skipped rather than throwing.
+   */
+  readonly disconnectForRevocation?: () => void;
 }
 
 /**
@@ -403,6 +416,22 @@ export class DocumentCoordinator {
       userId: s.userId,
       displayName: s.displayName,
     }));
+  }
+
+  /**
+   * API Spec §4.5 DELETE — called once, by httpApp.ts's DELETE /v1/documents/{id} handler, after
+   * the durable revocation itself has already committed. A no-op if nobody is currently
+   * connected (the coordinator's own session map is simply empty, or the coordinator for this
+   * document doesn't exist in memory at all — the caller checks that before reaching here). Does
+   * NOT remove sessions from `this.sessions` directly: `disconnectForRevocation()` closes the
+   * real socket, and the EXISTING `ws.on("close", ...)` handler (gateway.ts) already calls
+   * `coordinator.leave(sessionId)` once that close completes — reusing that path rather than
+   * duplicating it here.
+   */
+  disconnectAllSessions(): void {
+    for (const session of this.sessions.values()) {
+      session.disconnectForRevocation?.();
+    }
   }
 
   /** Diagnostic-only (see CoordinatorSession.receivedFrameCount's doc comment). */

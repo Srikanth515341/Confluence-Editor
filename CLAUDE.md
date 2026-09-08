@@ -5083,6 +5083,220 @@ check:purity` was ALSO silently broken by two comments (one in
   documented since Phase 19 (223 files now, up from 202 at Phase 24 — this
   phase's own files simply inherited it, like every prior phase's).
 
+- **Phase 27 — REST document lifecycle** (API Spec §4.3-§4.6, §4.16, §5.1,
+  §5.2, §9.2; Test Plan §11.1). Create, list, read, rename, and revoke
+  access to documents, for the first time behind Phase 26's REAL
+  authentication rather than a stub: `POST /v1/documents`,
+  `GET /v1/documents`, `GET/PATCH/DELETE /v1/documents/{id}`,
+  `GET /v1/users/search`. Every route runs behind a new `requireAuth`
+  Express middleware (`authMiddleware.ts`) that verifies a real
+  `Authorization: Bearer <accessToken>` header against Phase 26's own
+  `verifyAccessTokenDetailed` — the first thing in this project that
+  actually VERIFIES an access token on an incoming request (Phase 26
+  only ever ISSUED one; the WebSocket gateway's own handshake still
+  verifies nothing, unchanged).
+
+  **The single error envelope (API Spec §5.1)** —
+  `{ error: { code, message, requestId, details? } }` — is implemented in
+  a new `restErrors.ts` and used by every route THIS phase adds.
+  **Deliberately NOT retrofitted onto Phase 26's already-shipped
+  `/v1/auth/login`/`/refresh`/`/logout` routes**, even though §5.1's own
+  text reads "every non-2xx response" with no stated exception: this
+  phase's own Scope-IN names a specific, new set of endpoints, and
+  `auth.db.test.ts`'s own existing assertions (`{ error:
+  "invalid_credentials" }`, a flat string, not this envelope) are real,
+  passing, already-DoD-verified tests this phase has no mandate to
+  break. A future phase can migrate the auth routes to this same
+  envelope explicitly, if and when asked — disclosed here, not silently
+  decided. A per-request `requestId` (`restErrors.ts`'s
+  `requestIdMiddleware`, mounted as the very FIRST `app.use()` — ahead
+  of `express.json()`, so even a request that fails JSON parsing already
+  has one) is attached to `res.locals`, echoed in every error envelope,
+  and logged on both the way in and the way out of every request
+  (`http.request`/`http.response`), matching §5.1's own "requestId
+  appears in every server log line for that request" literally —
+  verified with a real test that captures `console.log` output and
+  confirms a returned `requestId` actually appears in it.
+
+  **The 404-vs-403 rule (API Spec §4.5) is implemented exactly as
+  specified, not softened**: a caller with NO permission row for a
+  document gets `404 document_not_found` — indistinguishable from the
+  document genuinely not existing, closing the enumeration oracle a 403
+  would open — while a caller with SOME role but an insufficient one
+  (an editor/viewer hitting PATCH/DELETE, both owner-only) gets `403
+  permission_denied`. GET never returns 403 at all, per the Test Plan
+  §11.1 matrix's own GET row (owner/editor/viewer/no-role/nonexistent →
+  200/200/200/404/404) — verified explicitly, including the genuinely
+  nonexistent-document case landing on the SAME code as the
+  exists-but-no-access case.
+
+  **Idempotency (API Spec §9.2)** — a new `idempotency_keys` table
+  (migration `1788134880000_create-idempotency-keys.js`), scoped by
+  `(user_id, endpoint, key)` rather than by key alone (an
+  Idempotency-Key header is only ever meaningful relative to a specific
+  caller and a specific route — this phase's own POST /v1/documents is
+  the only current user, but the schema doesn't hardcode that). No
+  literal DDL was supplied for this table (unlike Phase 15's own eight
+  verbatim-DDL tables) — this is this phase's own reasonable, disclosed
+  design, documented in full in the migration's own header comment. "Same
+  body" is checked via a SHA-256 of a CANONICALIZED (recursively
+  key-sorted) JSON serialization (`documentService.ts`'s
+  `canonicalJsonStringify`/`hashRequestBody`), verified with a real test
+  sending the identical logical body with keys in a different literal
+  order and confirming it still counts as "the same." The 24-hour window
+  (§9.2's own literal number) is enforced at QUERY time
+  (`created_at > now() - interval '24 hours'`), not a scheduled cleanup
+  job — a row past that window is simply treated as though it never
+  existed, the same "disclosed, not the biggest scope creep" precedent
+  as `rateLimiter.ts`'s own in-memory map and the `snapshots` table's own
+  lack of a retention policy.
+
+  **DELETE's "every open socket for the document receives
+  GOODBYE{reason: 2}" (API Spec §4.5)** required reaching from an HTTP
+  route handler into the live WebSocket gateway for the first time in
+  this project's history. Resolved with a minimal, low-blast-radius
+  addition rather than a new cross-module dependency: `CoordinatorSession`
+  gained one new OPTIONAL field, `disconnectForRevocation?: () => void`
+  (`documentCoordinator.ts`) — optional specifically because a DOZEN
+  pre-existing test fixtures across this codebase construct a
+  `CoordinatorSession` object literal directly with no real `ws` to
+  close (`writePath.test.ts`, `heartbeat.test.ts`, every `db/*.db.test.ts`
+  file), and making it required would have forced updating every one of
+  them for a capability none of them exercise. `gateway.ts` is the ONLY
+  place that ever sets it — a closure over the real `ws`, encoding a real
+  GOODBYE (`GoodbyeReason.PERMISSION_REVOKED = 2`, matching the spec's
+  own literal reason code) and closing the socket (WS close code `4001`,
+  the application-specific range) once the frame is actually written.
+  `DocumentCoordinator.disconnectAllSessions()` iterates every currently-
+  joined session and calls this via `?.()` — a silent no-op for every
+  session that doesn't have it, i.e. every pre-existing test fixture.
+  Verified end to end with a REAL WebSocket client connected to a REAL
+  document, a real committed operation, and a real DELETE request —
+  confirming the client's own `ws.on("message", ...)` actually receives
+  a decoded GOODBYE with `reason === PERMISSION_REVOKED` after the HTTP
+  204 response.
+
+  **DELETE's "does NOT delete the operation log or snapshots" (PRD
+  FR-VH-5)** is implemented literally: `revokeDocumentAccess`
+  (`db/documentStore.ts`) sets `documents.access_revoked_at` and
+  `DELETE`s every `document_permissions` row for that document (the
+  actual mechanism behind "revokes all permissions" — that table has no
+  `revoked_at` column of its own, so a permission row's mere EXISTENCE
+  is what "has access" means) — the `documents` row itself and every
+  `operations` row are never touched. Verified with a real row count
+  before and after DELETE on a document with a real committed operation:
+  identical count, confirming genuine retention, not merely an
+  assumption from reading the code.
+
+  **`GET /v1/documents/{id}`'s owner-only `structureSize`/
+  `tombstoneCount` — a real, disclosed, pre-existing gap surfaced (not
+  introduced) by this phase**: `documents.structure_size`/
+  `tombstone_count` (Phase 15's own schema, "Maintained by the
+  coordinator, not authoritative; the engine is") have never actually
+  been WRITTEN by any code path in this project's history — they read as
+  their DB default (0) forever. This phase's route prefers a currently-
+  open `DocumentCoordinator`'s LIVE `engine.stats()` when one exists in
+  memory, falling back to the (always-0, for now) durable columns only
+  when no coordinator is currently open — the best available answer
+  given the gap, not a fix to the gap itself (out of this phase's own
+  Scope-IN; disclosed here so a future phase doesn't rediscover it from
+  scratch).
+
+  **`GET /v1/documents` — keyset (not OFFSET) pagination**, ordered by
+  `(updated_at DESC, id DESC)` (`db/documentStore.ts`'s own
+  `listDocumentsForUser`), with an opaque, base64url-encoded
+  `{updatedAt, id}` cursor (`documentService.ts`'s `encodeDocumentListCursor`/
+  `decodeDocumentListCursor`) — a reasonable, disclosed design choice
+  (API Spec §4.4 names `?cursor=` but not its literal format). `?role=`
+  is repeatable (Express's own `req.query.role` naturally becomes an
+  array for a repeated query param); an invalid role token is `400
+  validation_failed` rather than silently ignored. `activeParticipants`
+  is read live from `getCoordinators().get(documentId)?.sessionCount`, a
+  plain callback threaded into `documentService.ts` rather than a direct
+  `DocumentCoordinator`/`Gateway` reference — the same decoupling
+  `audit.ts`'s own `AuditOptions.liveText` already established for an
+  analogous "the live in-memory truth, supplied by whoever has it"
+  parameter, keeping `documentService.ts` unit-testable with no gateway
+  involved at all. Verified with a real 3-document, limit=1 pagination
+  walk that visits every document exactly once with no repeats or skips.
+
+  **`GET /v1/users/search` (API Spec §4.16)** — one query, `lower(email)
+  = lower($1) OR display_name ILIKE $1 || '%'`, `LIMIT 10` (never two
+  separately-limited queries merged in application code, which could
+  return up to 20) — verified: an exact email match returns a MASKED
+  result (`maskEmail`'s own literal example, `"a***@example.com"`), a
+  display-name PREFIX also matches, and a PREFIX of an email (not the
+  exact address) matches NOTHING, per §4.16's own explicit
+  "prefix-matching on email would make this an address-harvesting tool"
+  reasoning.
+
+  **A real, if narrow, pre-existing gap found and fixed via this
+  phase's own DoD re-verification, not introduced by it**:
+  `schema.db.test.ts`'s "creates all eight tables" test hardcoded a
+  literal 8-table list that had never been updated when Phase 26 added
+  `refresh_tokens` — meaning it was already silently wrong before this
+  phase touched anything. Found only because re-running the surrounding
+  `pnpm test:db` suite as part of this phase's own regression check
+  surfaced it failing (now expecting 10 tables, including this phase's
+  own new `idempotency_keys`) — fixed as a one-line literal-list update,
+  not a design change.
+
+  **A second, PRE-EXISTING, UNRELATED failure confirmed, not fixed, by
+  this same regression check**: `snapshots.db.test.ts`'s "50,000-operation
+  document warm-starts in under 2 seconds" now measures ~59 seconds, not
+  under 2. This phase touched none of the code that test exercises
+  (`operationStore.ts`, `snapshotter.ts`, `engine.ts`) — it is the
+  already-disclosed, already-tracked Fugue O(N²) sequential-insertion
+  cost (CLAUDE.md's own Open Item 3, Phase 25) surfacing at a scale
+  (50,000 sequential ops) nobody had re-measured against this specific
+  test's own 2-second budget since the Fugue migration landed. Left
+  exactly as found — fixing it means the same deferred balanced-storage
+  redesign Open Item 3 already names, not a Phase 27 fix.
+
+  **DoD verification, all against a real, migrated Postgres instance**
+  (`db/documents.db.test.ts`, new — 9 tests, one per REST-matrix row or
+  row group): valid create (201, `Location` header, exact response
+  shape); default title + the 512-character boundary (both sides);
+  Idempotency-Key replay with the identical body (byte-identical
+  response, including a key-order-shuffled "same" body) AND with a
+  different body (409); list with owner/editor/viewer roles, a role
+  filter, and full-walk cursor pagination; get with
+  owner/editor/viewer/no-role/nonexistent (200×3 with the owner-only
+  fields correctly present/absent, 404×2); patch with owner (200) vs.
+  editor/viewer (403×2, title unchanged); delete with the full
+  owner-only/403/204/GOODBYE/retention/permission-wipe account above;
+  users/search's three cases; and the combined error-envelope test
+  (malformed JSON, missing auth, a genuinely expired token — each
+  matching §5.1 exactly, with the malformed-JSON case's own `requestId`
+  independently confirmed present in captured server log output). Also:
+  `db/auth.db.test.ts` (12/12) and `db/durability.db.test.ts` (9/9)
+  re-run clean, confirming zero regression from this phase's shared-file
+  changes (`httpApp.ts`, `gateway.ts`, `documentCoordinator.ts`,
+  `tokens.ts`, `index.ts`). `authTiming.db.test.ts` (SEC-11g's ~5-minute
+  timing test) was NOT re-run this phase — `tokens.ts`'s own change was
+  purely additive (`verifyAccessTokenDetailed`, a new function; nothing
+  existing was modified) and `passwordHash.ts`, the file SEC-11g's own
+  timing property actually depends on, was untouched — a disclosed,
+  deliberate scoping call, not an oversight. Full default `pnpm test`
+  (workspace-wide): 474 passed, 2 skipped (the same disclosed, deferred
+  O(N²) GC-chain tests), zero failures. `pnpm -r exec tsc --noEmit`:
+  clean across all 6 packages. `pnpm lint`: clean for every file this
+  phase touched.
+
+  **What is deliberately NOT built this phase**: a "share a document"/
+  grant-permission REST endpoint (Scope-IN names create/list/get/rename/
+  revoke-access only; this phase's own DoD tests grant editor/viewer
+  roles by inserting `document_permissions` rows directly via raw SQL,
+  the same fixture-seeding convention this project has used since
+  Phase 17/18's bulk-insert fixtures, for state a feature doesn't yet
+  have its own API to produce). The WebSocket gateway's own handshake
+  still verifies no access token at all — a client can still join any
+  document over WS by guessing its id, completely unaffected by this
+  phase's REST-side auth; that remains a later phase's job. Any
+  retention/cleanup job for `idempotency_keys` rows past their 24-hour
+  window (enforced at query time only, per this phase's own disclosed
+  design above).
+
 ## 🛑 CRITICAL, OPEN, UNRESOLVED FINDING — READ THIS FIRST (2026-09-05)
 
 **The core convergence guarantee is currently known to be BROKEN under
@@ -6157,6 +6371,24 @@ status and v0.2.0-m2 tag readiness determination).
 
 ## Current phase in progress
 
+**Phase 27 (REST document lifecycle) — COMPLETE as of 2026-09-08.**
+Create/list/get/rename/revoke-access for documents — `POST/GET
+/v1/documents`, `GET/PATCH/DELETE /v1/documents/{id}`, `GET
+/v1/users/search` — all behind Phase 26's real Bearer-token auth,
+verified for the first time on an incoming request (`authMiddleware.ts`).
+The single §5.1 error envelope, the 404-vs-403 enumeration-oracle rule,
+API Spec §9.2 idempotency (a new `idempotency_keys` table, canonicalized-
+JSON body hashing), and DELETE's real GOODBYE broadcast to every open
+WebSocket session for the document (verified end to end with a real
+client) are all built and DoD-tested against a real Postgres instance —
+see the "Phase 27" bullet in the Completed Phases list above for the
+full account, including two pre-existing gaps this phase's own
+regression re-run found (one fixed — a stale hardcoded table-count
+test; one left alone as already-tracked, unrelated — the Fugue O(N²)
+warm-start slowdown, Open Item 3) and what's explicitly deferred (no
+grant-permission endpoint yet; the WS gateway still verifies no token
+at all). No open item from this phase blocks anything.
+
 **Phase 26 (Authentication and sessions) — COMPLETE as of 2026-09-07.**
 Real user accounts, Argon2id password hashing, JWT access tokens, and
 refresh-token rotation with family-revocation-on-reuse are all live —
@@ -6363,15 +6595,23 @@ BEHAVIOR" callout above for the full risk and what must change when
 auth lands.** **Real authentication now exists as of Phase 26** (API Spec
 §4.1/§4.2) — `POST /v1/auth/login`/`/refresh`/`/logout`, real Argon2id
 password hashing, JWT access tokens, refresh-token rotation with
-family-revocation-on-reuse — but it is NOT YET WIRED into the WebSocket
-gateway's own handshake, which is unchanged and still exactly as
-permissive as before: any WebSocket client can join any document by
-guessing its id and is unconditionally granted the EDITOR role. This is
-Phase 27+'s own job (verifying a real access token during HELLO and using
-its claims for real per-document authorization), not yet a security
-concern since nothing is exposed publicly, and not something Phase 26
-itself claimed to close — Phase 26 built the login/token PRIMITIVES,
-deliberately scoped no further. A React component (`EditorView`), the full `beforeinput`
+family-revocation-on-reuse — and, as of **Phase 27**, the REST document
+lifecycle (`POST/GET /v1/documents`, `GET/PATCH/DELETE
+/v1/documents/{id}`, `GET /v1/users/search`) is real too, behind a real
+`Authorization: Bearer` check — but it is STILL NOT WIRED into the
+WebSocket gateway's own handshake, which is unchanged and still exactly
+as permissive as before: any WebSocket client can join any document by
+guessing its id and is unconditionally granted the EDITOR role. This
+remains a later phase's own job (verifying a real access token during
+HELLO and using its claims for real per-document authorization), not
+yet a security concern since nothing is exposed publicly, and not
+something Phase 26 or 27 claimed to close — both built real REST-side
+auth primitives, deliberately scoped no further. Also new as of Phase
+27: a real, if minimal, permission SYSTEM now exists for documents
+(`document_permissions`, read via `getUserRole`) — but there is still
+no REST endpoint to GRANT a role (Scope-IN named create/list/get/
+rename/revoke-access only); this project's own tests still seed
+editor/viewer rows directly via SQL. A React component (`EditorView`), the full `beforeinput`
 dispatch pipeline (Phase 12), MutationObserver-based DOM reconciliation
 (`MutationSentinel`, Phase 13), and a real demoable app (`packages/client/
 src/app/`, Phase 14/Milestone M1) now exist and are wired together —
@@ -7467,6 +7707,28 @@ flakiness, not just observed once.
   bulk-insert technique) auditing in ~13 seconds against the 30-second
   budget; and `audit_runs` confirmed queryable with a correctly-ordered
   "last successful run" timestamp.
+
+**Note on the "27 tests across five files" figure above**: it reflects
+this section's own last full update (Phase 18) and was never kept in
+sync with every later phase's own `db/*.db.test.ts` additions (Phase 21's
+`gc.db.test.ts`, Phase 25's `dur02LedgerReconciliation.db.test.ts`/
+`dur03CrashInjection.db.test.ts`/`soak.db.test.ts`, Phase 26's
+`auth.db.test.ts`/`authTiming.db.test.ts`, etc.) — a pre-existing
+documentation-maintenance gap, not something this phase introduces or
+attempts to fully correct (out of scope for a single phase's own
+report). **Phase 27 adds one new file, `db/documents.db.test.ts`** (9
+tests — the full REST matrix, one test per row/row-group: create,
+title validation, idempotency replay/conflict, list with role
+filter/pagination, get with the 404-vs-403 split, patch, delete/GOODBYE/
+retention, users/search, and the combined error-envelope check) — see
+the Phase 27 completed-phase entry above for the full account and real
+results. This same regression pass also fixed a real, pre-existing,
+unrelated staleness in `schema.db.test.ts` (a hardcoded 8-table literal
+list that had silently never been updated when Phase 26 added
+`refresh_tokens`) and confirmed — but did NOT fix — a real, pre-existing,
+unrelated failure in `snapshots.db.test.ts` (its 50,000-op/2-second
+warm-start budget, now measuring ~59s under Fugue's already-disclosed
+O(N²) cost, CLAUDE.md's own Open Item 3).
 
 Excluded from the default `pnpm test` (requires `docker compose up -d` +
 `pnpm db:migrate` first; most dev/CI environments don't have a Postgres
