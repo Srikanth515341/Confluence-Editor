@@ -4,8 +4,10 @@
 // own framing): get the broadcast/commit/ack ordering wrong and either
 // M4 latency or M2 durability breaks.
 //
-//   1. authorize (Phase 24: a real, minimal role check -- session.role !== VIEWER; full
-//      authorization beyond that single check is still Phase 28)
+//   1. authorize (Phase 24 gave this a real, minimal check -- session.role !== VIEWER, evaluated
+//      once at that phase. Phase 28 makes this a genuine PER-OPERATION re-check, through a ≤2s
+//      decision cache (SEC-06) that a live role change invalidates immediately -- see
+//      DocumentCoordinator.authorizeSession/setSessionRoleLive)
 //   2. verify stamp.r === session.replica_id
 //   3. rate check (stubbed until Phase 30)
 //   4. expand run/batch
@@ -120,18 +122,6 @@ export interface WritePathTestHooks {
 /** `OpsMessage` minus the two server-only, seq-less kinds — narrowed once here rather than at every downstream call site, since `processIncomingOperation`'s own early throw guard only narrows within that function's own body, not across the `runFastPath`/`runSlowPath` function boundary. */
 type ClientOpsMessage = Exclude<OpsMessage, OpAckMessage | OpRejectMessage>;
 
-/**
- * Step 1: authorize. Phase 24 gives this its first REAL (if still minimal) check: a session
- * whose role is VIEWER may never mutate the document (RC-32, API Spec §5.4/§5.5). Real role
- * ASSIGNMENT — who may change whose role, and why — remains Phase 26-30's job; `session.role`
- * itself is still either the hardcoded EDITOR default every real connection gets, or a
- * Phase-24-test-only override (`DocumentCoordinator.testOnlyQueueRoleOverride`, RC-32's own
- * stand-in for a permission system that doesn't exist yet).
- */
-function authorize(session: CoordinatorSession): boolean {
-  return session.role !== SessionRole.VIEWER;
-}
-
 /** Step 3: rate check. Stubbed until Phase 30. Always allows. */
 function rateCheckStub(_session: CoordinatorSession): boolean {
   return true;
@@ -184,8 +174,25 @@ export async function processIncomingOperation(
     return;
   }
 
-  // Step 1: authorize.
-  if (!authorize(session)) {
+  // Step 1: authorize (API Spec §6.3 line 1). Phase 28's own Goal: enforced on EVERY operation,
+  // not just at connect — `coordinator.authorizeSession` re-evaluates `session.role` on every
+  // call (through a ≤2s decision cache, SEC-06), and `session.role` itself can now change on an
+  // ALREADY-CONNECTED session (`DocumentCoordinator.setSessionRoleLive`/
+  // `testOnlySetConnectedSessionRole`), not only affect the next session to join (Phase 24's
+  // original `testOnlyQueueRoleOverride`). Real per-user role ASSIGNMENT (who may change whose
+  // role, and why) still doesn't reach the WS layer — no real WS identity/ticket-based admission
+  // exists yet (Phase 29's own job; see `HelloMessage.ticket`'s own doc comment) — `session.role`
+  // is still either the hardcoded EDITOR default every real connection gets, or a test-only
+  // override standing in for a permission system this layer can't yet look up by real identity.
+  if (!coordinator.authorizeSession(session)) {
+    // SEC-01's own "security log" requirement: session + document ids on every rejection, not
+    // just the OP_REJECT sent back to the sender.
+    logger.warn("writePath.authorizationDenied", {
+      documentId: coordinator.documentId,
+      sessionId: session.sessionId,
+      replicaId: session.replicaId,
+      role: SessionRole[session.role],
+    });
     sendOpReject(
       session,
       ops,
@@ -198,8 +205,20 @@ export async function processIncomingOperation(
   // Step 2: verify stamp.r === session.replica_id. Every operation in one message shares
   // exactly one replica by construction (a run/batch is always minted by ONE local Engine
   // instance) — checking the first operation's id.r is checking all of them.
+  //
+  // stamp.r is verified against the session's replica id. This is a CORRECTNESS
+  // control, not an attribution nicety: a client that could choose its own replica
+  // id could mint identifiers colliding with another replica's, violating Engine
+  // Spec I1 and breaking convergence itself. RFC §8.3, API Spec §11.8.
   const claimedReplica = ops[0]!.id.r;
   if (claimedReplica !== session.replicaId) {
+    // SEC-01/02's own "security log" requirement — see the identical reasoning above.
+    logger.warn("writePath.identityMismatch", {
+      documentId: coordinator.documentId,
+      sessionId: session.sessionId,
+      replicaId: session.replicaId,
+      claimedReplica,
+    });
     sendOpReject(
       session,
       ops,
