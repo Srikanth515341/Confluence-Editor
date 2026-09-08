@@ -71,11 +71,19 @@ async function seedUserDocumentSession(): Promise<{
 }
 
 describe("Phase 15 schema — table/index existence", () => {
-  it("pnpm db:migrate creates all eight tables", async () => {
+  it("pnpm db:migrate creates all ten tables", async () => {
     // `pgmigrations` is node-pg-migrate's own bookkeeping table (records
     // which migrations have run) — an implementation detail of the chosen
     // migration tool, not one of API Spec §2's eight tables, so it's
     // excluded here rather than added to the expected list below.
+    //
+    // Ten, not eight, as of Phase 27: Phase 26 added `refresh_tokens`
+    // (API Spec §4.2, no verbatim DDL supplied — this project's own
+    // disclosed design) and Phase 27 added `idempotency_keys` (API Spec
+    // §9.2, same reasoning) — this literal list was never updated when
+    // Phase 26 landed, a real, if narrow, pre-existing gap this phase's
+    // own DoD verification found and fixed while confirming its OWN new
+    // table's presence, not something Phase 27 itself introduced.
     const { rows } = await client.query<{ table_name: string }>(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
@@ -87,7 +95,9 @@ describe("Phase 15 schema — table/index existence", () => {
         "audit_runs",
         "document_permissions",
         "documents",
+        "idempotency_keys",
         "operations",
+        "refresh_tokens",
         "sessions",
         "snapshots",
         "users",

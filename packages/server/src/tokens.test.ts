@@ -6,6 +6,7 @@ import {
   hashRefreshToken,
   signAccessToken,
   verifyAccessToken,
+  verifyAccessTokenDetailed,
 } from "./tokens.js";
 
 function fakeAuthConfig(overrides: Partial<AuthConfig> = {}): AuthConfig {
@@ -85,5 +86,40 @@ describe("tokens (Phase 26, API Spec §4.1/§4.2)", () => {
     const config = fakeAuthConfig();
     const raw = generateRawRefreshToken();
     expect(hashRefreshToken(raw, config)).not.toBe(raw);
+  });
+
+  describe("verifyAccessTokenDetailed (Phase 27, API Spec §5.1's missing-auth vs. expired-token distinction)", () => {
+    it("reports 'valid' with the claims for a genuinely good token", () => {
+      const config = fakeAuthConfig();
+      const token = signAccessToken({ sub: "u", email: "e@x.com", displayName: "D" }, config);
+      expect(verifyAccessTokenDetailed(token, config)).toEqual({
+        outcome: "valid",
+        claims: { sub: "u", email: "e@x.com", displayName: "D" },
+      });
+    });
+
+    it("reports 'expired' — never merely 'invalid' — for a syntactically-valid, correctly-signed, but expired token", () => {
+      const config = fakeAuthConfig({ accessTokenTtlMs: 1000 });
+      const token = signAccessToken({ sub: "u", email: "e", displayName: "d" }, config);
+      return new Promise<void>((resolve) => {
+        setTimeout(() => {
+          expect(verifyAccessTokenDetailed(token, config)).toEqual({ outcome: "expired" });
+          resolve();
+        }, 1500);
+      });
+    });
+
+    it("reports 'invalid' for a garbage string", () => {
+      expect(verifyAccessTokenDetailed("not.a.jwt", fakeAuthConfig())).toEqual({
+        outcome: "invalid",
+      });
+    });
+
+    it("reports 'invalid' (not 'expired') for a token signed with the wrong secret", () => {
+      const config = fakeAuthConfig();
+      const token = signAccessToken({ sub: "u", email: "e", displayName: "d" }, config);
+      const wrongConfig = fakeAuthConfig({ jwtAccessSecret: "a-different-secret" });
+      expect(verifyAccessTokenDetailed(token, wrongConfig)).toEqual({ outcome: "invalid" });
+    });
   });
 });

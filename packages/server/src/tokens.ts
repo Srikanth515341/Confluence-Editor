@@ -12,7 +12,7 @@
 // the refresh token too.
 
 import { createHmac, randomBytes } from "node:crypto";
-import jwt from "jsonwebtoken";
+import jwt, { TokenExpiredError } from "jsonwebtoken";
 import type { AuthConfig } from "./config.js";
 
 export interface AccessTokenClaims {
@@ -44,6 +44,37 @@ export function verifyAccessToken(token: string, config: AuthConfig): AccessToke
     return { sub, email, displayName };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Phase 27 (API Spec §5.1/§5.2, Test Plan §11.1's "missing auth / expired token" row) — unlike
+ * `verifyAccessToken` above (which collapses every failure to a single `null`, correct for its
+ * one existing caller, which has no reason to distinguish them), the REST auth middleware
+ * (authMiddleware.ts) needs the distinction: a genuinely EXPIRED token must map to the specific
+ * `401 session_expired` code the Test Plan names explicitly, while a missing/malformed/wrong-
+ * secret token maps to a separate, generic "not authenticated at all" code. Reusing
+ * `jwt.verify`'s own thrown error TYPE (not re-parsing/re-deriving expiry by hand) is what makes
+ * this distinction reliable — `TokenExpiredError` is thrown ONLY for a syntactically-valid,
+ * correctly-signed token whose `exp` claim has passed, never for any other failure mode.
+ */
+export type AccessTokenVerification =
+  | { readonly outcome: "valid"; readonly claims: AccessTokenClaims }
+  | { readonly outcome: "expired" }
+  | { readonly outcome: "invalid" };
+
+export function verifyAccessTokenDetailed(token: string, config: AuthConfig): AccessTokenVerification {
+  try {
+    const decoded = jwt.verify(token, config.jwtAccessSecret);
+    if (typeof decoded !== "object" || decoded === null) return { outcome: "invalid" };
+    const { sub, email, displayName } = decoded as Record<string, unknown>;
+    if (typeof sub !== "string" || typeof email !== "string" || typeof displayName !== "string") {
+      return { outcome: "invalid" };
+    }
+    return { outcome: "valid", claims: { sub, email, displayName } };
+  } catch (err) {
+    if (err instanceof TokenExpiredError) return { outcome: "expired" };
+    return { outcome: "invalid" };
   }
 }
 

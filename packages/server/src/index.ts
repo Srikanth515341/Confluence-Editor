@@ -2,10 +2,13 @@
 // as of Phase 16 (operations are durably committed before being
 // acknowledged — API Spec §6.3) when run directly, below, via a real
 // `PostgresOperationStore`. Real user accounts/login (API Spec §4.1/§4.2)
-// are built as of Phase 26 — POST /v1/auth/login, /refresh, /logout; the
-// WebSocket gateway's own handshake does NOT yet verify an access token
-// (that remains Phase 27+ — see gateway.ts's own `testOnlyQueueRoleOverride`
-// citations for the still-standing no-auth-on-the-WS-path stance).
+// are built as of Phase 26 — POST /v1/auth/login, /refresh, /logout.
+// Phase 27 adds the REST document lifecycle (create/list/get/rename/
+// revoke-access, API Spec §4.3-§4.6/§4.16) behind the SAME real Bearer-
+// token auth (authMiddleware.ts) — but the WebSocket gateway's own
+// handshake still does NOT verify an access token (that remains a later
+// phase — see gateway.ts's own `testOnlyQueueRoleOverride` citations for
+// the still-standing no-auth-on-the-WS-path stance).
 
 export const SERVER_PACKAGE_NAME = "@collab-editor/server";
 
@@ -102,6 +105,58 @@ export {
   type UserRow,
   type RefreshTokenRow,
 } from "./db/authStore.js";
+export { verifyAccessTokenDetailed, type AccessTokenVerification } from "./tokens.js";
+export { requireAuth, type AuthLocals } from "./authMiddleware.js";
+export { sendError, requestIdMiddleware, type ErrorEnvelopeDetails, type RequestIdLocals } from "./restErrors.js";
+export {
+  createDocument,
+  getDocumentById,
+  getUserRole,
+  listPermissions,
+  updateDocumentTitle,
+  revokeDocumentAccess,
+  listDocumentsForUser,
+  searchUsers,
+  findIdempotencyRecord,
+  saveIdempotencyRecord,
+  type DocumentRole,
+  type DocumentRow,
+  type PermissionEntry,
+  type DocumentListEntry,
+  type ListDocumentsInput,
+  type SearchUserRow,
+  type IdempotencyRecord,
+} from "./db/documentStore.js";
+export {
+  ALL_DOCUMENT_ROLES,
+  DEFAULT_TITLE,
+  MAX_TITLE_LENGTH,
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
+  isDocumentRole,
+  maskEmail,
+  canonicalJsonStringify,
+  hashRequestBody,
+  resolveTitleForCreate,
+  resolveTitleForUpdate,
+  toDocumentSummary,
+  createDocumentForUser,
+  getDocumentForUser,
+  renameDocument,
+  deleteDocumentAccess,
+  encodeDocumentListCursor,
+  decodeDocumentListCursor,
+  listDocumentsForUserService,
+  searchUsersForResponse,
+  type DocumentSummaryResponse,
+  type CreateDocumentOutcome,
+  type GetDocumentOutcome,
+  type PatchDocumentOutcome,
+  type DeleteDocumentOutcome,
+  type ListDocumentsOutcome,
+  type DocumentListItem,
+  type SearchUserResult,
+} from "./documentService.js";
 
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";

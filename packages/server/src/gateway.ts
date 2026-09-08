@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   Channel,
+  GoodbyeReason,
   ProtocolDecodeError,
   SessionRole,
   SyncMode,
@@ -182,6 +183,27 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         presenceStale: false,
         staleTimer: undefined,
         receivedFrameCount: 0,
+        // Phase 27 (API Spec §4.5 DELETE) — see CoordinatorSession.disconnectForRevocation's own
+        // doc comment. `4001` is an application-specific WebSocket close code (the 4000-4999
+        // range is reserved for exactly this); the CONTROL-level GOODBYE frame's own `reason`
+        // field (PERMISSION_REVOKED) is the actual, protocol-defined signal a real client parses
+        // — this raw close code is only ever a secondary, transport-level hint.
+        disconnectForRevocation: () => {
+          if (ws.readyState !== ws.OPEN) return;
+          const frame = encodeControlFrame({
+            kind: "goodbye",
+            reason: GoodbyeReason.PERMISSION_REVOKED,
+            // A revoked document's access isn't coming back — 0 signals "do not retry," unlike
+            // e.g. a SHUTDOWN goodbye, which would give a real backoff hint instead.
+            retryAfterMs: 0,
+          });
+          // Send the GOODBYE first, close only once it's actually been written to the socket —
+          // closing immediately after `send()` returns (before its own callback fires) risks the
+          // close frame racing ahead of the GOODBYE payload on some platforms.
+          ws.send(frame, { binary: true }, () => {
+            ws.close(4001, "document access revoked");
+          });
+        },
       };
       coordinator.join(session);
       bound = { coordinator, session };

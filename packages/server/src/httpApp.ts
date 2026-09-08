@@ -14,6 +14,21 @@ import {
 } from "./authService.js";
 import { InMemoryRateLimiter } from "./rateLimiter.js";
 import { logger } from "./logger.js";
+import { requireAuth, type AuthLocals } from "./authMiddleware.js";
+import { requestIdMiddleware, sendError, type RequestIdLocals } from "./restErrors.js";
+import {
+  ALL_DOCUMENT_ROLES,
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
+  createDocumentForUser,
+  deleteDocumentAccess,
+  getDocumentForUser,
+  isDocumentRole,
+  listDocumentsForUserService,
+  renameDocument,
+  searchUsersForResponse,
+} from "./documentService.js";
+import type { DocumentRole } from "./db/documentStore.js";
 
 /** API Spec §4.1/§4.2's own literal cookie name/path — the ONE place both are named, so /login, /refresh, and /logout can never drift out of sync with each other. */
 const REFRESH_COOKIE_NAME = "rt";
@@ -184,18 +199,253 @@ function mountAuthRoutes(app: Express, pool: DbPool, authConfig: AuthConfig): vo
   });
 }
 
+/**
+ * Phase 27 — POST/GET/PATCH/DELETE /v1/documents[/:id], GET /v1/users/search (API Spec §4.3-§4.6,
+ * §4.16). Every route runs behind `requireAuth` (authMiddleware.ts) — the Test Plan §11.1 "any"
+ * row's missing-auth/expired-token cases apply uniformly across all of them. Each handler stays
+ * thin: parse the request, call one documentService.ts function, map its discriminated outcome to
+ * a status code — the actual role-check/idempotency/pagination logic lives there, independently
+ * testable without an Express request/response object.
+ */
+function mountDocumentRoutes(
+  app: Express,
+  pool: DbPool,
+  authConfig: AuthConfig,
+  getCoordinators: () => ReadonlyMap<string, DocumentCoordinator>,
+): void {
+  const auth = requireAuth(authConfig);
+
+  function requestId(res: Response): string {
+    return (res.locals as RequestIdLocals).requestId;
+  }
+
+  function authedUserId(res: Response): string {
+    return (res.locals as AuthLocals).user.sub;
+  }
+
+  app.post("/v1/documents", auth, async (req, res) => {
+    const idempotencyKeyHeader = req.headers["idempotency-key"];
+    const idempotencyKey =
+      typeof idempotencyKeyHeader === "string" ? idempotencyKeyHeader : undefined;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const outcome = await createDocumentForUser(pool, {
+      ownerId: authedUserId(res),
+      rawTitle: body.title,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    });
+    switch (outcome.kind) {
+      case "validation-failed":
+        sendError(
+          res,
+          400,
+          "validation_failed",
+          "title must be a string of at most 512 characters",
+          requestId(res),
+          { fields: ["title"] },
+        );
+        return;
+      case "idempotency-conflict":
+        sendError(
+          res,
+          409,
+          "idempotency_key_reused",
+          "This Idempotency-Key was already used with a different request body",
+          requestId(res),
+        );
+        return;
+      case "replay":
+        res.status(outcome.status).json(outcome.body);
+        return;
+      case "created":
+        res.status(201).location(`/v1/documents/${outcome.body.id}`).json(outcome.body);
+        return;
+    }
+  });
+
+  app.get("/v1/documents", auth, async (req, res) => {
+    const rawRoles = req.query.role;
+    const roleTokens = Array.isArray(rawRoles) ? rawRoles : rawRoles !== undefined ? [rawRoles] : [];
+    const roles: DocumentRole[] = [];
+    for (const token of roleTokens) {
+      if (typeof token !== "string" || !isDocumentRole(token)) {
+        sendError(
+          res,
+          400,
+          "validation_failed",
+          `?role= must be one of: ${ALL_DOCUMENT_ROLES.join(", ")}`,
+          requestId(res),
+          { fields: ["role"] },
+        );
+        return;
+      }
+      roles.push(token);
+    }
+    const requestedLimit = Number(req.query.limit ?? DEFAULT_LIST_LIMIT);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.trunc(requestedLimit), 1), MAX_LIST_LIMIT)
+      : DEFAULT_LIST_LIMIT;
+    const rawCursor = req.query.cursor;
+    if (rawCursor !== undefined && typeof rawCursor !== "string") {
+      sendError(res, 400, "validation_failed", "?cursor= must be a string", requestId(res), {
+        fields: ["cursor"],
+      });
+      return;
+    }
+    const outcome = await listDocumentsForUserService(
+      pool,
+      {
+        userId: authedUserId(res),
+        limit,
+        ...(roles.length > 0 ? { roles } : {}),
+        ...(rawCursor !== undefined ? { cursor: rawCursor } : {}),
+      },
+      (documentId) => getCoordinators().get(documentId)?.sessionCount ?? 0,
+    );
+    if (outcome.kind === "invalid-cursor") {
+      sendError(res, 400, "validation_failed", "?cursor= is not a valid cursor", requestId(res), {
+        fields: ["cursor"],
+      });
+      return;
+    }
+    res.status(200).json({ documents: outcome.documents, nextCursor: outcome.nextCursor });
+  });
+
+  app.get("/v1/documents/:documentId", auth, async (req: Request<{ documentId: string }>, res: Response) => {
+    const coordinator = getCoordinators().get(req.params.documentId);
+    // API Spec §4.5's structureSize/tombstoneCount are "owner only" and reflect editing VOLUME —
+    // prefer a currently-open coordinator's live `engine.stats()` over the durable
+    // `documents.structure_size`/`tombstone_count` columns, which no code path in this project
+    // currently maintains (db/documentStore.ts's own `DocumentRow.structureSize` doc comment).
+    const liveStats = coordinator
+      ? {
+          structureSize: coordinator.engine.stats().totalElements,
+          tombstoneCount: coordinator.engine.stats().tombstones,
+        }
+      : undefined;
+    const outcome = await getDocumentForUser(pool, {
+      documentId: req.params.documentId,
+      userId: authedUserId(res),
+      ...(liveStats ? { liveStats } : {}),
+    });
+    if (outcome.kind === "not-found") {
+      sendError(
+        res,
+        404,
+        "document_not_found",
+        "No document with this id, or you do not have access to it",
+        requestId(res),
+      );
+      return;
+    }
+    res.status(200).json(outcome.body);
+  });
+
+  app.patch("/v1/documents/:documentId", auth, async (req: Request<{ documentId: string }>, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const outcome = await renameDocument(pool, {
+      documentId: req.params.documentId,
+      userId: authedUserId(res),
+      rawTitle: body.title,
+    });
+    switch (outcome.kind) {
+      case "not-found":
+        sendError(
+          res,
+          404,
+          "document_not_found",
+          "No document with this id, or you do not have access to it",
+          requestId(res),
+        );
+        return;
+      case "forbidden":
+        sendError(res, 403, "permission_denied", "Only the document owner may rename it", requestId(res));
+        return;
+      case "validation-failed":
+        sendError(
+          res,
+          400,
+          "validation_failed",
+          "title must be a non-empty string of at most 512 characters",
+          requestId(res),
+          { fields: ["title"] },
+        );
+        return;
+      case "ok":
+        res.status(200).json(outcome.body);
+        return;
+    }
+  });
+
+  app.delete("/v1/documents/:documentId", auth, async (req: Request<{ documentId: string }>, res: Response) => {
+    const documentId = req.params.documentId;
+    const outcome = await deleteDocumentAccess(pool, { documentId, userId: authedUserId(res) });
+    switch (outcome.kind) {
+      case "not-found":
+        sendError(
+          res,
+          404,
+          "document_not_found",
+          "No document with this id, or you do not have access to it",
+          requestId(res),
+        );
+        return;
+      case "forbidden":
+        sendError(res, 403, "permission_denied", "Only the document owner may delete it", requestId(res));
+        return;
+      case "ok":
+        // API Spec §4.5: "causes every open socket for the document to receive GOODBYE{reason:
+        // 2}" — AFTER the durable revocation above has already committed, never before (telling a
+        // live socket "you're revoked" while the database still showed active permissions would
+        // be a real, if narrow, inconsistency window).
+        getCoordinators().get(documentId)?.disconnectAllSessions();
+        res.status(204).end();
+        return;
+    }
+  });
+
+  app.get("/v1/users/search", auth, async (req, res) => {
+    const q = req.query.q;
+    if (typeof q !== "string" || q.length === 0) {
+      sendError(res, 400, "validation_failed", "?q= is required", requestId(res), { fields: ["q"] });
+      return;
+    }
+    const users = await searchUsersForResponse(pool, q);
+    res.status(200).json({ users });
+  });
+}
+
 export function createHttpApp(deps: HttpAppDeps): Express {
   const app = express();
-  // Only POST /v1/auth/* bodies exist in this whole app — every other route is GET with no
-  // body — but mounting this unconditionally is harmless (a no-op for a bodyless GET) and is
-  // simpler than conditionally mounting it only when `authDeps` is present.
+  // Phase 27 (API Spec §5.1) — MUST run before `express.json()`: even a request that fails JSON
+  // parsing (the very next middleware) needs a requestId to report in its own error envelope, and
+  // "requestId ... in every server log line for that request" means the very FIRST log line for a
+  // request (below) needs one too.
+  app.use(requestIdMiddleware(logger.info));
+  // Only POST /v1/auth/* and POST/PATCH /v1/documents* bodies exist in this whole app — every
+  // other route is GET with no body — but mounting this unconditionally is harmless (a no-op for
+  // a bodyless GET) and is simpler than conditionally mounting it only when a body-bearing route
+  // is present.
   app.use(express.json());
   // `express.json()` calls `next(err)` on syntactically invalid JSON, which — left unhandled —
   // would fall through to Express's own default HTML error page instead of this API's own
-  // consistent `{ error: "..." }` JSON shape. Malformed input of ANY kind on an auth route is a
-  // `validation_failed`, whether it's a missing field or a body that isn't valid JSON at all.
-  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  // consistent error shape. Malformed input of ANY kind is a `validation_failed`, whether it's a
+  // missing field or a body that isn't valid JSON at all — but WHICH shape depends on which
+  // phase's routes are being hit: Phase 27's own new `/v1/documents*` routes use the real §5.1
+  // envelope (restErrors.ts); Phase 26's already-shipped `/v1/auth/*` routes keep their own
+  // simpler, already-DoD-verified `{ error: "..." }` shape unchanged (see restErrors.ts's own
+  // header comment for why this phase doesn't retrofit that).
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
     if (err instanceof SyntaxError && "body" in err) {
+      if (req.path.startsWith("/v1/documents")) {
+        sendError(
+          res,
+          400,
+          "validation_failed",
+          "Malformed JSON request body",
+          (res.locals as RequestIdLocals).requestId,
+        );
+        return;
+      }
       res.status(400).json({ error: "validation_failed" });
       return;
     }
@@ -206,6 +456,7 @@ export function createHttpApp(deps: HttpAppDeps): Express {
   });
   if (deps.authDeps) {
     mountAuthRoutes(app, deps.authDeps.pool, deps.authDeps.authConfig);
+    mountDocumentRoutes(app, deps.authDeps.pool, deps.authDeps.authConfig, deps.getCoordinators);
   }
   app.get("/v1/documents/:documentId/replay", async (req, res) => {
     const coordinator = deps.getCoordinators().get(req.params.documentId);
