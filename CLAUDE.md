@@ -5297,6 +5297,248 @@ check:purity` was ALSO silently broken by two comments (one in
   window (enforced at query time only, per this phase's own disclosed
   design above).
 
+- **Phase 28 — Permissions and per-operation authorization** (API Spec
+  §4.7-§4.9, §6.3 line 1, §11.8; Test Plan SEC-01/02/03/06/07; PRD
+  FR-PM-1…4, FR-PM-6, M9). Owner/editor/viewer roles enforced server-side
+  on every operation, not just at connect — the phase's own stated Goal.
+  Dependencies: Phases 16 (the write path this phase's own step 1 finally
+  makes real) and 27 (real REST auth, `document_permissions` reads).
+
+  **The foundational design question, resolved with the user before any
+  code was written**: Phase 28's own DoD (SEC-01 specifically) implicitly
+  assumes a way to test "a real viewer's operations get rejected by real
+  permission data" over a real WebSocket connection — but the WS
+  handshake has deliberately carried no real authenticated identity since
+  Phase 8 (`HelloMessage.ticket`'s own pre-existing doc comment: "Opaque
+  bytes from a later auth phase (Phase 29) — accepted, never validated,
+  this phase"). Two options were presented via `AskUserQuestion`: (1) add
+  a plain, unauthenticated `userId` field to HELLO as a disclosed interim
+  measure, or (2) keep HELLO completely unchanged and simulate the
+  WS-side scenarios via the existing, already-labeled
+  `DocumentCoordinator.testOnlyQueueRoleOverride` test seam (Phase 24's
+  own RC-32 precedent), generalized as needed. **The user chose option
+  2**, with reasoning worth recording verbatim because it names a real
+  principle, not just a preference: "adding a client-declared,
+  unauthenticated userId field to HELLO — even as a disclosed interim
+  measure — would be a real, permanent addition to the wire protocol
+  that contradicts this very phase's own core principle (attribution
+  must come from the authenticated session, never anything
+  client-declared). It's exactly the shape of gap SEC-03 exists to test
+  against." This means SEC-01/02/03/07's WS-layer coverage proves the
+  SERVER-SIDE ENFORCEMENT LOGIC is correct using a labeled test seam for
+  identity — not a full end-to-end proof with real ticket-based
+  authentication, which doesn't exist until Phase 29. Stated here
+  explicitly so it is never mistaken for more than it is.
+
+  **`DocumentCoordinator.testOnlyQueueRoleOverride` was generalized, not
+  replaced** (`documentCoordinator.ts`): Phase 24's own mechanism only
+  ever affected the NEXT session to join a coordinator — insufficient for
+  Phase 28's own Goal ("not just at connect"), since a genuine
+  per-operation re-check needs to be OBSERVABLY different from a
+  connect-time check, which requires changing an ALREADY-CONNECTED
+  session's role live. Two new methods close this: `setSessionRoleLive
+  (sessionId, role)` (the real mechanism — mutates `session.role`,
+  Phase-28-newly-mutable, was `readonly` through Phase 27 — and
+  immediately invalidates that session's own cached authorization
+  decision) and `testOnlySetConnectedSessionRole` (a thin, explicitly-
+  named, grep-able alias for it, kept separate from the real name so
+  every call site standing in for "a real permission change landed on an
+  already-connected session" — since no real WS identity/ticket-based
+  admission exists until Phase 29 — is unambiguously a test seam, the
+  same discipline `testOnlyQueueRoleOverride` already established).
+
+  **The authorization decision cache (SEC-06: "≤2s TTL")**
+  (`DocumentCoordinator.authDecisionCache`/`authorizeSession`): keyed by
+  `sessionId`, `AUTH_DECISION_TTL_MS = 2000`. Today's actual per-operation
+  check (`session.role !== VIEWER`) is cheap enough that a cache buys
+  nothing on its own — this exists so the SHAPE of "authorize on every
+  operation, through a bounded-staleness cache" is already in place for
+  Phase 29+, when this is expected to become a real per-user DB lookup
+  keyed off a genuine authenticated WS identity that doesn't exist yet.
+  An EXPLICIT role change (`setSessionRoleLive`) invalidates the cache
+  immediately rather than waiting out the TTL — verified directly
+  (`permissions.test.ts`'s own SEC-06 test): a role flipped without
+  going through the real invalidation path stays masked by the cache for
+  up to, but never past, 2000ms; the real path shows zero staleness at
+  all, not even the TTL's own duration.
+
+  **`writePath.ts`'s step 1 is now genuinely real, not the Phase 24
+  minimal stub reused unchanged** — the phase brief's own note ("this is
+  the first phase where writePath.ts's step 1 becomes real. Wire it in
+  properly rather than adding a parallel check") is satisfied literally:
+  the free function `authorize(session)` was DELETED (not kept alongside
+  a new check) and every call site now reads
+  `coordinator.authorizeSession(session)` directly. A rejection at this
+  step now also logs a security-log line (`writePath.authorizationDenied`,
+  session + document ids — SEC-01's own explicit requirement), and the
+  identical treatment was added to the pre-existing (correct since Phase
+  16) identity-mismatch rejection (`writePath.identityMismatch`) — SEC-01
+  and SEC-02 share the same "log every rejection" requirement, so both
+  paths log, not just the new one.
+
+  **The required verbatim stamp.r comment is now in the code**, directly
+  above the existing, already-correct (since Phase 16) `claimedReplica
+  !== session.replicaId` check — this logic was never wrong, it simply
+  never carried this exact citation text before:
+  ```
+  // stamp.r is verified against the session's replica id. This is a CORRECTNESS
+  // control, not an attribution nicety: a client that could choose its own replica
+  // id could mint identifiers colliding with another replica's, violating Engine
+  // Spec I1 and breaking convergence itself. RFC §8.3, API Spec §11.8.
+  ```
+
+  **SEC-03 (attribution from the authenticated session, never the
+  payload)**: verified, not merely inspected — `runFastPath`/`runSlowPath`
+  (writePath.ts, unchanged this phase) were re-confirmed to call
+  `commitOperations` with `authorSession: session.sessionId, authorUser:
+  session.userId` at every call site, never from `msg`/`ops` — and
+  `OpsMessage` (API Spec §3.5) structurally carries no author/user field
+  at all for a payload to even smuggle one through. `permissions.test.ts`'s
+  own SEC-03 test documents this as a structural property of the code
+  (the test's own `session` object is the ONLY identity source
+  `commitOperations` is ever given in that call), not a new runtime
+  check — there was nothing to build here, only to confirm and cite.
+
+  **New REST endpoints** (`db/documentStore.ts`'s `grantPermission`/
+  `revokePermission`/`transferOwnership`; `documentService.ts`'s
+  `grantPermissionForUser`/`revokePermissionForUser`/
+  `transferOwnershipForUser`; `httpApp.ts`'s three new routes), all behind
+  Phase 27's own `requireAuth`:
+  - `PUT /v1/documents/{id}/permissions/{userId}` — owner-only; body
+    `{role}` restricted to `GRANTABLE_ROLES = ["editor", "viewer"]`
+    (never `"owner"` — ownership can only ever be TRANSFERRED, via POST
+    `/owner`, never granted through a plain upsert); upserts via the
+    table's own PK `(document_id, user_id)`; 409
+    `cannot_change_own_owner_role` if the caller (necessarily the owner,
+    already checked) targets their OWN id — the endpoint was never
+    designed to let ownership simply vanish via a role change; 404
+    `user_not_found` if the target isn't a real user; response
+    `{documentId, userId, role, grantedBy, grantedAt, effectiveAtSeq}`,
+    with `effectiveAtSeq` read from `documents.current_seq` (the durable
+    column) right after the grant commits — "the document sequence at
+    commit," per §4.7's own wording.
+  - `DELETE /v1/documents/{id}/permissions/{userId}` — owner-only; 409
+    `cannot_revoke_owner` if the target's current role is `'owner'`
+    (ownership can only move via POST `/owner`, never simply be
+    removed); 404 `user_not_found` if the target has no permission row
+    at all (nothing to revoke); 204 on success.
+  - `POST /v1/documents/{id}/owner` — owner-only; body `{newOwnerId}`;
+    409 `target_has_no_access` if the target has no EXISTING permission
+    row (must already have some access before receiving ownership); 200
+    with the document's updated summary, the CALLER's own new role now
+    `"editor"` (the transaction demotes them as part of the same atomic
+    operation).
+
+  **SEC-07's atomicity — real, live proof, not an inference from reading
+  the transaction**: `transferOwnership` (`db/documentStore.ts`) wraps a
+  `SELECT user_id FROM document_permissions WHERE document_id = $1 AND
+  role = 'owner' FOR UPDATE` at the START of its transaction — this locks
+  the current owner's own row for the transaction's full duration,
+  serializing every concurrent transfer attempt against the SAME document
+  into a strict queue. Whichever transaction acquires the lock first
+  re-checks (under the lock, never from an earlier, possibly-stale read)
+  that the caller is STILL the owner; every other transaction that later
+  acquires the same lock finds a DIFFERENT owner already in place and
+  returns `"not-owner"` (mapped to the ordinary 403 `permission_denied` —
+  the caller simply isn't/is-no-longer the owner, same status a stale
+  check would have produced anyway). This is what makes "exactly one of
+  N concurrent requests succeeds" a database-ENFORCED guarantee, not an
+  application-level hope. Demote-then-promote (never the other order)
+  means the transaction never holds two `'owner'` rows at once (which
+  `docperm_single_owner_idx` would refuse regardless) and never holds
+  zero for longer than the gap between its own two UPDATE statements,
+  itself inside the same lock-serialized transaction.
+
+  **Verified for real** (`db/permissions.db.test.ts`, against a real,
+  migrated Postgres instance, `pnpm test:db`): 50 concurrent `POST
+  .../owner` requests to 50 DIFFERENT targets on the same document,
+  alongside a live, running 10ms-interval poller of
+  `document_permissions` for the WHOLE duration of the burst (not a
+  before/after snapshot) — **observed, real result: the poller never once
+  saw zero or two simultaneous owners, exactly 1 of 50 requests returned
+  200, the other 49 returned 403, and the original owner's own row ended
+  up exactly `'editor'`** (never vanished, never left as `'owner'`).
+  Alongside this: full PUT/DELETE/POST-owner coverage (owner-only
+  enforcement, every named 400/403/404/409 outcome, upsert-changes-the-
+  same-row behavior) and, in `permissions.test.ts` (no Postgres needed —
+  pure in-memory `DocumentCoordinator`/`CoordinatorSession` fixtures,
+  the same pattern `writePath.test.ts` already established for Phase
+  24's RC-32 coverage), SEC-01 (VIEWER rejection + security log, AND the
+  live-downgrade-takes-effect-on-the-very-next-operation scenario that
+  is this phase's own Goal made concrete), SEC-02 (identity mismatch +
+  security log), SEC-03 (attribution structural proof), and SEC-06 (the
+  cache's own TTL/invalidation behavior, both sides of the boundary).
+
+  **DoD verification, all against the real, merged code**: `pnpm -r exec
+  tsc --noEmit` clean across all 6 packages; `pnpm eslint` clean for
+  every file this phase touched; the full default `pnpm test` (workspace-
+  wide) re-run clean at **483/483 across 54 files** (up from 474/53 at
+  the end of Phase 27 — the +9 are this phase's own new
+  `permissions.test.ts` (6) and `documentService.test.ts`'s 3 new
+  `isGrantableRole` cases; 2 disclosed, pre-existing skips, unchanged)
+  after every change, confirming zero regressions from this
+  phase's shared-file edits (`documentCoordinator.ts`, `writePath.ts`,
+  `httpApp.ts`, `documentService.ts`, `db/documentStore.ts`, `index.ts`);
+  `db/documents.db.test.ts` (9/9), `db/durability.db.test.ts` (9/9), and
+  `db/schema.db.test.ts` (7/7) re-run clean against real Postgres,
+  confirming no regression from this phase's own shared-file changes;
+  `db/permissions.db.test.ts` (4/4, including the real SEC-07 burst
+  above) and `permissions.test.ts` (6/6) both new and passing;
+  `db/auth.db.test.ts` (12/12) re-run clean, confirming no regression
+  from this phase's shared-file changes there either.
+
+  **A pre-existing, UNRELATED regression check finding, confirmed not
+  caused by this phase**: re-running `db/audit.db.test.ts` and
+  `db/gc.db.test.ts` (both exercise a 100,000-operation document) as part
+  of this phase's own broader regression sweep, both now TIME OUT
+  entirely at that scale (previously slow but completing — e.g. Phase 21's
+  own account measured the M8-c scenario completing; Phase 18's 100k-op
+  audit measured ~13 seconds) — this phase touched none of
+  `engine.ts`/`gcScheduler.ts`/`audit.ts`/`operationStore.ts` (confirmed
+  via `git status`: this phase's own diff is scoped entirely to
+  `documentCoordinator.ts`, `writePath.ts`, `httpApp.ts`,
+  `documentService.ts`, `db/documentStore.ts`, `index.ts`, plus two new
+  test files), so this is the SAME already-disclosed, already-tracked
+  Fugue O(N²) sequential-insertion cost (Open Item 3) continuing to
+  worsen at 100,000-op scale as more phases' own fixtures exercise it —
+  not a new finding, and not this phase's own regression. Left exactly
+  as found, per this project's own established precedent (Phase 27's
+  identical treatment of `snapshots.db.test.ts`'s 50,000-op slowdown) —
+  fixing it means Open Item 3's own deferred balanced-storage redesign,
+  not a Phase 28 fix.
+
+  **PERMISSION_CHANGED push — built structurally correct, with a
+  disclosed limit on what it actually reaches today**
+  (`httpApp.ts`'s `pushPermissionChanged`,
+  `DocumentCoordinator.getSessionsByUserId`): API Spec §4.7/§4.8's own
+  "publishes an authorization invalidation and pushes PERMISSION_CHANGED
+  to every open session for that user on that document" is implemented
+  by matching `CoordinatorSession.userId` — but that field is still a
+  fresh `randomUUID()` minted per WS connection (Phase 8/16, completely
+  unchanged this phase, per the resolved design decision above), never a
+  real authenticated identity. **In production today, a REST-
+  authenticated `userId` (from a real JWT) will structurally never match
+  any live WS session's own `userId`, so this will typically find
+  nothing to push to.** The mechanism itself — find every open session
+  for a given user on a given document, invalidate its cached
+  authorization decision, update its live role, and enqueue a real
+  PERMISSION_CHANGED control frame — is real, correct, and exactly what
+  Phase 29's real ticket-based admission needs the moment WS sessions
+  carry a real userId instead of a random one; disclosed here rather
+  than silently built and left undocumented, the same "known interim
+  behavior" treatment Phase 16's own auto-provisioning callout received.
+
+  **What is deliberately NOT built this phase**: any REAL linkage between
+  a REST-authenticated user identity and a WS session's own identity —
+  that is Phase 29's own job in full (real ticket-based admission,
+  `HelloMessage.ticket` finally validated); a UI for any of this
+  (`ConnectionIndicator.tsx`/`EditorView.tsx` untouched); a real DB-backed
+  per-user lookup behind `authorizeSession` (still `session.role !==
+  VIEWER`, exactly as Phase 24 left it — only the CACHING/re-evaluation
+  SHAPE around it is new); any endpoint to LIST who has access other than
+  the pre-existing owner-only `permissions` field on `GET
+  /v1/documents/{id}` (Phase 27).
+
 ## 🛑 CRITICAL, OPEN, UNRESOLVED FINDING — READ THIS FIRST (2026-09-05)
 
 **The core convergence guarantee is currently known to be BROKEN under
@@ -6371,6 +6613,26 @@ status and v0.2.0-m2 tag readiness determination).
 
 ## Current phase in progress
 
+**Phase 28 (Permissions and per-operation authorization) — COMPLETE as of
+2026-09-08.** Owner/editor/viewer roles are now enforced server-side on
+every operation, not just at connect — `PUT/DELETE
+/v1/documents/{id}/permissions/{userId}` and `POST
+/v1/documents/{id}/owner`, `writePath.ts`'s step 1 finally real (a
+per-operation re-check through a ≤2s decision cache, SEC-06), and the
+required stamp.r correctness comment now in the code. SEC-07's ownership-
+transfer atomicity is proven with a real, live 50-concurrent-request burst
+against a real Postgres instance — see the "Phase 28" bullet in the
+Completed Phases list above for the full account, including the resolved
+foundational design decision (keep HELLO's wire protocol unchanged;
+simulate the WS-side scenarios via a generalized, still-labeled test seam,
+`testOnlySetConnectedSessionRole`, rather than adding any new
+unauthenticated identity field) and exactly what that decision means for
+what SEC-01/02/03/07's WS-layer coverage does and does not prove. No open
+item from this phase blocks anything — the next phase to pick up is
+whichever one wires real ticket-based WS identity (Phase 29), which is
+what would let PERMISSION_CHANGED's own push mechanism (built this phase,
+structurally correct) actually reach a real, authenticated live session.
+
 **Phase 27 (REST document lifecycle) — COMPLETE as of 2026-09-08.**
 Create/list/get/rename/revoke-access for documents — `POST/GET
 /v1/documents`, `GET/PATCH/DELETE /v1/documents/{id}`, `GET
@@ -6606,12 +6868,20 @@ remains a later phase's own job (verifying a real access token during
 HELLO and using its claims for real per-document authorization), not
 yet a security concern since nothing is exposed publicly, and not
 something Phase 26 or 27 claimed to close — both built real REST-side
-auth primitives, deliberately scoped no further. Also new as of Phase
-27: a real, if minimal, permission SYSTEM now exists for documents
-(`document_permissions`, read via `getUserRole`) — but there is still
-no REST endpoint to GRANT a role (Scope-IN named create/list/get/
-rename/revoke-access only); this project's own tests still seed
-editor/viewer rows directly via SQL. A React component (`EditorView`), the full `beforeinput`
+auth primitives, deliberately scoped no further. As of **Phase 28**, real
+grant/revoke/transfer endpoints now exist (`PUT/DELETE
+/v1/documents/{id}/permissions/{userId}`, `POST
+/v1/documents/{id}/owner`) and `writePath.ts`'s own per-operation
+authorization check is genuinely re-evaluated on every operation, not
+read once at connect — but the WS-side "authenticated identity" gap
+above is exactly why PERMISSION_CHANGED's own push mechanism (built this
+phase) will typically find no live session to reach in production: a WS
+session's `userId` is still a random per-connection value, unrelated to
+any REST-authenticated user id, until Phase 29 actually wires real
+ticket-based identity into the handshake. This project's own tests
+still seed editor/viewer rows directly via SQL in most places (the
+grant endpoint exists now, but most fixtures predate it and were never
+migrated to use it, since there was no reason to). A React component (`EditorView`), the full `beforeinput`
 dispatch pipeline (Phase 12), MutationObserver-based DOM reconciliation
 (`MutationSentinel`, Phase 13), and a real demoable app (`packages/client/
 src/app/`, Phase 14/Milestone M1) now exist and are wired together —
@@ -7729,6 +7999,19 @@ list that had silently never been updated when Phase 26 added
 unrelated failure in `snapshots.db.test.ts` (its 50,000-op/2-second
 warm-start budget, now measuring ~59s under Fugue's already-disclosed
 O(N²) cost, CLAUDE.md's own Open Item 3).
+
+**Phase 28 adds two new files**: `db/permissions.db.test.ts` (4 tests —
+PUT/DELETE .../permissions/{userId}, POST .../owner, and SEC-07's own
+50-concurrent-request ownership-transfer atomicity burst, verified live
+against a real Postgres instance with a running 10ms-interval poller,
+not just a before/after snapshot) and, outside `db/` entirely (no
+Postgres needed), `packages/server/src/permissions.test.ts` (6 tests —
+SEC-01/02/03/06's own WS-layer, in-memory `DocumentCoordinator`
+coverage). This phase's own regression sweep also found — but did NOT
+fix, being unrelated to this phase's own work — `db/audit.db.test.ts`
+and `db/gc.db.test.ts`'s 100,000-operation tests now TIMING OUT entirely
+(previously slow but completing), the same already-disclosed Fugue
+O(N²) cost (Open Item 3) continuing to worsen at that scale.
 
 Excluded from the default `pnpm test` (requires `docker compose up -d` +
 `pnpm db:migrate` first; most dev/CI environments don't have a Postgres

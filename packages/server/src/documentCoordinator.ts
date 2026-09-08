@@ -45,8 +45,18 @@ export interface CoordinatorSession {
   readonly queues: ConnectionSendQueues;
   /** Phase 16: coalesces this session's own OP_ACK entries (up to 64 entries or 20ms, whichever first) — see ackBatcher.ts. Constructed once at handshake time (gateway.ts), closed on disconnect. */
   readonly ackBatcher: AckBatcher;
-  /** Hardcoded EDITOR for every session this phase — real roles/auth are Phase 26-29 (API Spec §3.6.2). */
-  readonly role: SessionRole;
+  /**
+   * Hardcoded EDITOR at connect time for every real session (API Spec §3.6.2) — real per-user
+   * role ASSIGNMENT still doesn't reach the WS layer (Phase 29's own "real WS identity" job; see
+   * `HelloMessage.ticket`'s own doc comment). Mutable as of Phase 28 (was `readonly` through
+   * Phase 27): Phase 28's Goal is authorization "not just at connect," which requires a role
+   * change to be observable to an ALREADY-CONNECTED session, not only to the next one that joins
+   * (Phase 24's original `testOnlyQueueRoleOverride` only ever affected the latter). Mutated only
+   * via `DocumentCoordinator.setSessionRoleLive`/`testOnlySetConnectedSessionRole` below, which
+   * also invalidate this session's own cached authorization decision so the change is never
+   * masked by a stale cache entry.
+   */
+  role: SessionRole;
   /** Placeholder UUID this phase — real users don't exist until Phase 26. */
   readonly userId: string;
   readonly displayName: string;
@@ -284,6 +294,93 @@ export class DocumentCoordinator {
     const role = this.testOnlyNextRoleOverride;
     this.testOnlyNextRoleOverride = null;
     return role;
+  }
+
+  /**
+   * Phase 28 (API Spec §6.3 line 1, Test Plan SEC-06) — a per-session decision cache with a
+   * ≤2-second TTL, keyed by sessionId. Exists so per-operation authorization (Phase 28's own
+   * Goal: "enforced server-side on every operation, not just at connect") does not mean a fresh
+   * permission lookup on every single keystroke once a real, DB-backed per-user permission check
+   * eventually replaces `session.role` as this cache's source of truth (Phase 29+) — a stale
+   * decision can survive for at most `AUTH_DECISION_TTL_MS`, and an EXPLICIT role change
+   * (`setSessionRoleLive` below) invalidates it immediately rather than waiting out the TTL, so a
+   * revocation is never masked by a cache that just happens to still be "fresh."
+   */
+  private readonly authDecisionCache = new Map<string, { readonly allowed: boolean; readonly expiresAt: number }>();
+
+  /** SEC-06's own literal bound: "a decision cache whose TTL is ≤ 2s." */
+  static readonly AUTH_DECISION_TTL_MS = 2000;
+
+  /**
+   * Step 1 of writePath.ts's write path (API Spec §6.3 line 1) — re-evaluated on every call, not
+   * read once at connect. Today's actual check (`session.role !== VIEWER`) is cheap enough that
+   * this cache buys nothing on its own; it exists so the SHAPE of "authorize per operation,
+   * bounded-staleness cache" is already in place for Phase 29+, when this is expected to become a
+   * real per-user DB lookup keyed off a genuine authenticated WS identity that doesn't exist yet.
+   */
+  authorizeSession(session: CoordinatorSession, now: number = Date.now()): boolean {
+    const cached = this.authDecisionCache.get(session.sessionId);
+    if (cached && cached.expiresAt > now) {
+      return cached.allowed;
+    }
+    const allowed = session.role !== SessionRole.VIEWER;
+    this.authDecisionCache.set(session.sessionId, {
+      allowed,
+      expiresAt: now + DocumentCoordinator.AUTH_DECISION_TTL_MS,
+    });
+    return allowed;
+  }
+
+  /** Drops any cached authorization decision for one session — called whenever that session's own role changes, so the very next operation re-evaluates rather than possibly reusing a decision cached under the OLD role for up to `AUTH_DECISION_TTL_MS` longer. */
+  invalidateAuthorizationCache(sessionId: string): void {
+    this.authDecisionCache.delete(sessionId);
+  }
+
+  /**
+   * Phase 28 — generalizes Phase 24's `testOnlyQueueRoleOverride` (which only ever affected the
+   * NEXT session to join) to also change an ALREADY-CONNECTED session's role live. This is what
+   * makes "authorize on every operation, not just at connect" an observable difference from a
+   * connect-time-only check: a real caller would reach this via a genuine, authenticated
+   * grant/revoke landing on a live WS session, but no real WS identity/ticket-based admission
+   * exists yet (Phase 29's own job — see `HelloMessage.ticket`'s own doc comment) — matching by
+   * session id here, never by the WS session's own fake per-connection `userId`. Returns `false`
+   * if no session with that id is currently connected (the caller — httpApp.ts's grant/revoke
+   * routes — treats this as "nothing to push," not an error, since the affected user may simply
+   * not be connected over WS right now).
+   */
+  setSessionRoleLive(sessionId: string, role: SessionRole): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.role = role;
+    this.invalidateAuthorizationCache(sessionId);
+    return true;
+  }
+
+  /** TEST-ONLY (Phase 28, Test Plan SEC-01/02/03/07) — thin, explicitly-named alias for `setSessionRoleLive`, kept separate so every call site that exists purely to simulate "a real permission change landed on an already-connected session" (since no real WS identity/ticket-based admission exists until Phase 29) is grep-able as a test seam, the same discipline `testOnlyQueueRoleOverride` above already established. */
+  testOnlySetConnectedSessionRole(sessionId: string, role: SessionRole): boolean {
+    return this.setSessionRoleLive(sessionId, role);
+  }
+
+  /**
+   * Phase 28 (API Spec §4.7/§4.8: "pushes PERMISSION_CHANGED to every open session for that user
+   * on that document") — matches by `CoordinatorSession.userId`, which is a fresh `randomUUID()`
+   * per WS connection (gateway.ts, unchanged since Phase 8/16), NOT a real authenticated user
+   * identity. DISCLOSED GAP, consistent with this project's standing "the WS gateway still does
+   * not verify any access token" stance (CLAUDE.md's own "What is explicitly NOT yet built"):
+   * in production today, a REST-authenticated `userId` (from a real JWT) will structurally never
+   * match any live WS session's own `userId` field, so this will typically find nothing to push
+   * to. The mechanism itself — find every open session for a given user, on this document — is
+   * real and correct, and is what Phase 29's real ticket-based admission needs the moment WS
+   * sessions carry a real, authenticated userId instead of a random one.
+   */
+  getSessionsByUserId(userId: string): CoordinatorSession[] {
+    const result: CoordinatorSession[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.userId === userId) {
+        result.push(session);
+      }
+    }
+    return result;
   }
 
   constructor(

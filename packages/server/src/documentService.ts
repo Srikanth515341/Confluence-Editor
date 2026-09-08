@@ -11,15 +11,19 @@ import {
   findIdempotencyRecord,
   getDocumentById,
   getUserRole,
+  grantPermission,
   listDocumentsForUser,
   listPermissions,
   revokeDocumentAccess,
+  revokePermission,
   saveIdempotencyRecord,
   searchUsers,
+  transferOwnership,
   updateDocumentTitle,
   type DocumentRole,
   type DocumentRow,
 } from "./db/documentStore.js";
+import { findUserById } from "./db/authStore.js";
 
 export const DEFAULT_TITLE = "Untitled";
 export const MAX_TITLE_LENGTH = 512;
@@ -356,4 +360,161 @@ export interface SearchUserResult {
 export async function searchUsersForResponse(pool: DbPool, query: string): Promise<SearchUserResult[]> {
   const rows = await searchUsers(pool, query);
   return rows.map((r) => ({ id: r.id, displayName: r.displayName, email: maskEmail(r.email) }));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 28 — Permissions and per-operation authorization (API Spec §4.7-§4.9).
+// ---------------------------------------------------------------------------------------------
+
+/** PUT's own role enum — deliberately narrower than `ALL_DOCUMENT_ROLES`: ownership can never be GRANTED through this endpoint (only transferred, via `transferOwnershipForUser` below, which relies on `docperm_single_owner_idx` for atomicity that a plain upsert cannot provide). */
+export const GRANTABLE_ROLES: readonly DocumentRole[] = ["editor", "viewer"];
+
+export function isGrantableRole(value: unknown): value is DocumentRole {
+  return typeof value === "string" && (GRANTABLE_ROLES as readonly string[]).includes(value);
+}
+
+export interface PermissionChangeResponse {
+  readonly documentId: string;
+  readonly userId: string;
+  readonly role: DocumentRole;
+  readonly grantedBy: string;
+  readonly grantedAt: string;
+  readonly effectiveAtSeq: number;
+}
+
+export type GrantPermissionOutcome =
+  | { readonly kind: "not-found" }
+  | { readonly kind: "forbidden" }
+  | { readonly kind: "validation-failed" }
+  | { readonly kind: "user-not-found" }
+  | { readonly kind: "cannot-change-own-owner-role" }
+  | { readonly kind: "ok"; readonly body: PermissionChangeResponse };
+
+/**
+ * API Spec §4.7 PUT /v1/documents/{id}/permissions/{userId} — owner-only. `effectiveAtSeq` (§4.7:
+ * "the document sequence at commit; operations at or before it were authorized under the
+ * previous role and are KEPT") is read from `documents.current_seq` right after the grant commits
+ * — the durable column, not necessarily a currently-open coordinator's own live `currentSeq`
+ * (which can be ahead of the durable value by whatever hasn't committed yet at this exact
+ * instant) — the same "durable is the answer unless a live one is supplied" precedent
+ * `getDocumentForUser`'s own `liveStats` parameter established for structureSize/tombstoneCount.
+ */
+export async function grantPermissionForUser(
+  pool: DbPool,
+  input: {
+    readonly documentId: string;
+    readonly callerId: string;
+    readonly targetUserId: string;
+    readonly rawRole: unknown;
+  },
+): Promise<GrantPermissionOutcome> {
+  const callerRole = await getUserRole(pool, input.documentId, input.callerId);
+  if (!callerRole) return { kind: "not-found" };
+  if (callerRole !== "owner") return { kind: "forbidden" };
+  if (input.targetUserId === input.callerId) {
+    // The owner IS the caller here (checked above) — changing their OWN role through this
+    // endpoint would either be a redundant no-op (granting themselves 'owner' — not even a valid
+    // GRANTABLE_ROLES value) or a self-demotion this endpoint was never designed to allow
+    // (ownership must always move through `transferOwnershipForUser`, never simply vanish).
+    return { kind: "cannot-change-own-owner-role" };
+  }
+  if (!isGrantableRole(input.rawRole)) return { kind: "validation-failed" };
+  const targetUser = await findUserById(pool, input.targetUserId);
+  if (!targetUser) return { kind: "user-not-found" };
+
+  const result = await grantPermission(pool, {
+    documentId: input.documentId,
+    userId: input.targetUserId,
+    role: input.rawRole,
+    grantedBy: input.callerId,
+  });
+  const document = await getDocumentById(pool, input.documentId);
+  return {
+    kind: "ok",
+    body: {
+      documentId: input.documentId,
+      userId: input.targetUserId,
+      role: result.role,
+      grantedBy: result.grantedBy,
+      grantedAt: result.grantedAt.toISOString(),
+      effectiveAtSeq: Number(document?.currentSeq ?? 0n),
+    },
+  };
+}
+
+export type RevokePermissionOutcome =
+  | { readonly kind: "not-found" }
+  | { readonly kind: "forbidden" }
+  | { readonly kind: "target-not-found" }
+  | { readonly kind: "cannot-revoke-owner" }
+  | { readonly kind: "ok" };
+
+/** API Spec §4.8 DELETE /v1/documents/{id}/permissions/{userId} — owner-only; revoking the current owner's own row is 409 cannot_revoke_owner (ownership can only ever move via `transferOwnershipForUser`, never simply be removed). */
+export async function revokePermissionForUser(
+  pool: DbPool,
+  input: { readonly documentId: string; readonly callerId: string; readonly targetUserId: string },
+): Promise<RevokePermissionOutcome> {
+  const callerRole = await getUserRole(pool, input.documentId, input.callerId);
+  if (!callerRole) return { kind: "not-found" };
+  if (callerRole !== "owner") return { kind: "forbidden" };
+  const targetRole = await getUserRole(pool, input.documentId, input.targetUserId);
+  if (!targetRole) return { kind: "target-not-found" };
+  if (targetRole === "owner") return { kind: "cannot-revoke-owner" };
+  await revokePermission(pool, input.documentId, input.targetUserId);
+  return { kind: "ok" };
+}
+
+export type TransferOwnershipOutcome =
+  | { readonly kind: "not-found" }
+  | { readonly kind: "forbidden" }
+  | { readonly kind: "validation-failed" }
+  | { readonly kind: "user-not-found" }
+  | { readonly kind: "target-has-no-access" }
+  | { readonly kind: "ok"; readonly body: DocumentSummaryResponse };
+
+/**
+ * API Spec §4.9 POST /v1/documents/{id}/owner — owner-only. The outer `getUserRole` check here is
+ * an early, cheap rejection for the common case (caller was never the owner at all — 404/403,
+ * same enumeration-oracle reasoning as every other route); the REAL atomicity guarantee for
+ * concurrent transfer attempts (SEC-07) lives inside `transferOwnership`'s own `SELECT ... FOR
+ * UPDATE`-serialized transaction, which re-checks ownership under the lock rather than trusting
+ * this earlier, now-possibly-stale read.
+ */
+export async function transferOwnershipForUser(
+  pool: DbPool,
+  input: { readonly documentId: string; readonly callerId: string; readonly rawNewOwnerId: unknown },
+): Promise<TransferOwnershipOutcome> {
+  const callerRole = await getUserRole(pool, input.documentId, input.callerId);
+  if (!callerRole) return { kind: "not-found" };
+  if (callerRole !== "owner") return { kind: "forbidden" };
+  if (typeof input.rawNewOwnerId !== "string" || input.rawNewOwnerId.length === 0) {
+    return { kind: "validation-failed" };
+  }
+  const newOwnerId = input.rawNewOwnerId;
+  const targetUser = await findUserById(pool, newOwnerId);
+  if (!targetUser) return { kind: "user-not-found" };
+
+  const result = await transferOwnership(pool, {
+    documentId: input.documentId,
+    callerId: input.callerId,
+    newOwnerId,
+  });
+  if (result.kind === "not-owner") {
+    // Lost a concurrent race (SEC-07) — by the time the transaction's own lock was acquired,
+    // `input.callerId` was no longer the owner. Reported the same way as the outer, earlier
+    // check above: this caller simply isn't (or is no longer) the owner.
+    return { kind: "forbidden" };
+  }
+  if (result.kind === "target-has-no-access") {
+    return { kind: "target-has-no-access" };
+  }
+  const document = await getDocumentById(pool, input.documentId);
+  if (!document) {
+    // Structurally shouldn't happen (the transaction above just updated this exact row) — never
+    // assumed, only checked, the same discipline `getDocumentForUser` already applies.
+    return { kind: "not-found" };
+  }
+  // The caller (the former owner) is now 'editor' — `transferOwnership`'s own transaction demotes
+  // them as part of the same atomic operation.
+  return { kind: "ok", body: toDocumentSummary(document, "editor") };
 }

@@ -1,5 +1,6 @@
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { Engine } from "@collab-editor/engine";
+import { encodeControlFrame, SessionRole } from "@collab-editor/protocol";
 import { parseCookie, stringifySetCookie } from "cookie";
 import type { DocumentCoordinator } from "./documentCoordinator.js";
 import type { AuthConfig } from "./config.js";
@@ -23,12 +24,45 @@ import {
   createDocumentForUser,
   deleteDocumentAccess,
   getDocumentForUser,
+  grantPermissionForUser,
   isDocumentRole,
   listDocumentsForUserService,
   renameDocument,
+  revokePermissionForUser,
   searchUsersForResponse,
+  transferOwnershipForUser,
 } from "./documentService.js";
 import type { DocumentRole } from "./db/documentStore.js";
+
+/**
+ * Phase 28 (API Spec §4.7/§4.8: "pushes PERMISSION_CHANGED to every open session for that user on
+ * that document") — see `DocumentCoordinator.getSessionsByUserId`'s own doc comment for the
+ * disclosed gap this relies on (a WS session's `userId` is still a random per-connection value,
+ * not a real authenticated identity, so this will typically find nothing to push to against a
+ * real production connection today). `role: null` (revocation) sends nothing — there is no
+ * SessionRole value for "no access at all," and no real WS identity to force-disconnect by real
+ * user id yet either (unlike DELETE /v1/documents/{id}, which disconnects EVERY session for the
+ * document via `disconnectAllSessions`, not one user's).
+ */
+function pushPermissionChanged(
+  coordinator: DocumentCoordinator | undefined,
+  userId: string,
+  role: DocumentRole | null,
+): void {
+  if (!coordinator) return;
+  const sessionRole =
+    role === "owner" ? SessionRole.OWNER : role === "editor" ? SessionRole.EDITOR : role === "viewer" ? SessionRole.VIEWER : null;
+  for (const session of coordinator.getSessionsByUserId(userId)) {
+    coordinator.invalidateAuthorizationCache(session.sessionId);
+    if (sessionRole !== null) {
+      session.role = sessionRole;
+      session.queues.enqueue(
+        "control",
+        encodeControlFrame({ kind: "permissionChanged", role: sessionRole }),
+      );
+    }
+  }
+}
 
 /** API Spec §4.1/§4.2's own literal cookie name/path — the ONE place both are named, so /login, /refresh, and /logout can never drift out of sync with each other. */
 const REFRESH_COOKIE_NAME = "rt";
@@ -402,6 +436,184 @@ function mountDocumentRoutes(
         return;
     }
   });
+
+  app.put(
+    "/v1/documents/:documentId/permissions/:userId",
+    auth,
+    async (req: Request<{ documentId: string; userId: string }>, res: Response) => {
+      const { documentId, userId } = req.params;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const outcome = await grantPermissionForUser(pool, {
+        documentId,
+        callerId: authedUserId(res),
+        targetUserId: userId,
+        rawRole: body.role,
+      });
+      switch (outcome.kind) {
+        case "not-found":
+          sendError(
+            res,
+            404,
+            "document_not_found",
+            "No document with this id, or you do not have access to it",
+            requestId(res),
+          );
+          return;
+        case "forbidden":
+          sendError(
+            res,
+            403,
+            "permission_denied",
+            "Only the document owner may grant or change a permission",
+            requestId(res),
+          );
+          return;
+        case "user-not-found":
+          sendError(res, 404, "user_not_found", "No user with this id", requestId(res));
+          return;
+        case "cannot-change-own-owner-role":
+          sendError(
+            res,
+            409,
+            "cannot_change_own_owner_role",
+            "The owner cannot change their own role this way — use POST /v1/documents/{id}/owner to transfer ownership",
+            requestId(res),
+          );
+          return;
+        case "validation-failed":
+          sendError(
+            res,
+            400,
+            "validation_failed",
+            "role must be one of: editor, viewer",
+            requestId(res),
+            { fields: ["role"] },
+          );
+          return;
+        case "ok":
+          // API Spec §4.7: "publishes an authorization invalidation and pushes PERMISSION_CHANGED
+          // to every open session for that user on that document" — see pushPermissionChanged's
+          // own doc comment for the disclosed limit on what "that user"'s live sessions actually
+          // means today.
+          pushPermissionChanged(getCoordinators().get(documentId), userId, outcome.body.role);
+          res.status(200).json(outcome.body);
+          return;
+      }
+    },
+  );
+
+  app.delete(
+    "/v1/documents/:documentId/permissions/:userId",
+    auth,
+    async (req: Request<{ documentId: string; userId: string }>, res: Response) => {
+      const { documentId, userId } = req.params;
+      const outcome = await revokePermissionForUser(pool, {
+        documentId,
+        callerId: authedUserId(res),
+        targetUserId: userId,
+      });
+      switch (outcome.kind) {
+        case "not-found":
+          sendError(
+            res,
+            404,
+            "document_not_found",
+            "No document with this id, or you do not have access to it",
+            requestId(res),
+          );
+          return;
+        case "forbidden":
+          sendError(
+            res,
+            403,
+            "permission_denied",
+            "Only the document owner may revoke a permission",
+            requestId(res),
+          );
+          return;
+        case "target-not-found":
+          sendError(res, 404, "user_not_found", "No user with this id", requestId(res));
+          return;
+        case "cannot-revoke-owner":
+          sendError(
+            res,
+            409,
+            "cannot_revoke_owner",
+            "The document owner's own access cannot be revoked — transfer ownership first",
+            requestId(res),
+          );
+          return;
+        case "ok":
+          pushPermissionChanged(getCoordinators().get(documentId), userId, null);
+          res.status(204).end();
+          return;
+      }
+    },
+  );
+
+  app.post(
+    "/v1/documents/:documentId/owner",
+    auth,
+    async (req: Request<{ documentId: string }>, res: Response) => {
+      const documentId = req.params.documentId;
+      const callerId = authedUserId(res);
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const outcome = await transferOwnershipForUser(pool, {
+        documentId,
+        callerId,
+        rawNewOwnerId: body.newOwnerId,
+      });
+      switch (outcome.kind) {
+        case "not-found":
+          sendError(
+            res,
+            404,
+            "document_not_found",
+            "No document with this id, or you do not have access to it",
+            requestId(res),
+          );
+          return;
+        case "forbidden":
+          sendError(
+            res,
+            403,
+            "permission_denied",
+            "Only the current document owner may transfer ownership",
+            requestId(res),
+          );
+          return;
+        case "validation-failed":
+          sendError(res, 400, "validation_failed", "newOwnerId is required", requestId(res), {
+            fields: ["newOwnerId"],
+          });
+          return;
+        case "user-not-found":
+          sendError(res, 404, "user_not_found", "No user with this id", requestId(res));
+          return;
+        case "target-has-no-access":
+          sendError(
+            res,
+            409,
+            "target_has_no_access",
+            "The target user must already have some access to this document before receiving ownership",
+            requestId(res),
+          );
+          return;
+        case "ok": {
+          const coordinator = getCoordinators().get(documentId);
+          // Both parties' roles changed as one atomic transaction (transferOwnership's own
+          // FOR-UPDATE-serialized transaction) — push PERMISSION_CHANGED to both, if either is
+          // currently connected (see pushPermissionChanged's own doc comment for the disclosed
+          // limit on what "connected" actually means today).
+          const newOwnerId = typeof body.newOwnerId === "string" ? body.newOwnerId : "";
+          pushPermissionChanged(coordinator, callerId, "editor");
+          pushPermissionChanged(coordinator, newOwnerId, "owner");
+          res.status(200).json(outcome.body);
+          return;
+        }
+      }
+    },
+  );
 
   app.get("/v1/users/search", auth, async (req, res) => {
     const q = req.query.q;

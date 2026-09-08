@@ -12,6 +12,34 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 28 — Permissions and per-operation authorization.** Owner/editor/
+viewer roles are now enforced server-side on EVERY operation, not just at
+connect: `PUT/DELETE /v1/documents/{id}/permissions/{userId}` grant/change
+and revoke a role (owner-only, 409 on trying to change your own owner role
+or revoke the owner), and `POST /v1/documents/{id}/owner` transfers
+ownership in one atomic transaction — verified with a real, live proof:
+50 concurrent transfer requests to 50 different targets against a real
+Postgres instance, exactly one succeeds, a 10ms poller never once observes
+zero or two owners, and the previous owner ends up exactly `editor`.
+`writePath.ts`'s authorization step is now a genuine per-operation
+re-check through a ≤2-second decision cache that an explicit role change
+invalidates immediately, not a value read once at connect and trusted
+forever — proven by downgrading an already-CONNECTED session's role and
+watching its very next operation get rejected, no reconnect involved. The
+`stamp.r === session.replica_id` check (already correct since Phase 16)
+now carries the exact required correctness-not-attribution comment, and
+every rejection is logged with session and document ids. Because
+ticket-based WS identity is explicitly Phase 29's own job, the WS-side
+scenarios (a real viewer's operations getting rejected) are proven via a
+generalized version of Phase 24's own labeled test seam
+(`testOnlySetConnectedSessionRole`) rather than any new, unauthenticated
+identity field added to the wire protocol — a decision made explicitly to
+avoid contradicting this very phase's own principle that attribution must
+come from the authenticated session, never anything client-declared. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 28 entry for the full account,
+including exactly what "proven" means here versus true end-to-end
+ticket-authenticated proof, deferred to Phase 29.
+
 **Phase 27 — REST document lifecycle.** Create, list, read, rename, and
 revoke access to documents — `POST/GET /v1/documents`, `GET/PATCH/DELETE
 /v1/documents/{id}`, `GET /v1/users/search` — the first REST endpoints in
@@ -454,9 +482,9 @@ runs this at full scale on a schedule.
 | Convergence engine — Fugue migration       | ✅ **Phase 25** (three real bugs found in the prior YATA-family scan; rebuilt on Fugue; six further integration bugs found & fixed; adverse-network DoD fully passing) |
 | Authentication (login/refresh/logout)      | ✅ **Phase 26** (Argon2id, JWT access tokens, refresh rotation + family revocation, SEC-11g timing-oracle-free — verified with a real statistical test) |
 | REST document lifecycle                    | ✅ **Phase 27** (create/list/get/rename/revoke-access, real Bearer-token auth, §5.1 error envelope, §9.2 idempotency, DELETE broadcasts a real GOODBYE) |
-| WS gateway authorization + presence        | ⏳ not started (31) — Phase 26/27 built real REST-side auth; the WS handshake still does not verify a token |
+| Permissions (grant/revoke/transfer)        | ✅ **Phase 28** (PUT/DELETE .../permissions/{userId}, POST .../owner; per-operation authorization with a ≤2s decision cache; SEC-07 atomicity proven with 50 real concurrent transfer requests) |
+| WS gateway authorization + presence        | ⏳ not started (Phase 29 for real ticket-based WS identity, 31 for presence) — Phase 28's own WS-side scenarios are proven via a labeled test seam (`testOnlySetConnectedSessionRole`), not real authenticated identity |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
-| Permissions (grant/share a document)       | ⏳ not started (Phase 28-30) — Phase 27 reads `document_permissions`; no endpoint grants a role yet          |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

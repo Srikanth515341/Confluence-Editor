@@ -282,6 +282,123 @@ export async function searchUsers(pool: DbPool, query: string): Promise<SearchUs
   return rows.map((r) => ({ id: r.id, displayName: r.display_name, email: r.email }));
 }
 
+export interface GrantPermissionResult {
+  readonly role: DocumentRole;
+  readonly grantedBy: string;
+  readonly grantedAt: Date;
+}
+
+/**
+ * API Spec §4.7 PUT .../permissions/{userId} — upserts via the table's own PK (document_id,
+ * user_id): a first grant INSERTs; changing an already-permissioned user's role UPDATEs that
+ * same row, bumping `granted_by`/`granted_at` to reflect the CHANGE (not the original grant).
+ * Deliberately never writes `role: 'owner'` — the caller (documentService.ts) rejects an attempt
+ * to grant ownership through this path before this function is ever reached (409
+ * cannot_change_own_owner_role — ownership transfer is `transferOwnership` below, one atomic
+ * transaction relying on `docperm_single_owner_idx`, never a plain upsert).
+ */
+export async function grantPermission(
+  pool: DbPool,
+  input: {
+    readonly documentId: string;
+    readonly userId: string;
+    readonly role: DocumentRole;
+    readonly grantedBy: string;
+  },
+): Promise<GrantPermissionResult> {
+  const { rows } = await pool.query<{ role: DocumentRole; granted_by: string; granted_at: Date }>(
+    `INSERT INTO document_permissions (document_id, user_id, role, granted_by)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (document_id, user_id)
+     DO UPDATE SET role = EXCLUDED.role, granted_by = EXCLUDED.granted_by, granted_at = now()
+     RETURNING role, granted_by, granted_at`,
+    [input.documentId, input.userId, input.role, input.grantedBy],
+  );
+  const row = rows[0]!;
+  return { role: row.role, grantedBy: row.granted_by, grantedAt: row.granted_at };
+}
+
+/** API Spec §4.8 DELETE .../permissions/{userId} — a plain row delete; the caller (documentService.ts) has already confirmed the target's current role is not 'owner' (409 cannot_revoke_owner) before reaching here. */
+export async function revokePermission(pool: DbPool, documentId: string, userId: string): Promise<void> {
+  await pool.query(`DELETE FROM document_permissions WHERE document_id = $1 AND user_id = $2`, [
+    documentId,
+    userId,
+  ]);
+}
+
+export type TransferOwnershipResult =
+  | { readonly kind: "not-owner" }
+  | { readonly kind: "target-has-no-access" }
+  | { readonly kind: "ok"; readonly effectiveAtSeq: bigint };
+
+/**
+ * API Spec §4.9 POST .../owner — ownership transfer in ONE transaction (demote the current owner
+ * to 'editor', promote the target to 'owner'), relying on `docperm_single_owner_idx` for
+ * atomicity (Phase 15's own DDL comment: "ownership transfer... can therefore never leave the
+ * database in a two-owner state even under a crash mid-transaction or a race between two
+ * concurrent transfer attempts"). The index alone guarantees no two rows are EVER simultaneously
+ * `role = 'owner'`; it does NOT by itself guarantee exactly one of N CONCURRENT transfer attempts
+ * against the SAME document succeeds and the rest fail cleanly (SEC-07) — that needs the
+ * `SELECT ... FOR UPDATE` below, which locks the current owner's own row for the duration of this
+ * transaction, serializing every concurrent transfer attempt against this document into a strict
+ * queue. Whichever transaction acquires that lock first re-checks (under the lock, not from any
+ * earlier, now-possibly-stale read) that `input.callerId` is STILL the current owner; every other
+ * concurrently-queued transaction that later acquires the same lock finds a DIFFERENT owner
+ * already in place and returns `"not-owner"` — this is what makes "exactly one of 50 concurrent
+ * requests succeeds" a real, database-enforced guarantee rather than a race the application layer
+ * merely hopes doesn't happen.
+ */
+export async function transferOwnership(
+  pool: DbPool,
+  input: { readonly documentId: string; readonly callerId: string; readonly newOwnerId: string },
+): Promise<TransferOwnershipResult> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: ownerRows } = await client.query<{ user_id: string }>(
+      `SELECT user_id FROM document_permissions WHERE document_id = $1 AND role = 'owner' FOR UPDATE`,
+      [input.documentId],
+    );
+    if (ownerRows[0]?.user_id !== input.callerId) {
+      await client.query("ROLLBACK");
+      return { kind: "not-owner" };
+    }
+    const { rows: targetRows } = await client.query<{ role: DocumentRole }>(
+      `SELECT role FROM document_permissions WHERE document_id = $1 AND user_id = $2 FOR UPDATE`,
+      [input.documentId, input.newOwnerId],
+    );
+    if (targetRows.length === 0) {
+      await client.query("ROLLBACK");
+      return { kind: "target-has-no-access" };
+    }
+    // Demote first, promote second — at no instant does this transaction hold TWO 'owner' rows
+    // (which docperm_single_owner_idx would refuse anyway) or ZERO of them for longer than the
+    // gap between these two statements, both inside the same transaction the FOR UPDATE lock
+    // above already serializes against every other concurrent transfer of this same document.
+    await client.query(
+      `UPDATE document_permissions SET role = 'editor', granted_by = $2, granted_at = now()
+       WHERE document_id = $1 AND user_id = $2`,
+      [input.documentId, input.callerId],
+    );
+    await client.query(
+      `UPDATE document_permissions SET role = 'owner', granted_by = $3, granted_at = now()
+       WHERE document_id = $1 AND user_id = $2`,
+      [input.documentId, input.newOwnerId, input.callerId],
+    );
+    const { rows: docRows } = await client.query<{ current_seq: string }>(
+      `UPDATE documents SET owner_id = $2, updated_at = now() WHERE id = $1 RETURNING current_seq`,
+      [input.documentId, input.newOwnerId],
+    );
+    await client.query("COMMIT");
+    return { kind: "ok", effectiveAtSeq: BigInt(docRows[0]!.current_seq) };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export interface IdempotencyRecord {
   readonly requestBodyHash: string;
   readonly responseStatus: number;

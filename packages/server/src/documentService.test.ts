@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   ALL_DOCUMENT_ROLES,
+  GRANTABLE_ROLES,
   canonicalJsonStringify,
   decodeDocumentListCursor,
   encodeDocumentListCursor,
   hashRequestBody,
   isDocumentRole,
+  isGrantableRole,
   maskEmail,
   resolveTitleForCreate,
   resolveTitleForUpdate,
@@ -62,6 +64,22 @@ describe("documentService (Phase 27, API Spec §4.3-§4.6/§4.16/§9.2)", () => 
     });
     it("rejects a title over 512 characters", () => {
       expect(resolveTitleForUpdate("x".repeat(513))).toEqual({ ok: false });
+    });
+  });
+
+  describe("isGrantableRole — Phase 28's PUT permissions endpoint's own role enum: 'editor'|'viewer' only, never 'owner'", () => {
+    it("accepts every GRANTABLE_ROLES value", () => {
+      for (const role of GRANTABLE_ROLES) {
+        expect(isGrantableRole(role)).toBe(true);
+      }
+    });
+    it("rejects 'owner' — ownership can only ever be TRANSFERRED (POST /owner), never GRANTED via PUT", () => {
+      expect(isGrantableRole("owner")).toBe(false);
+    });
+    it("rejects a non-string/garbage value", () => {
+      expect(isGrantableRole(123)).toBe(false);
+      expect(isGrantableRole(undefined)).toBe(false);
+      expect(isGrantableRole("administrator")).toBe(false);
     });
   });
 
