@@ -120,7 +120,13 @@ const goodbyeArb: fc.Arbitrary<ControlMessage> = fc.record({
 
 const permissionChangedArb: fc.Arbitrary<ControlMessage> = fc.record({
   kind: fc.constant("permissionChanged" as const),
-  role: fc.constantFrom(SessionRole.VIEWER, SessionRole.EDITOR, SessionRole.OWNER),
+  role: fc.constantFrom<SessionRole | null>(
+    SessionRole.VIEWER,
+    SessionRole.EDITOR,
+    SessionRole.OWNER,
+    null,
+  ),
+  effectiveAtSeq: fc.nat({ max: 5_000_000 }),
 });
 
 const errorArb: fc.Arbitrary<ControlMessage> = fc.record({

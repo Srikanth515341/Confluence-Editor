@@ -5539,6 +5539,196 @@ check:purity` was ALSO silently broken by two comments (one in
   the pre-existing owner-only `permissions` field on `GET
   /v1/documents/{id}` (Phase 27).
 
+- **Phase 29 — WebSocket admission tickets and live revocation** (API Spec
+  §4.10/§1.5/§3.6.9; Test Plan SEC-04/05/11b/c/d/e, RC-32). Makes HELLO's
+  `ticket` field REAL — accepted but never validated since Phase 9 — and
+  links real authenticated identity (Phase 26/27's Bearer tokens) to the
+  WebSocket connection for the first time, replacing the random
+  per-connection `userId` Phase 28 explicitly disclosed as a known gap.
+  Dependencies: Phases 26 (real access tokens), 27 (REST auth), 28 (the
+  per-operation authorization/decision-cache shape this phase makes
+  genuinely DB-backed).
+
+  **`POST /v1/documents/{id}/rt-ticket`** (`httpApp.ts`, new route behind
+  Phase 27's `requireAuth`): any role (owner/editor/viewer) qualifies —
+  no caller with SOME access is ever denied a ticket, so a caller with NO
+  permission row gets 404 `document_not_found`, never 403, the same
+  enumeration-oracle rule every other route in this project follows since
+  Phase 27. Issues via a new `InMemoryTicketStore`
+  (`packages/server/src/ticketStore.ts`): an opaque `rt_<base64url>`
+  string, single-use ("burned on ANY presentation, even a failing one —
+  first touch, not first success" — verified directly:
+  `ticketStore.test.ts`'s SEC-11b case confirms a reused ticket is
+  rejected even on its VERY FIRST reuse attempt, not merely on a second
+  reuse), scoped to `(documentId, userId)`, and TTL-bound
+  (`AuthConfig.ticketTtlMs`, default 30,000ms, env-overridable via
+  `AUTH_TICKET_TTL_MS`). A dedicated `InMemoryRateLimiter` instance
+  (`AuthConfig.ticketRateLimit`, default 30 tickets/60s, deliberately
+  NOT sharing counters with the login rate limiter) caps issuance.
+
+  **One shared ticket-store instance, not two** — the single most
+  important wiring decision this phase makes: `server.ts` constructs
+  exactly ONE `InMemoryTicketStore` (only when `deps.auth` is present)
+  and passes the SAME instance to both `createHttpApp` (issuing, via
+  `authDeps.ticketStore`) and `createGateway` (consuming, via
+  `deps.auth.ticketStore`). Two separate instances — an easy mistake,
+  since the REST and WS halves of this feature are built and wired in
+  different files — would make every ticket issued by the REST endpoint
+  permanently unknown to the WS gateway, and every real end-to-end test
+  would have failed immediately; disclosed here because it is exactly
+  the kind of wiring bug a typecheck alone can't catch (both sides just
+  see `TicketStore`-shaped objects).
+
+  **HELLO's ticket, consumed exactly once at handshake time**
+  (`gateway.ts`'s `handleHandshake`): when the server is constructed with
+  `auth` deps, the ticket's UTF-8 bytes are decoded and passed to
+  `ticketStore.consume(ticket, documentId)` BEFORE any coordinator is
+  even looked up — a failing consume (`not-found`/`already-used`/
+  `expired`/`wrong-document`) always maps to the SAME wire error code,
+  `ErrorCode.INVALID_TICKET` (new in `controlMessages.ts`), sent via a
+  new `rejectHandshake()` helper (ERROR frame, then close 1008) —
+  deliberately one code for every failure mode, so the wire itself can
+  never become an oracle for probing which specific thing was wrong with
+  a given ticket. A server constructed with no `auth` deps (every
+  pre-Phase-29 test) skips ticket validation entirely — HELLO's `ticket`
+  field is simply read and ignored, byte-for-byte the original Phase
+  9-28 behavior, full backward compatibility.
+
+  **Real per-connect role lookup, `ErrorCode.SESSION_EXPIRED` distinct
+  from `INVALID_TICKET`**: once a ticket is consumed, the session's real
+  role comes from `getUserRole(pool, documentId, userId)` — a FRESH
+  database read at connect time, not merely whatever the ticket itself
+  implied. If that lookup finds no access at all (revoked between ticket
+  issuance and the socket actually connecting — SEC-05's own scenario),
+  the connection is rejected with `ErrorCode.SESSION_EXPIRED`, a
+  genuinely different code than a bad ticket — the ticket was formally
+  fine; the access it once represented no longer exists. This is also
+  what makes `DocumentCoordinator`'s `authorizeSession` (Phase 28's
+  decision cache) genuinely DB-backed for the first time: the coordinator
+  constructor gained a 4th, optional `lookupRole` parameter, bound to a
+  specific `documentId` in `gateway.ts`'s `getOrCreateCoordinator` only
+  when real `auth` deps are present — every pre-Phase-29 test (no
+  `lookupRole` supplied) falls back to exactly Phase 28's own
+  `session.role !== VIEWER` behavior, unchanged.
+
+  **`PermissionChangedMessage` extended, wire-format redesigned**
+  (`controlMessages.ts`/`controlCodec.ts`): gained `role: SessionRole |
+  null` (was non-nullable — `null` is the ONLY way to signal a full
+  revocation, since no `SessionRole` value means "no access"; the
+  session's own enforcement field, `session.role`, is still set to
+  `VIEWER` under the hood, since VIEWER is what actually blocks writes)
+  and `effectiveAtSeq: number` (the document sequence the change becomes
+  effective at — API Spec §4.7's own wording, reused from Phase 28's
+  grant/revoke/transfer responses). Wire shape: a flags byte (bit0 =
+  has-role) + an optional role byte + a varint `effectiveAtSeq`. Pushed
+  on EVERY permission commit — PUT/DELETE/POST-owner all now call
+  `pushPermissionChanged` with a real `effectiveAtSeq`, and — unlike
+  Phase 28, which silently skipped sending anything for a `null` role —
+  every push now actually sends the wire frame regardless of outcome.
+
+  **Client-side write-blocking on downgrade/revocation** (`SyncClient`,
+  Scope-IN's own "stop sending, keep local state, expect rejections for
+  in-flight ops"): a new `NoWriteAccessError` is thrown from
+  `assertHasWriteAccess()` — called as the very first line of
+  `localInsert`/`localDelete`/`localInsertText`, before the engine is
+  ever touched — whenever the tracked role is `VIEWER` or a
+  `hasAnyAccessValue` flag (new, defaults `true`, set on every WELCOME,
+  and to `msg.role !== null` on every `PERMISSION_CHANGED`) is false.
+  `inputPipeline.ts` catches this alongside the pre-existing
+  `OfflineWindowExceededError` and silently drops the keystroke rather
+  than letting it escape a DOM event handler. Nothing about the local
+  engine, the durable offline queue, or `exportLocalText()` (Phase 24) is
+  touched — a downgraded/revoked session can still read and export
+  everything already typed; it simply can no longer mint new local
+  operations.
+
+  **Client-side ticket fetching, deliberately fail-open, not
+  fail-closed**: a new `SyncClientOptions.fetchTicket` callback is called
+  at the start of every `openSocket()` (a genuinely new call, renamed
+  from the pre-existing socket-creation logic, now `openSocketNow()`) —
+  its result (or `null`/a rejection) is stored and always proceeds to
+  open the socket regardless of success, via a `.then().catch().finally()`
+  chain, rather than adding a separate retry loop: a bad or missing
+  ticket is already handled by the server's own ERROR+close and this
+  client's pre-existing reconnect/backoff machinery, so a second,
+  parallel retry mechanism here would be redundant. When `fetchTicket` is
+  not configured (every pre-Phase-29 test, and this phase's own large
+  `reconnection.test.ts` suite, which never configures it), `openSocket()`
+  calls `openSocketNow()` synchronously — byte-for-byte the original
+  behavior, proven directly via a dedicated test.
+
+  **DoD verification, at three levels**: pure unit tests
+  (`ticketStore.test.ts`, 7 tests — issue/consume happy path, SEC-11b
+  reuse, SEC-11c expiry on both sides of the boundary, SEC-11d
+  wrong-document, burn-on-any-presentation, lazy pruning); an in-memory
+  mechanism-level proof using a fake `lookupRole` callback
+  (`ticketAuthorization.test.ts`, 2 tests — SEC-05's cache-TTL-alone
+  mechanism with a deterministic injected clock, and a real write-path
+  integration proof that an operation before revocation is retained and
+  an operation after is rejected with `PERMISSION_DENIED` plus a security
+  log line); and a full real-Postgres, real-WebSocket, real-REST
+  end-to-end suite (`db/tickets.db.test.ts`, 8 tests) — ticket issuance
+  for owner/editor/viewer plus 404 for an outsider and for a nonexistent
+  document; SEC-11b/c/d proven over the real wire (reuse, short-TTL
+  expiry, wrong-document — the last confirmed to ALSO burn the ticket, a
+  second attempt on the correct document also fails); SEC-04 (a real
+  OP_INSERT before revocation is confirmed durably committed via a direct
+  query against `operations`, a real `DELETE /permissions/{userId}` is
+  issued, `PERMISSION_CHANGED` arrives within 2000ms carrying `role: null`
+  and a real `effectiveAtSeq`, and a real OP_INSERT sent afterward is
+  confirmed rejected with a real `OP_REJECT{PERMISSION_DENIED}`); and
+  SEC-05 (a ticket issued BEFORE revocation — issuing after would 404,
+  since the editor no longer has any role at that point — is still
+  formally valid but rejected with `SESSION_EXPIRED` at connect time via
+  the fresh per-connect lookup, even though nothing ever pushed a
+  notification). All 8 tests passed after two fixes: a BIGINT-returned-
+  as-string comparison bug in the SEC-04 durable-log check (the same bug
+  class as Phase 25's Bug 6b), and a SEC-05 test-ordering bug (the test's
+  own first draft revoked before issuing, which 404'd at issuance itself
+  rather than reaching the intended scenario).
+
+  **A real backward-compatibility regression found and fixed via this
+  phase's own regression sweep, not anticipated in advance**:
+  `documents.db.test.ts`'s pre-existing DELETE test (Phase 27) broke —
+  its own `connectAndHandshake` helper sent an empty `ticket:
+  new Uint8Array()`, which the now-ticket-validating server correctly
+  rejects once constructed with real `auth` deps. Fixed by teaching that
+  helper to fetch a real ticket via `POST /rt-ticket` before HELLO,
+  mirroring what a real client now does. Confirmed via `grep` that
+  `serverRestart.db.test.ts` builds its server WITHOUT `auth` deps and
+  needed no equivalent fix.
+
+  **Full regression verification, all against the real, merged code**:
+  `pnpm -r exec tsc --noEmit` clean across all 6 packages; `pnpm eslint`
+  clean for every file this phase touched; the full default `pnpm test`
+  passing (one single-run failure, `passwordHash.test.ts`'s Argon2id
+  timing test, confirmed via isolated re-run to be CPU contention from a
+  concurrently-running 177-second `fugueTree.crosscheck` test, not a
+  regression — Phase 26 code, untouched by this phase); the six
+  `db/*.db.test.ts` files most relevant to this phase's own changes
+  (`tickets`, `documents`, `permissions`, `auth`, `durability`, `schema`)
+  all passing together, 49/49, against a real Postgres instance;
+  `pnpm --filter @collab-editor/client run test:reconnection` — 35/36,
+  the one failure being RC-27's own already-extensively-documented,
+  pre-existing Fugue O(N²) timing flake (CLAUDE.md's own Open Item 7),
+  confirmed NOT attributable to this phase: `reconnection.test.ts` never
+  configures `fetchTicket`, so Phase 29's async ticket-fetch wrapper
+  never activates on that suite's own path at all, and the failure
+  reproduced twice in full isolation (no concurrent load) with the same
+  varying-timeout signature this project has documented for this exact
+  test since Phase 24.
+
+  **What is deliberately NOT built this phase**: server-side session/
+  replica-id resumption across a reconnect — unchanged, still the
+  standing Phase 8/9 decision; a reconnecting client still always gets a
+  brand-new replica id and a fresh ticket. Any UI for the write-blocked
+  state (`ConnectionIndicator.tsx`/`EditorView.tsx` untouched) — the real
+  `NoWriteAccessError`/role-tracking capability this phase builds is what
+  a future UI phase would wire a banner/indicator to, the same "build the
+  real capability now, a future phase wires up the UI" precedent this
+  project has followed since Phase 24's `offlineWindowStatus`. Presence
+  (Phase 31) is unaffected either way.
+
 ## 🛑 CRITICAL, OPEN, UNRESOLVED FINDING — READ THIS FIRST (2026-09-05)
 
 **The core convergence guarantee is currently known to be BROKEN under
@@ -6613,6 +6803,26 @@ status and v0.2.0-m2 tag readiness determination).
 
 ## Current phase in progress
 
+**Phase 29 (WebSocket admission tickets and live revocation) — COMPLETE as
+of 2026-09-10.** HELLO's `ticket` field is now genuinely validated —
+`POST /v1/documents/{id}/rt-ticket` issues an opaque, single-use, 30s
+ticket scoped to one document/user, consumed exactly once by the gateway
+at handshake time, with a fresh per-connect DB role lookup (not merely
+whatever the ticket implied) closing SEC-05's own "revoked between
+ticket issuance and connect" gap. `PERMISSION_CHANGED` now pushes live on
+every grant/revoke/transfer, carrying `effectiveAtSeq` and using
+`role: null` as the explicit full-revocation signal. Client-side,
+`NoWriteAccessError` stops local writes immediately on a downgrade or
+revocation without discarding anything already typed. See the "Phase 29"
+bullet in the Completed Phases list above for the full account, including
+the shared-single-ticket-store wiring decision in `server.ts`, the
+fail-open client-side ticket-fetch design, and the RC-27 flake explicitly
+ruled out as a cause via isolated re-runs and confirmation that
+`reconnection.test.ts` never exercises the new ticket-fetch code path at
+all. No open item from this phase blocks anything — the next phase to
+pick up is whichever one builds PRESENCE (Phase 31) or cursor
+transformation under remote edits (Phase 32).
+
 **Phase 28 (Permissions and per-operation authorization) — COMPLETE as of
 2026-09-08.** Owner/editor/viewer roles are now enforced server-side on
 every operation, not just at connect — `PUT/DELETE
@@ -6873,15 +7083,21 @@ grant/revoke/transfer endpoints now exist (`PUT/DELETE
 /v1/documents/{id}/permissions/{userId}`, `POST
 /v1/documents/{id}/owner`) and `writePath.ts`'s own per-operation
 authorization check is genuinely re-evaluated on every operation, not
-read once at connect — but the WS-side "authenticated identity" gap
-above is exactly why PERMISSION_CHANGED's own push mechanism (built this
-phase) will typically find no live session to reach in production: a WS
-session's `userId` is still a random per-connection value, unrelated to
-any REST-authenticated user id, until Phase 29 actually wires real
-ticket-based identity into the handshake. This project's own tests
-still seed editor/viewer rows directly via SQL in most places (the
-grant endpoint exists now, but most fixtures predate it and were never
-migrated to use it, since there was no reason to). A React component (`EditorView`), the full `beforeinput`
+read once at connect. **As of Phase 29, the WS-side "authenticated
+identity" gap described above is CLOSED**: `POST
+/v1/documents/{id}/rt-ticket` issues a real, single-use, 30-second
+ticket scoped to one document/user, and HELLO's own `ticket` field is
+now genuinely consumed at handshake time; a WS session's role and
+identity now come from a fresh per-connect database lookup, not a
+random per-connection value, so PERMISSION_CHANGED's own push mechanism
+(built in Phase 28) now actually reaches real, live sessions. A server
+constructed with no `auth` dependencies (every pre-Phase-29 test, and
+any deployment that doesn't supply them) still skips ticket validation
+entirely, exactly the original Phase 8-28 permissive behavior — this is
+deliberate backward compatibility, not a residual gap. This project's
+own tests still seed editor/viewer rows directly via SQL in most places
+(the grant endpoint exists now, but most fixtures predate it and were
+never migrated to use it, since there was no reason to). A React component (`EditorView`), the full `beforeinput`
 dispatch pipeline (Phase 12), MutationObserver-based DOM reconciliation
 (`MutationSentinel`, Phase 13), and a real demoable app (`packages/client/
 src/app/`, Phase 14/Milestone M1) now exist and are wired together —

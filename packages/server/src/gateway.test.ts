@@ -410,7 +410,11 @@ describe("Permission downgrade while offline (Phase 24, Test Plan RC-32, API Spe
     expect(second.welcome.role).toBe(SessionRole.VIEWER); // "viewers may read" -- HELLO still succeeds, CATCHUP/SNAPSHOT still delivered
 
     const permissionChanged = await second.frames.nextControl();
-    expect(permissionChanged).toEqual({ kind: "permissionChanged", role: SessionRole.VIEWER });
+    expect(permissionChanged).toEqual({
+      kind: "permissionChanged",
+      role: SessionRole.VIEWER,
+      effectiveAtSeq: expect.any(Number),
+    });
 
     second.ws.close();
     await waitForClose(second.ws);

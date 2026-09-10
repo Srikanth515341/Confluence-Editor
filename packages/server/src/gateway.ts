@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   Channel,
+  ErrorCode,
   GoodbyeReason,
   ProtocolDecodeError,
   SessionRole,
@@ -17,6 +18,8 @@ import {
 } from "@collab-editor/protocol";
 import { AckBatcher } from "./ackBatcher.js";
 import type { OperationStore } from "./db/operationStore.js";
+import type { DbPool } from "./db/pool.js";
+import { getUserRole, type DocumentRole } from "./db/documentStore.js";
 import { DocumentCoordinator, type CoordinatorSession } from "./documentCoordinator.js";
 import { armPresenceStaleTimer, disarmPresenceStaleTimer, onPingReceived } from "./heartbeat.js";
 import {
@@ -28,7 +31,19 @@ import {
 } from "./handshake.js";
 import { logger } from "./logger.js";
 import { ConnectionSendQueues } from "./sendQueues.js";
+import type { InMemoryTicketStore } from "./ticketStore.js";
 import { processIncomingOperation } from "./writePath.js";
+
+function documentRoleToSessionRole(role: DocumentRole): SessionRole {
+  switch (role) {
+    case "owner":
+      return SessionRole.OWNER;
+    case "editor":
+      return SessionRole.EDITOR;
+    case "viewer":
+      return SessionRole.VIEWER;
+  }
+}
 
 /** WebSocket path and subprotocol (API Spec §1.2/§3). */
 export const WS_PATH = "/v1/rt";
@@ -58,10 +73,15 @@ function getOrCreateCoordinator(
   coordinators: Map<string, DocumentCoordinator>,
   documentId: string,
   operationStore: OperationStore,
+  pool: DbPool | undefined,
 ): DocumentCoordinator {
   let coordinator = coordinators.get(documentId);
   if (!coordinator) {
-    coordinator = new DocumentCoordinator(documentId, operationStore);
+    // `lookupRole` is bound to THIS documentId once, here, at construction — see
+    // DocumentCoordinator's own `lookupRole` field doc comment for why it's `undefined`
+    // (falling back to Phase 28's `session.role`-only check) whenever `pool` isn't configured.
+    const lookupRole = pool ? (userId: string) => getUserRole(pool, documentId, userId) : undefined;
+    coordinator = new DocumentCoordinator(documentId, operationStore, undefined, lookupRole);
     coordinators.set(documentId, coordinator);
   }
   return coordinator;
@@ -69,11 +89,24 @@ function getOrCreateCoordinator(
 
 export interface CreateGatewayDeps {
   readonly operationStore: OperationStore;
+  /**
+   * Phase 29 (API Spec §1.5/§4.10) — REAL WebSocket admission ticket validation and per-user
+   * `document_permissions` lookups. Optional for the SAME reason `HttpAppDeps.authDeps` is
+   * (server.ts's own construction is the direct precedent, and shares this exact pool/config):
+   * every pre-Phase-29 test constructing a gateway (gateway.test.ts, heartbeat.test.ts, most of
+   * `db/*.db.test.ts`) has no real Postgres instance and no reason to exercise real auth — when
+   * omitted, HELLO's `ticket` field is accepted unconditionally (byte-for-byte the original
+   * Phase 8-28 behavior) and every session still gets the hardcoded EDITOR default (or a
+   * `testOnlyQueueRoleOverride`, Phase 24's own test seam) rather than a real, looked-up role.
+   * `ticketStore` MUST be the SAME instance `POST /v1/documents/{id}/rt-ticket` (httpApp.ts)
+   * issues tickets into — server.ts's own construction is what guarantees this.
+   */
+  readonly auth?: { readonly pool: DbPool; readonly ticketStore: InMemoryTicketStore };
 }
 
 /** Wires the WebSocket server (path/subprotocol per API Spec §1.2/§3) onto an existing HTTP server, with one DocumentCoordinator per open document. */
 export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): Gateway {
-  const { operationStore } = deps;
+  const { operationStore, auth } = deps;
   const coordinators = new Map<string, DocumentCoordinator>();
 
   const wss = new WebSocketServer({
@@ -111,6 +144,23 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
     }
 
     /**
+     * Phase 29 — rejects the handshake with a real CONTROL-channel ERROR frame (API Spec §4.10:
+     * `ERROR{invalid_ticket, fatal: 1}`) BEFORE closing, mirroring `disconnectForRevocation`'s own
+     * "send the frame first, close only once it's actually been written" ordering — closing
+     * immediately after `send()` returns (before its callback fires) risks the close frame racing
+     * ahead of the ERROR payload on some platforms. `1008` (policy violation) is the same close
+     * code `closeMalformed` already uses for "this client did something the protocol forbids" —
+     * a rejected ticket is exactly that category, not a server-side fault.
+     */
+    function rejectHandshake(code: ErrorCode, reason: string, message: string): void {
+      logger.warn("ws.handshakeRejected", { sessionId, reason });
+      const frame = encodeControlFrame({ kind: "error", code, fatal: true, message });
+      ws.send(frame, { binary: true }, () => {
+        ws.close(1008, reason);
+      });
+    }
+
+    /**
      * The first frame after the upgrade MUST be HELLO on CONTROL (API Spec
      * §3.6.1). Everything else (wrong channel, wrong CONTROL type, a decode
      * failure) closes the socket — there is no partially-joined state to
@@ -141,7 +191,39 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         return;
       }
 
-      const coordinator = getOrCreateCoordinator(coordinators, ctrlMsg.documentId, operationStore);
+      // Phase 29 (API Spec §1.5/§4.10) — real ticket validation, only when this gateway was
+      // configured with real `auth` deps (see CreateGatewayDeps.auth's own doc comment for why
+      // every pre-Phase-29 test skips this entirely). Deliberately checked BEFORE creating/
+      // warm-starting a coordinator for `ctrlMsg.documentId` — a bad ticket should cost nothing
+      // more than an in-memory map lookup, not a coordinator construction (and, for a brand-new
+      // document, a real warm-start DB round trip) for a connection that's about to be rejected
+      // anyway.
+      let realIdentity: { readonly userId: string; readonly displayName: string } | undefined;
+      if (auth) {
+        const ticketString = new TextDecoder().decode(ctrlMsg.ticket);
+        const consumed = auth.ticketStore.consume(ticketString, ctrlMsg.documentId);
+        if (consumed.outcome !== "ok") {
+          // ONE wire signal for every failure mode (not-found/already-used/expired/wrong-document)
+          // — API Spec §4.10 names a single `invalid_ticket` code, and distinguishing these on the
+          // wire would hand an attacker a real oracle (e.g. "wrong-document" vs "expired" leaks
+          // whether a guessed ticket string was ever real). The specific reason is still logged
+          // server-side (below) for real operational visibility.
+          rejectHandshake(
+            ErrorCode.INVALID_TICKET,
+            `invalid ticket (${consumed.outcome})`,
+            "invalid or expired ticket",
+          );
+          return;
+        }
+        realIdentity = { userId: consumed.userId, displayName: consumed.displayName };
+      }
+
+      const coordinator = getOrCreateCoordinator(
+        coordinators,
+        ctrlMsg.documentId,
+        operationStore,
+        auth?.pool,
+      );
       try {
         await coordinator.ready;
       } catch (err) {
@@ -163,11 +245,40 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       const replicaId = coordinator.allocateReplicaId();
       // Phase 24, Test Plan RC-32 — TEST-ONLY: consumes a one-shot role override queued via
       // `DocumentCoordinator.testOnlyQueueRoleOverride`, standing in for a real, persisted
-      // permission lookup that doesn't exist until Phases 26-30. `null` (every real
-      // connection, every test that doesn't call it) means the ordinary hardcoded EDITOR
-      // default. See that method's own doc comment for the full reasoning.
+      // permission lookup. Only ever consulted when this connection has NO real ticket-based
+      // identity (see below) — a real, authenticated connection's role always comes from a
+      // genuine `document_permissions` lookup as of Phase 29, never from this test seam.
       const roleOverride = coordinator.consumeTestOnlyRoleOverride();
-      const role = roleOverride ?? SessionRole.EDITOR;
+
+      let role: SessionRole;
+      let userId: string;
+      let displayName: string;
+      if (realIdentity) {
+        // Phase 29: a REAL, fresh permission lookup — not the ticket's own (up to 30s stale)
+        // snapshot. A ticket only proves "this user could issue a ticket a moment ago"; the
+        // actual role admitted here must reflect the CURRENT database state, since a grant/revoke
+        // could legitimately land in that same window.
+        const dbRole = await getUserRole(auth!.pool, ctrlMsg.documentId, realIdentity.userId);
+        if (!dbRole) {
+          rejectHandshake(
+            ErrorCode.SESSION_EXPIRED,
+            "access no longer granted at connect time",
+            "your access to this document has ended",
+          );
+          return;
+        }
+        role = documentRoleToSessionRole(dbRole);
+        userId = realIdentity.userId;
+        displayName = realIdentity.displayName;
+      } else {
+        role = roleOverride ?? SessionRole.EDITOR;
+        // Placeholder identity — real, ticket-based identity only exists when `auth` deps are
+        // configured (Phase 29); every other connection keeps this project's original Phase
+        // 8-16 placeholder.
+        userId = randomUUID();
+        displayName = `Guest ${replicaId}`;
+      }
+
       const session: CoordinatorSession = {
         sessionId,
         replicaId,
@@ -176,9 +287,8 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           queues.enqueue("ops", encodeFrame({ kind: "opAck", acks: entries }));
         }),
         role,
-        // Placeholder identity — real users don't exist until Phase 26.
-        userId: randomUUID(),
-        displayName: `Guest ${replicaId}`,
+        userId,
+        displayName,
         lastPingAt: Date.now(),
         presenceStale: false,
         staleTimer: undefined,
@@ -271,7 +381,14 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       if (roleOverride !== null) {
         queues.enqueue(
           "control",
-          encodeControlFrame({ kind: "permissionChanged", role: roleOverride }),
+          encodeControlFrame({
+            kind: "permissionChanged",
+            role: roleOverride,
+            // This test-only path has no real REST commit behind it (RC-32's own simulated
+            // downgrade), so there is no real "document sequence at commit" to report — the
+            // current seq at the moment of the join is the most honest value available.
+            effectiveAtSeq: Number(coordinator.currentSeq),
+          }),
         );
       }
     }

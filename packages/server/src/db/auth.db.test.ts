@@ -45,6 +45,8 @@ function testAuthConfig(overrides: Partial<AuthConfig> = {}): AuthConfig {
     // exercise rate limiting override one or the other explicitly.
     loginRateLimitPerIp: { max: 1000, windowMs: 15 * 60 * 1000 },
     loginRateLimitPerAccount: { max: 1000, windowMs: 15 * 60 * 1000 },
+    ticketTtlMs: 30_000,
+    ticketRateLimit: { max: 1000, windowMs: 60 * 1000 },
     ...overrides,
   };
 }

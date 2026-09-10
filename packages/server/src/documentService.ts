@@ -447,9 +447,9 @@ export type RevokePermissionOutcome =
   | { readonly kind: "forbidden" }
   | { readonly kind: "target-not-found" }
   | { readonly kind: "cannot-revoke-owner" }
-  | { readonly kind: "ok" };
+  | { readonly kind: "ok"; readonly effectiveAtSeq: number };
 
-/** API Spec §4.8 DELETE /v1/documents/{id}/permissions/{userId} — owner-only; revoking the current owner's own row is 409 cannot_revoke_owner (ownership can only ever move via `transferOwnershipForUser`, never simply be removed). */
+/** API Spec §4.8 DELETE /v1/documents/{id}/permissions/{userId} — owner-only; revoking the current owner's own row is 409 cannot_revoke_owner (ownership can only ever move via `transferOwnershipForUser`, never simply be removed). `effectiveAtSeq` (Phase 29, API Spec §4.7/§4.8/§3.6.9) is read from `documents.current_seq` right after the revocation commits — the same "durable column, right after commit" pattern `grantPermissionForUser` already established. */
 export async function revokePermissionForUser(
   pool: DbPool,
   input: { readonly documentId: string; readonly callerId: string; readonly targetUserId: string },
@@ -461,7 +461,8 @@ export async function revokePermissionForUser(
   if (!targetRole) return { kind: "target-not-found" };
   if (targetRole === "owner") return { kind: "cannot-revoke-owner" };
   await revokePermission(pool, input.documentId, input.targetUserId);
-  return { kind: "ok" };
+  const document = await getDocumentById(pool, input.documentId);
+  return { kind: "ok", effectiveAtSeq: Number(document?.currentSeq ?? 0n) };
 }
 
 export type TransferOwnershipOutcome =

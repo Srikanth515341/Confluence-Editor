@@ -75,7 +75,13 @@ export const CLIENT_CAP_HAS_RESIDENT_ENGINE = 0x04;
 export interface HelloMessage {
   readonly kind: "hello";
   readonly documentId: string;
-  /** Opaque bytes from a later auth phase (Phase 29) — accepted, never validated, this phase. */
+  /**
+   * API Spec §4.10/§1.5 (Phase 29) — UTF-8 bytes of the opaque `rt_...` ticket string returned by
+   * `POST /v1/documents/{id}/rt-ticket`. REAL, validated as of Phase 29: single-use, scoped to
+   * one document and one user, valid 30s. A server configured with no `auth` deps (most of this
+   * project's own pre-Phase-29 tests) skips validation entirely, preserving the old "accepted,
+   * never checked" behavior — see `gateway.ts`'s own handshake handler for the exact gating.
+   */
   readonly ticket: Uint8Array;
   /**
    * 0 for a client's very first-ever connection. As of Phase 22, a
@@ -156,20 +162,47 @@ export interface WelcomeMessage {
 }
 
 /**
- * Notifies a session its ROLE has changed (§3.6's "Other CONTROL message types" table; API
- * Spec §5.4; Phase 24, Test Plan RC-32). A minimal wire message — just the new role — NOT the
- * full owner/editor/viewer permission SYSTEM (who is allowed to change whose role, and under
- * what conditions), which remains Phase 26-30's job; this phase only builds the notification
- * itself and a TEST-ONLY mechanism to trigger it (`DocumentCoordinator.
- * testOnlyQueueRoleOverride`), simulating "the owner already changed this session's role"
- * without inventing a persisted identity/permission model under schedule pressure. Sent AFTER
- * the rest of the handshake (WELCOME/SNAPSHOT-or-CATCHUP/ALREADY_HAVE) completes — RC-32's own
- * assertion order lists "HELLO succeeds, CATCHUP delivered" before "PERMISSION_CHANGED
- * received."
+ * Notifies a session its ROLE has changed (§3.6's "Other CONTROL message types" table; API Spec
+ * §3.6.9, §5.4; Phase 24 built the minimal shape, Phase 29 makes it real). `role: null` means
+ * access was revoked ENTIRELY (no `document_permissions` row at all — DELETE
+ * .../permissions/{userId}) — there is no `SessionRole` value for "no access," so `null` is the
+ * explicit signal rather than overloading VIEWER (a session that lost ALL access is not the same
+ * as one that was merely downgraded TO viewer, even though both are enforced identically
+ * server-side: `session.role` itself is set to VIEWER either way, since that's what actually
+ * blocks every mutating operation — `role: null` on the WIRE exists purely so the CLIENT can
+ * distinguish the two cases for its own UI/export messaging, per FR-PM-8).
+ *
+ * `effectiveAtSeq` (Phase 29, API Spec §4.7/§4.8's own field, now also echoed here): the document
+ * sequence at the moment this permission change committed — operations at or before it were
+ * authorized under the PREVIOUS role and are kept; operations after are subject to the new one.
+ *
+ * Sent AFTER the rest of the handshake (WELCOME/SNAPSHOT-or-CATCHUP/ALREADY_HAVE) completes when
+ * triggered during a fresh join (Phase 24's RC-32 scenario, still driven by
+ * `DocumentCoordinator.testOnlyQueueRoleOverride` there); pushed directly, at any time, to an
+ * ALREADY-OPEN session as of Phase 29 (`httpApp.ts`'s `pushPermissionChanged`, driven by a REAL
+ * PUT/DELETE/POST-owner commit, API Spec §4.7/§4.8's own "publishes an authorization invalidation
+ * and pushes PERMISSION_CHANGED to every open session for that user on that document").
  */
 export interface PermissionChangedMessage {
   readonly kind: "permissionChanged";
-  readonly role: SessionRole;
+  readonly role: SessionRole | null;
+  readonly effectiveAtSeq: number;
+}
+
+/**
+ * `ErrorMessage.code` values this project actually assigns meaning to, first used as of Phase 29
+ * (API Spec §4.10's own named `ERROR{invalid_ticket, fatal: 1}`). The spec text available to this
+ * project has never given `code` a literal numeric table (see `ErrorMessage`'s own doc comment,
+ * unchanged since Phase 9) — these two values are this phase's own necessary, disclosed
+ * definition, the same "a later phase that needs specific error codes should define them, not
+ * invent them under an earlier phase's schedule pressure" precedent Phase 9 itself named. A later
+ * phase needing a THIRD code should extend this enum, not invent a separate one.
+ */
+export enum ErrorCode {
+  /** API Spec §4.10: a ticket that is missing, unknown, already used, expired, or scoped to a different document than the one claimed in HELLO. Deliberately ONE code for all of these — see gateway.ts's own comment for why distinguishing them on the wire would be a real, if narrow, oracle. */
+  INVALID_TICKET = 1,
+  /** Phase 29, Test Plan SEC-11e: this session's own authorization can no longer be confirmed (e.g. the connecting user's `document_permissions` row is gone) on an already-admitted, long-lived socket — the SAME condition PERMISSION_CHANGED{role: null} reports when caught by an explicit push; this code covers the case where nothing pushed it, and the decision cache's own ≤2s re-check (SEC-05/06) is what surfaced it instead. */
+  SESSION_EXPIRED = 2,
 }
 
 /** §3.6.3's form byte. */

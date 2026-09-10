@@ -12,6 +12,8 @@ function fakeAuthConfig(overrides: Partial<AuthConfig> = {}): AuthConfig {
     refreshTokenTtlMs: 30 * 24 * 60 * 60 * 1000,
     loginRateLimitPerIp: { max: 20, windowMs: 900_000 },
     loginRateLimitPerAccount: { max: 5, windowMs: 900_000 },
+    ticketTtlMs: 30_000,
+    ticketRateLimit: { max: 30, windowMs: 60_000 },
     ...overrides,
   };
 }

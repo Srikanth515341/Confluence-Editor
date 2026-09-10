@@ -173,24 +173,24 @@ describe("Phase 28 — per-operation authorization (SEC-01/02/03/06)", () => {
     coordinator.join(session);
 
     let now = 1_000_000;
-    expect(coordinator.authorizeSession(session, now)).toBe(true);
+    expect(await coordinator.authorizeSession(session, now)).toBe(true);
 
     // A role flip that bypasses the coordinator's own invalidation (directly mutating the field,
     // simulating a hypothetical future caller that forgets to call setSessionRoleLive) should
     // still be masked by the cache for up to, but never more than, 2000ms.
     session.role = SessionRole.VIEWER;
     now += 1_999;
-    expect(coordinator.authorizeSession(session, now)).toBe(true); // still cached, < 2000ms old
+    expect(await coordinator.authorizeSession(session, now)).toBe(true); // still cached, < 2000ms old
 
     now += 2; // now 2,001ms after the original decision — past the ≤2s bound
-    expect(coordinator.authorizeSession(session, now)).toBe(false); // re-evaluated, sees VIEWER
+    expect(await coordinator.authorizeSession(session, now)).toBe(false); // re-evaluated, sees VIEWER
 
     // The REAL path (setSessionRoleLive / its test-only alias) invalidates immediately -- no
     // staleness window at all, not even the TTL's own duration.
     coordinator.testOnlySetConnectedSessionRole(session.sessionId, SessionRole.EDITOR);
-    expect(coordinator.authorizeSession(session, now)).toBe(true);
+    expect(await coordinator.authorizeSession(session, now)).toBe(true);
     coordinator.testOnlySetConnectedSessionRole(session.sessionId, SessionRole.VIEWER);
-    expect(coordinator.authorizeSession(session, now)).toBe(false); // immediate, not cached from the EDITOR call a moment ago
+    expect(await coordinator.authorizeSession(session, now)).toBe(false); // immediate, not cached from the EDITOR call a moment ago
   });
 
   it("getSessionsByUserId finds every currently-open session for a given userId on this document, and none for an unrelated one", () => {
