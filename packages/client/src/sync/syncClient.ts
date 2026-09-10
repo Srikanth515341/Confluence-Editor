@@ -46,6 +46,25 @@ import {
 
 export { OfflineWindowExceededError, type OfflineWindowStatus } from "./offlineWindow.js";
 
+/**
+ * Phase 29 (API Spec §4.7/§4.8/§5.4, RC-32's own "Client on downgrade: stop sending" Scope-IN
+ * item) — thrown by {@link SyncClient.localInsert}/{@link SyncClient.localDelete}/
+ * {@link SyncClient.localInsertText} the instant this client's own tracked `role` (set from
+ * WELCOME, kept current by PERMISSION_CHANGED) is VIEWER. This is a CLIENT-SIDE convenience, not
+ * the actual enforcement — the server's own `writePath.ts` `authorizeSession` step is what really
+ * blocks a mutating operation, and remains the source of truth even if this check is ever
+ * bypassed or stale for up to the server's own ≤2s decision-cache window (SEC-06). Refusing HERE,
+ * before `engine` is ever touched, mirrors `assertOfflineWindowNotExceeded`'s own reasoning
+ * exactly: minting locally and only refusing to SEND afterward would leave the local engine (and
+ * anything rendering from it) reflecting content the server will simply reject moments later.
+ */
+export class NoWriteAccessError extends Error {
+  constructor() {
+    super("this session's current role does not permit mutating operations");
+    this.name = "NoWriteAccessError";
+  }
+}
+
 /** One rejected-and-preserved operation (API Spec §5.5 step 1 — "move to the rejected store, do not delete"). Returned by {@link SyncClient.listRejected}. */
 export interface RejectedEntry {
   readonly op: Operation;
@@ -163,6 +182,22 @@ export interface SyncClientOptions {
    * breaks and why.
    */
   readonly mutateAdvanceSeqPerChunk?: boolean;
+  /**
+   * Phase 29 (API Spec §1.5/§4.10) — obtains a fresh, single-use WebSocket admission ticket
+   * BEFORE every `openSocket()` call (a fresh connect AND every reconnect — a ticket is
+   * consumed by its very first HELLO, so a reconnect always needs a brand-new one, never the
+   * previous one reused). A real implementation calls `POST /v1/documents/{id}/rt-ticket`
+   * with this client's own access token; this is injectable (mirroring `createSocket`/
+   * `openDurableQueue`) so this project's own test suite can supply a fake ticket source with
+   * no real HTTP server involved. `undefined` (every pre-Phase-29 test, and any caller that
+   * doesn't care about real auth) sends an EMPTY ticket, byte-for-byte the original Phase
+   * 8-28 "accept any bytes" behavior — a server with no `auth` deps configured never
+   * validates it either way. A rejected/failed fetch (network error, 403/404/429) still
+   * proceeds to open the socket with no ticket — the server's own real ERROR{invalid_ticket}
+   * rejection and this client's EXISTING close/backoff/reconnect machinery already handle
+   * that outcome correctly, so there is no need for a second, parallel retry mechanism here.
+   */
+  readonly fetchTicket?: () => Promise<{ readonly ticket: string } | null>;
 }
 
 /**
@@ -185,6 +220,9 @@ export class SyncClient {
   private readonly createSocket: (url: string, protocol: string) => WebSocketLike;
   private readonly onReconnectScheduled: ((delayMs: number) => void) | undefined;
   private readonly openDurableQueueFn: () => DurableQueue | null | Promise<DurableQueue | null>;
+  private readonly fetchTicketFn: (() => Promise<{ readonly ticket: string } | null>) | undefined;
+  /** Phase 29 — the raw ticket string for the CURRENTLY IN-FLIGHT (or most recently attempted) `openSocketNow()` call, encoded into HELLO's `ticket` field by `onOpen()`. `null` when no `fetchTicketFn` is configured, or when the most recent fetch failed. */
+  private currentTicket: string | null = null;
 
   private ws: WebSocketLike | null = null;
   private everSynced = false;
@@ -204,11 +242,25 @@ export class SyncClient {
     this.unsyncedCountValue.set(this.unacked.size);
   }
 
-  /** API Spec §3.6.2/§5.4: this session's own role, set from WELCOME and updated by PERMISSION_CHANGED (Phase 24, RC-32). `null` before the first WELCOME ever arrives. */
+  /** API Spec §3.6.2/§5.4: this session's own role, set from WELCOME and updated by PERMISSION_CHANGED (Phase 24, RC-32). `null` before the first WELCOME ever arrives, OR (Phase 29) after a PERMISSION_CHANGED reporting full revocation — see `hasAnyAccessValue`'s own doc comment for why `null` alone is not enough to distinguish those two cases for write-blocking purposes. */
   private readonly roleValue = new ObservableValue<SessionRole | null>(null);
   get role(): Observable<SessionRole | null> {
     return this.roleValue;
   }
+
+  /**
+   * Phase 29 (API Spec §4.7/§4.8/§3.6.9) — `false` ONLY after this client has received an
+   * EXPLICIT `PERMISSION_CHANGED{role: null}` (DELETE .../permissions/{userId}, full revocation)
+   * and no LATER grant has re-admitted it. Kept separate from `roleValue` specifically because
+   * `roleValue === null` is already meaningful for a DIFFERENT reason ("no WELCOME has ever
+   * arrived yet") — collapsing both into one field would make `assertHasWriteAccess` unable to
+   * tell "never connected" apart from "was connected, then lost all access," and would incorrectly
+   * ALLOW a client to keep attempting writes after a real revocation until the server's own ≤2s
+   * decision cache eventually catches up (SEC-06) — wasteful, not unsafe (the server is still the
+   * real enforcement point either way), but exactly the kind of avoidable round trip
+   * `assertHasWriteAccess` exists to skip.
+   */
+  private hasAnyAccessValue = true;
 
   /** Phase 24, API Spec §5.5/§10.5: how long/how many local ops since this client last left `synced` — see offlineWindow.ts. */
   private readonly offlineWindow = new OfflineWindowTracker();
@@ -414,6 +466,7 @@ export class SyncClient {
     this.onReconnectScheduled = opts.onReconnectScheduled;
     this.openDurableQueueFn = opts.openDurableQueue ?? openDurableQueue;
     this.mutateAdvanceSeqPerChunk = opts.mutateAdvanceSeqPerChunk ?? false;
+    this.fetchTicketFn = opts.fetchTicket;
   }
 
   /**
@@ -604,9 +657,17 @@ export class SyncClient {
     }
   }
 
-  /** Mints and sends a local insert, exactly mirroring `Engine.localInsert`'s signature. Throws if not currently synced — there is no offline queue-and-replay in this phase (Phase 22's IndexedDB queue is what that becomes) — or if the offline window has been exceeded (Phase 24, see `assertOfflineWindowNotExceeded`). */
+  /** Phase 29 — see {@link NoWriteAccessError} and {@link hasAnyAccessValue}'s own doc comments. `roleValue.value === null` from "no WELCOME has ever arrived yet" is never blocked here on its own — `requireEngine()` (called first at every one of this method's callers) already refuses to mint anything before a handshake has completed at least once, and role is always set by that same first WELCOME; `hasAnyAccessValue` is what actually distinguishes that case from a real revocation. */
+  private assertHasWriteAccess(): void {
+    if (this.roleValue.value === SessionRole.VIEWER || !this.hasAnyAccessValue) {
+      throw new NoWriteAccessError();
+    }
+  }
+
+  /** Mints and sends a local insert, exactly mirroring `Engine.localInsert`'s signature. Throws if not currently synced — there is no offline queue-and-replay in this phase (Phase 22's IndexedDB queue is what that becomes) — if the offline window has been exceeded (Phase 24, see `assertOfflineWindowNotExceeded`) — or if this session's own role no longer permits writes (Phase 29, see `assertHasWriteAccess`). */
   localInsert(visibleIndex: number, value: number, bind?: boolean): InsertOperation {
     const engine = this.requireEngine();
+    this.assertHasWriteAccess();
     this.assertOfflineWindowNotExceeded();
     const op =
       bind === undefined
@@ -621,6 +682,7 @@ export class SyncClient {
   /** Mints and sends local deletes, mirroring `Engine.localDelete`. Same offline-window gate as {@link localInsert} — see `assertOfflineWindowNotExceeded`. */
   localDelete(visibleIndex: number, count: number): readonly DeleteOperation[] {
     const engine = this.requireEngine();
+    this.assertHasWriteAccess();
     this.assertOfflineWindowNotExceeded();
     const ops = engine.localDelete(visibleIndex, count);
     for (const op of ops) {
@@ -652,6 +714,7 @@ export class SyncClient {
    */
   localInsertText(visibleIndex: number, text: string): readonly InsertOperation[] {
     const engine = this.requireEngine();
+    this.assertHasWriteAccess();
     this.assertOfflineWindowNotExceeded();
     const ops: InsertOperation[] = [];
     let at = visibleIndex;
@@ -757,7 +820,34 @@ export class SyncClient {
     this.ws?.send(bytes);
   }
 
+  /**
+   * Phase 29 — the single entry point every internal caller uses to actually open a socket
+   * (fresh connect, reconnect, or backoff-scheduled retry). When {@link fetchTicketFn} is
+   * configured, this fetches a fresh ticket FIRST — a ticket is single-use (API Spec §4.10), so
+   * even a reconnect over the SAME logical session needs a brand-new one, never the previous
+   * attempt's. Deliberately proceeds to `openSocketNow()` regardless of whether the fetch
+   * succeeded — see this file's own `SyncClientOptions.fetchTicket` doc comment for why a
+   * failed fetch doesn't need its own separate retry path.
+   */
   private openSocket(): void {
+    if (!this.fetchTicketFn) {
+      this.openSocketNow();
+      return;
+    }
+    const fetchTicketFn = this.fetchTicketFn;
+    void fetchTicketFn()
+      .then((result) => {
+        this.currentTicket = result?.ticket ?? null;
+      })
+      .catch(() => {
+        this.currentTicket = null;
+      })
+      .finally(() => {
+        this.openSocketNow();
+      });
+  }
+
+  private openSocketNow(): void {
     const ws = this.createSocket(`${this.serverUrl}`, WS_SUBPROTOCOL);
     this.ws = ws;
     // Stale-socket guard (same pattern as the Phase 22 Bug 4 leftover-timer fix): `disconnect()`
@@ -806,7 +896,10 @@ export class SyncClient {
     this.sendControl({
       kind: "hello",
       documentId: this.documentId,
-      ticket: new Uint8Array(), // no auth yet (Phase 29) — "accept any bytes" server-side
+      // Phase 29 (API Spec §4.10): the real ticket, UTF-8 encoded, when `fetchTicketFn` supplied
+      // one for THIS `openSocketNow()` attempt; empty bytes otherwise (a server with no `auth`
+      // deps configured never validates this either way — the original Phase 8-28 behavior).
+      ticket: this.currentTicket ? new TextEncoder().encode(this.currentTicket) : new Uint8Array(),
       // Phase 25 (DUR-06 fix): `highestAppliedSeq`, NOT `gapTracker.value` — see
       // `highestAppliedSeq`'s own doc comment for why the gap tracker's own (deliberately
       // non-contiguous) value is unsafe to use as CATCHUP's own fromSeq boundary.
@@ -847,6 +940,7 @@ export class SyncClient {
         this.replicaId = msg.replicaId;
         this.sessionId = msg.sessionId;
         this.roleValue.set(msg.role);
+        this.hasAnyAccessValue = true; // a fresh WELCOME is a fresh admission — see this field's own doc comment
         // ALREADY_CURRENT sends no further state-sync payload (no snapshot, no catchupBegin) —
         // but this client's engine STILL needs rebuilding under the new replica id, from a
         // clean base (see rebuildEngineForReconnect's own doc comment for why skipping this
@@ -881,12 +975,19 @@ export class SyncClient {
         this.gapTracker.markAlive();
         break;
       case "permissionChanged":
-        // API Spec §5.4/§5.5, Phase 24 (RC-32) — a real, if minimal, notification: this
-        // session's role has changed. Deliberately does NOT itself reject/discard anything
-        // client-side — the server's own write path (writePath.ts's `authorize` step) is what
-        // actually rejects any operation this session sends while its role disallows mutation;
-        // this only keeps `role` accurate for a UI (or a future client-side pre-check) to read.
+        // API Spec §3.6.9/§5.4/§5.5, Phase 24 (RC-32) built the minimal shape; Phase 29 makes it
+        // real. Deliberately does NOT itself reject/discard anything client-side for an
+        // IN-FLIGHT operation — the server's own write path (`authorizeSession`) is what actually
+        // rejects any operation sent while the new role disallows mutation, and that rejection's
+        // own OP_REJECT handling (`tryRevertLocalInsert`/preserve-rule) is what covers "expect
+        // rejections for in-flight operations" (Scope-IN). This handler's OWN job is narrower:
+        // keep `role`/`hasAnyAccessValue` accurate (so `assertHasWriteAccess` stops NEW local
+        // edits before they're even minted, per Scope-IN's "stop sending") and preserve
+        // engine/local state exactly as-is — nothing here ever clears `engine`, `unacked`, or any
+        // durable queue state; that only ever happens via an explicit user action elsewhere
+        // (`discardRejected`), never automatically on a permission change.
         this.roleValue.set(msg.role);
+        this.hasAnyAccessValue = msg.role !== null;
         break;
       case "goodbye":
       case "error":

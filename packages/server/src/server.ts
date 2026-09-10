@@ -6,6 +6,7 @@ import type { AuthConfig } from "./config.js";
 import { createGateway, type Gateway } from "./gateway.js";
 import { createHttpApp } from "./httpApp.js";
 import { logger } from "./logger.js";
+import { InMemoryTicketStore } from "./ticketStore.js";
 
 export interface CollabServer {
   readonly httpServer: HttpServer;
@@ -49,16 +50,26 @@ export function createCollabServer(deps: CreateCollabServerDeps = {}): CollabSer
   // `gatewayBox.current` below is always already set. A boxed object (rather than a `let`) so the
   // binding itself stays `const` — only its one property is ever mutated, once.
   const gatewayBox: { current: Gateway | undefined } = { current: undefined };
+  // Phase 29 (API Spec §4.10) — ONE shared instance, constructed here so httpApp.ts (issuing
+  // tickets) and gateway.ts (consuming them) are provably talking to the same in-memory store —
+  // constructing it separately in each place would silently make every ticket "wrong-document"
+  // forever, since the two stores would never share state. Only constructed when `deps.auth` is
+  // present — real ticket validation, like every other real-auth capability this project has
+  // added since Phase 26, is off by default so pre-Phase-29 tests keep working unchanged.
+  const ticketStore = deps.auth ? new InMemoryTicketStore() : undefined;
   const app = createHttpApp({
     getCoordinators: (): ReadonlyMap<string, DocumentCoordinator> =>
       gatewayBox.current?.coordinators ?? new Map(),
     // `exactOptionalPropertyTypes` means `authDeps: undefined` is NOT the same as omitting the
     // property — spread only when actually present, so `deps.auth === undefined` (the default,
     // every pre-Phase-26 caller) genuinely omits the key rather than assigning `undefined` to it.
-    ...(deps.auth ? { authDeps: deps.auth } : {}),
+    ...(deps.auth && ticketStore ? { authDeps: { ...deps.auth, ticketStore } } : {}),
   });
   const httpServer = createHttpServer(app);
-  const gateway = createGateway(httpServer, { operationStore });
+  const gateway = createGateway(httpServer, {
+    operationStore,
+    ...(deps.auth && ticketStore ? { auth: { pool: deps.auth.pool, ticketStore } } : {}),
+  });
   gatewayBox.current = gateway;
 
   return {

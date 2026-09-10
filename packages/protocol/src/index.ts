@@ -58,6 +58,7 @@ export {
   CLIENT_CAP_HAS_RESIDENT_ENGINE,
   ControlMessageType,
   type ControlMessage,
+  ErrorCode,
   type ErrorMessage,
   type GoodbyeMessage,
   GoodbyeReason,

@@ -32,35 +32,46 @@ import {
   searchUsersForResponse,
   transferOwnershipForUser,
 } from "./documentService.js";
-import type { DocumentRole } from "./db/documentStore.js";
+import { getUserRole, type DocumentRole } from "./db/documentStore.js";
+import type { InMemoryTicketStore } from "./ticketStore.js";
 
 /**
- * Phase 28 (API Spec §4.7/§4.8: "pushes PERMISSION_CHANGED to every open session for that user on
- * that document") — see `DocumentCoordinator.getSessionsByUserId`'s own doc comment for the
- * disclosed gap this relies on (a WS session's `userId` is still a random per-connection value,
- * not a real authenticated identity, so this will typically find nothing to push to against a
- * real production connection today). `role: null` (revocation) sends nothing — there is no
- * SessionRole value for "no access at all," and no real WS identity to force-disconnect by real
- * user id yet either (unlike DELETE /v1/documents/{id}, which disconnects EVERY session for the
- * document via `disconnectAllSessions`, not one user's).
+ * Phase 28/29 (API Spec §4.7/§4.8/§3.6.9: "pushes PERMISSION_CHANGED to every open session for
+ * that user on that document" — Phase 29's own `effectiveAtSeq` field now carried too). Finds the
+ * target's live sessions via `DocumentCoordinator.getSessionsByUserId` — see that method's own
+ * doc comment: this only genuinely reaches a live session as of Phase 29, when that session was
+ * admitted through real ticket-based validation (its `userId` is then the real authenticated one,
+ * not the Phase 8-28 random placeholder).
+ *
+ * `role: null` (DELETE .../permissions/{userId}, full revocation) still enforces immediately —
+ * `session.role` itself is set to VIEWER either way, since VIEWER is what actually blocks every
+ * mutating operation (`authorizeSession`) and there is no separate `SessionRole` value for "no
+ * access at all" — but the WIRE message carries `role: null`, not `VIEWER`, so the client can
+ * distinguish "you were downgraded to viewer" from "you lost all access" for its own UI/export
+ * messaging (FR-PM-8). This does NOT disconnect the socket (unlike DELETE /v1/documents/{id}'s
+ * `disconnectAllSessions`, which really does end the WHOLE document for everyone) — a revoked
+ * user's live session simply stops being able to write, exactly like an ordinary viewer.
  */
 function pushPermissionChanged(
   coordinator: DocumentCoordinator | undefined,
   userId: string,
   role: DocumentRole | null,
+  effectiveAtSeq: number,
 ): void {
   if (!coordinator) return;
   const sessionRole =
-    role === "owner" ? SessionRole.OWNER : role === "editor" ? SessionRole.EDITOR : role === "viewer" ? SessionRole.VIEWER : null;
+    role === "owner" ? SessionRole.OWNER : role === "editor" ? SessionRole.EDITOR : SessionRole.VIEWER;
   for (const session of coordinator.getSessionsByUserId(userId)) {
+    session.role = sessionRole;
     coordinator.invalidateAuthorizationCache(session.sessionId);
-    if (sessionRole !== null) {
-      session.role = sessionRole;
-      session.queues.enqueue(
-        "control",
-        encodeControlFrame({ kind: "permissionChanged", role: sessionRole }),
-      );
-    }
+    session.queues.enqueue(
+      "control",
+      encodeControlFrame({
+        kind: "permissionChanged",
+        role: role === "owner" ? SessionRole.OWNER : role === "editor" ? SessionRole.EDITOR : role === "viewer" ? SessionRole.VIEWER : null,
+        effectiveAtSeq,
+      }),
+    );
   }
 }
 
@@ -89,9 +100,17 @@ export interface HttpAppDeps {
    * (a request to them 404s, the same as any other undefined route) — mirroring how every
    * existing `/v1/documents/:id/...` route already 404s for an unknown id rather than crashing.
    * Only `index.ts`'s real direct-run path and this phase's own new `*.db.test.ts` suite ever
-   * supply this.
+   * supply this. `ticketStore` (Phase 29, API Spec §4.10) is REQUIRED alongside the other two
+   * rather than its own separate optional field — WebSocket admission tickets are meaningless
+   * without the same real Postgres/JWT infrastructure `authDeps` already gates, and this MUST be
+   * the exact same `InMemoryTicketStore` instance `createGateway`'s own `auth.ticketStore` is
+   * given (server.ts's own construction is what guarantees that single-instance sharing).
    */
-  readonly authDeps?: { readonly pool: DbPool; readonly authConfig: AuthConfig };
+  readonly authDeps?: {
+    readonly pool: DbPool;
+    readonly authConfig: AuthConfig;
+    readonly ticketStore: InMemoryTicketStore;
+  };
 }
 
 /** Builds the exact `Set-Cookie` value API Spec §4.1/§4.2 requires: `HttpOnly; Secure; SameSite=Strict; Path=/v1/auth/refresh`. `maxAgeSeconds: 0` (logout, or any dead-end auth failure) clears the cookie in every real browser — the standard "expire a cookie" idiom, since there is no separate "delete cookie" primitive in the Set-Cookie spec itself. */
@@ -246,8 +265,14 @@ function mountDocumentRoutes(
   pool: DbPool,
   authConfig: AuthConfig,
   getCoordinators: () => ReadonlyMap<string, DocumentCoordinator>,
+  ticketStore: InMemoryTicketStore,
 ): void {
   const auth = requireAuth(authConfig);
+  // Phase 29 — same "one instance for this app's whole lifetime" shape as mountAuthRoutes's own
+  // login rate limiter, a SEPARATE limiter (a per-user ticket-churn cap is a different concern
+  // than a per-IP/per-account login cap, and reusing the login limiter's own keys would let
+  // ticket-issuance traffic and login traffic silently interfere with each other's counters).
+  const ticketRateLimiter = new InMemoryRateLimiter();
 
   function requestId(res: Response): string {
     return (res.locals as RequestIdLocals).requestId;
@@ -255,6 +280,10 @@ function mountDocumentRoutes(
 
   function authedUserId(res: Response): string {
     return (res.locals as AuthLocals).user.sub;
+  }
+
+  function authedUser(res: Response): AuthLocals["user"] {
+    return (res.locals as AuthLocals).user;
   }
 
   app.post("/v1/documents", auth, async (req, res) => {
@@ -495,7 +524,12 @@ function mountDocumentRoutes(
           // to every open session for that user on that document" — see pushPermissionChanged's
           // own doc comment for the disclosed limit on what "that user"'s live sessions actually
           // means today.
-          pushPermissionChanged(getCoordinators().get(documentId), userId, outcome.body.role);
+          pushPermissionChanged(
+            getCoordinators().get(documentId),
+            userId,
+            outcome.body.role,
+            outcome.body.effectiveAtSeq,
+          );
           res.status(200).json(outcome.body);
           return;
       }
@@ -544,7 +578,7 @@ function mountDocumentRoutes(
           );
           return;
         case "ok":
-          pushPermissionChanged(getCoordinators().get(documentId), userId, null);
+          pushPermissionChanged(getCoordinators().get(documentId), userId, null, outcome.effectiveAtSeq);
           res.status(204).end();
           return;
       }
@@ -606,12 +640,55 @@ function mountDocumentRoutes(
           // currently connected (see pushPermissionChanged's own doc comment for the disclosed
           // limit on what "connected" actually means today).
           const newOwnerId = typeof body.newOwnerId === "string" ? body.newOwnerId : "";
-          pushPermissionChanged(coordinator, callerId, "editor");
-          pushPermissionChanged(coordinator, newOwnerId, "owner");
+          pushPermissionChanged(coordinator, callerId, "editor", outcome.body.currentSeq);
+          pushPermissionChanged(coordinator, newOwnerId, "owner", outcome.body.currentSeq);
           res.status(200).json(outcome.body);
           return;
         }
       }
+    },
+  );
+
+  /**
+   * Phase 29 (API Spec §4.10) — the WebSocket admission ticket endpoint. "Any role" (owner,
+   * editor, or viewer all qualify — a viewer needs a ticket to even READ over WS, same as an
+   * editor needs one to write), so the ONLY 404-vs-403 split possible here is the standard
+   * enumeration-oracle rule (no permission row at all → 404, same as every other route) — this
+   * endpoint structurally never returns 403 `permission_denied`, since there is no "has SOME role
+   * but an insufficient one" case for "any role."
+   */
+  app.post(
+    "/v1/documents/:documentId/rt-ticket",
+    auth,
+    async (req: Request<{ documentId: string }>, res: Response) => {
+      const documentId = req.params.documentId;
+      const user = authedUser(res);
+      const role = await getUserRole(pool, documentId, user.sub);
+      if (!role) {
+        sendError(
+          res,
+          404,
+          "document_not_found",
+          "No document with this id, or you do not have access to it",
+          requestId(res),
+        );
+        return;
+      }
+      if (!ticketRateLimiter.consume(`ticket:${user.sub}`, authConfig.ticketRateLimit)) {
+        sendError(res, 429, "rate_limited", "Too many ticket requests", requestId(res));
+        return;
+      }
+      const { ticket, expiresAtMs } = ticketStore.issue(
+        documentId,
+        user.sub,
+        user.displayName,
+        authConfig.ticketTtlMs,
+      );
+      res.status(201).json({
+        ticket,
+        expiresIn: Math.round((expiresAtMs - Date.now()) / 1000),
+        documentId,
+      });
     },
   );
 
@@ -668,7 +745,13 @@ export function createHttpApp(deps: HttpAppDeps): Express {
   });
   if (deps.authDeps) {
     mountAuthRoutes(app, deps.authDeps.pool, deps.authDeps.authConfig);
-    mountDocumentRoutes(app, deps.authDeps.pool, deps.authDeps.authConfig, deps.getCoordinators);
+    mountDocumentRoutes(
+      app,
+      deps.authDeps.pool,
+      deps.authDeps.authConfig,
+      deps.getCoordinators,
+      deps.authDeps.ticketStore,
+    );
   }
   app.get("/v1/documents/:documentId/replay", async (req, res) => {
     const coordinator = deps.getCoordinators().get(req.params.documentId);

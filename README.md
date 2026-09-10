@@ -12,6 +12,37 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 29 — WebSocket admission tickets and live revocation.** HELLO's
+`ticket` field — accepted but never validated since Phase 9 — is now REAL:
+`POST /v1/documents/{id}/rt-ticket` issues an opaque, single-use, 30-second
+ticket scoped to one document and the requesting user (any role qualifies;
+404, never 403, for a caller with no access at all, the same enumeration-
+oracle rule every other route follows), and the WebSocket gateway consumes
+it exactly once at handshake time — reused, expired, or wrong-document
+tickets are all rejected with the same `INVALID_TICKET` code, deliberately
+never distinguishing which, so the wire never becomes an oracle for probing
+ticket state. This is the phase that finally links real authenticated
+identity (Phase 26/27's Bearer tokens) to the WS connection, replacing the
+random per-connection `userId` Phase 28 disclosed as a known gap — a
+session's role and identity now come from a genuine per-connect database
+lookup, not a client-declared or randomly-minted value. Permission changes
+now push live: `PERMISSION_CHANGED` is sent on every grant/revoke/transfer,
+carrying the document sequence the change becomes effective at, and a full
+revocation is signaled with `role: null` (not `VIEWER` — there's no wire
+value for "no access at all"). Verified end to end against a real Postgres
+instance and real WebSocket connections: a revocation while a session is
+connected reaches it well within 2 seconds even with no push at all (a
+decision-cache TTL alone catches it on the very next operation); an already
+stale-but-formally-valid ticket is rejected at connect time via a fresh
+per-connect lookup, not merely a cached one. On the client, a downgrade to
+viewer or a full revocation now stops local writes immediately
+(`NoWriteAccessError`, thrown before the engine or DOM are ever touched)
+without discarding anything already typed — engine state, the durable
+queue, and export-to-plain-text all keep working exactly as before. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 29 entry for the full account, including
+the shared-ticket-store wiring in `server.ts` and the ticket-fetch/write-
+blocking mechanics on the client.
+
 **Phase 28 — Permissions and per-operation authorization.** Owner/editor/
 viewer roles are now enforced server-side on EVERY operation, not just at
 connect: `PUT/DELETE /v1/documents/{id}/permissions/{userId}` grant/change
@@ -483,7 +514,8 @@ runs this at full scale on a schedule.
 | Authentication (login/refresh/logout)      | ✅ **Phase 26** (Argon2id, JWT access tokens, refresh rotation + family revocation, SEC-11g timing-oracle-free — verified with a real statistical test) |
 | REST document lifecycle                    | ✅ **Phase 27** (create/list/get/rename/revoke-access, real Bearer-token auth, §5.1 error envelope, §9.2 idempotency, DELETE broadcasts a real GOODBYE) |
 | Permissions (grant/revoke/transfer)        | ✅ **Phase 28** (PUT/DELETE .../permissions/{userId}, POST .../owner; per-operation authorization with a ≤2s decision cache; SEC-07 atomicity proven with 50 real concurrent transfer requests) |
-| WS gateway authorization + presence        | ⏳ not started (Phase 29 for real ticket-based WS identity, 31 for presence) — Phase 28's own WS-side scenarios are proven via a labeled test seam (`testOnlySetConnectedSessionRole`), not real authenticated identity |
+| WS gateway authorization (real ticket-based identity) | ✅ **Phase 29** (POST .../rt-ticket, single-use/30s/scoped; HELLO's ticket field now genuinely validated; live PERMISSION_CHANGED push with effectiveAtSeq; client-side write-blocking on downgrade/revocation) |
+| Presence (cursors/avatars for other users) | ⏳ not started (Phase 31)                                                                                  |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
 | Version history                            | ⏳ not started                                                                                             |
 

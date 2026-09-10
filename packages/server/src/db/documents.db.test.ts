@@ -57,6 +57,8 @@ function testAuthConfig(overrides: Partial<AuthConfig> = {}): AuthConfig {
     refreshTokenTtlMs: 30 * 24 * 60 * 60 * 1000,
     loginRateLimitPerIp: { max: 1000, windowMs: 15 * 60 * 1000 },
     loginRateLimitPerAccount: { max: 1000, windowMs: 15 * 60 * 1000 },
+    ticketTtlMs: 30_000,
+    ticketRateLimit: { max: 1000, windowMs: 60 * 1000 },
     ...overrides,
   };
 }
@@ -141,11 +143,25 @@ function waitForOpen(ws: WebSocket): Promise<void> {
   });
 }
 
-/** A minimal HELLO -> WELCOME handshake — a local copy of serverRestart.db.test.ts's own helper (that file's own version is private to it), trimmed to what this file's own DELETE test actually needs (WELCOME only, no SNAPSHOT decode). */
+/**
+ * A minimal HELLO -> WELCOME handshake — a local copy of serverRestart.db.test.ts's own helper
+ * (that file's own version is private to it), trimmed to what this file's own DELETE test
+ * actually needs (WELCOME only, no SNAPSHOT decode). Phase 29: this server is built with real
+ * `auth` deps, so ticket validation is real and mandatory — `token` is a real access token, used
+ * to fetch a real ticket via `POST /v1/documents/{id}/rt-ticket` before HELLO, exactly as a real
+ * client now must.
+ */
 async function connectAndHandshake(
   port: number,
   documentId: string,
+  token: string,
 ): Promise<{ ws: WebSocket; welcome: WelcomeMessage }> {
+  const ticketRes = await fetch(`${baseUrl(port)}/v1/documents/${documentId}/rt-ticket`, {
+    method: "POST",
+    headers: authed(token),
+  });
+  const { ticket } = (await ticketRes.json()) as { ticket: string };
+
   const ws = new WebSocket(wsUrl(port), WS_SUBPROTOCOL);
   await waitForOpen(ws);
 
@@ -168,7 +184,7 @@ async function connectAndHandshake(
     encodeControlFrame({
       kind: "hello",
       documentId,
-      ticket: new Uint8Array(),
+      ticket: new TextEncoder().encode(ticket),
       lastServerSeq: 0,
       unacked: [],
       clientCapabilities: 0,
@@ -478,7 +494,7 @@ describe("Phase 27 — REST document lifecycle (API Spec §4.3-§4.6, §4.16, §
     // notify), and one real committed operation (so there's a real `operations` row to check
     // survives the deletion). Minted under the server-ASSIGNED replica id from WELCOME —
     // writePath.ts's step 2 (API Spec §6.3) rejects anything else as IDENTITY_MISMATCH.
-    const { ws, welcome } = await connectAndHandshake(port, documentId);
+    const { ws, welcome } = await connectAndHandshake(port, documentId, editorToken);
     const engine = new Engine(welcome.replicaId);
     const op = engine.localInsert(0, 0x68); // "h"
     ws.send(encodeFrame(operationToOpInsert(op, 0)), { binary: true });

@@ -253,19 +253,38 @@ function decodeSyncCompletePayload(reader: ByteReader): SyncCompleteMessage {
   return { kind: "syncComplete", lastServerSeq, resentCount };
 }
 
+/** Bit0 of the flags byte: role is present (a real SessionRole follows). Unset means `role: null` — access revoked entirely (PermissionChangedMessage's own doc comment). */
+const PERMISSION_CHANGED_FLAG_HAS_ROLE = 0x01;
+
 function encodePermissionChangedPayload(writer: ByteWriter, msg: PermissionChangedMessage): void {
-  writer.writeByte(msg.role);
+  writer.writeByte(msg.role !== null ? PERMISSION_CHANGED_FLAG_HAS_ROLE : 0);
+  if (msg.role !== null) {
+    writer.writeByte(msg.role);
+  }
+  writeVarint(writer, msg.effectiveAtSeq);
 }
 
 function decodePermissionChangedPayload(reader: ByteReader): PermissionChangedMessage {
-  const role = reader.readByte();
-  if (!KNOWN_ROLES.has(role)) {
+  const flags = reader.readByte();
+  if ((flags & ~PERMISSION_CHANGED_FLAG_HAS_ROLE) !== 0) {
     throw new ProtocolDecodeError(
-      "UNKNOWN_ROLE",
-      `${role} is not one of the 3 defined SessionRole values`,
+      "RESERVED_BIT_SET",
+      `permissionChanged flags byte ${flags} sets a reserved bit`,
     );
   }
-  return { kind: "permissionChanged", role: role as SessionRole };
+  let role: SessionRole | null = null;
+  if ((flags & PERMISSION_CHANGED_FLAG_HAS_ROLE) !== 0) {
+    const raw = reader.readByte();
+    if (!KNOWN_ROLES.has(raw)) {
+      throw new ProtocolDecodeError(
+        "UNKNOWN_ROLE",
+        `${raw} is not one of the 3 defined SessionRole values`,
+      );
+    }
+    role = raw as SessionRole;
+  }
+  const effectiveAtSeq = readVarint(reader);
+  return { kind: "permissionChanged", role, effectiveAtSeq };
 }
 
 function encodePingPayload(writer: ByteWriter, msg: PingMessage): void {

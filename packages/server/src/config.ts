@@ -78,6 +78,10 @@ export interface AuthConfig {
   readonly loginRateLimitPerIp: RateLimitRule;
   /** Test Plan's own "per-account... throttling" requirement, exact thresholds unspecified — a disclosed, reasonable default. */
   readonly loginRateLimitPerAccount: RateLimitRule;
+  /** API Spec §4.10's own literal number: "valid 30 seconds." Exposed as a field (not an inline constant) for the SAME reason `accessTokenTtlMs` is — tests need a short-lived variant to exercise SEC-11c's own expiry boundary without a real 30-second wait. */
+  readonly ticketTtlMs: number;
+  /** API Spec §4.10: "429 rate_limited — bounds connection-churn attacks at the ticket issuer." No literal threshold given — a disclosed, reasonable default, keyed per-user by the caller (httpApp.ts). */
+  readonly ticketRateLimit: RateLimitRule;
 }
 
 export interface RateLimitRule {
@@ -112,6 +116,10 @@ const DEFAULT_LOGIN_RATE_LIMIT_PER_IP_MAX = 20;
 const DEFAULT_LOGIN_RATE_LIMIT_PER_IP_WINDOW_MS = 15 * 60 * 1000;
 const DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_MAX = 5;
 const DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_WINDOW_MS = 15 * 60 * 1000;
+// Phase 29 — API Spec §4.10's own literal number.
+const DEFAULT_TICKET_TTL_MS = 30 * 1000;
+const DEFAULT_TICKET_RATE_LIMIT_MAX = 30;
+const DEFAULT_TICKET_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 /** No safe default exists for a secret — see AuthConfig's own doc comment for why these two are the only genuinely required env vars besides `DATABASE_URL`. */
 function requiredStringFromEnv(env: NodeJS.ProcessEnv, key: string): string {
@@ -201,6 +209,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
         env,
         "AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT_WINDOW_MS",
         DEFAULT_LOGIN_RATE_LIMIT_PER_ACCOUNT_WINDOW_MS,
+      ),
+    },
+    ticketTtlMs: positiveIntFromEnv(env, "AUTH_TICKET_TTL_MS", DEFAULT_TICKET_TTL_MS),
+    ticketRateLimit: {
+      max: positiveIntFromEnv(env, "AUTH_TICKET_RATE_LIMIT_MAX", DEFAULT_TICKET_RATE_LIMIT_MAX),
+      windowMs: positiveIntFromEnv(
+        env,
+        "AUTH_TICKET_RATE_LIMIT_WINDOW_MS",
+        DEFAULT_TICKET_RATE_LIMIT_WINDOW_MS,
       ),
     },
   };

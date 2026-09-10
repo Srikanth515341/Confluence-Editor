@@ -184,7 +184,7 @@ export async function processIncomingOperation(
   // exists yet (Phase 29's own job; see `HelloMessage.ticket`'s own doc comment) — `session.role`
   // is still either the hardcoded EDITOR default every real connection gets, or a test-only
   // override standing in for a permission system this layer can't yet look up by real identity.
-  if (!coordinator.authorizeSession(session)) {
+  if (!(await coordinator.authorizeSession(session))) {
     // SEC-01's own "security log" requirement: session + document ids on every rejection, not
     // just the OP_REJECT sent back to the sender.
     logger.warn("writePath.authorizationDenied", {

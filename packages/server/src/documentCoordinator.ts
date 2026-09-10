@@ -6,6 +6,7 @@ import {
 } from "@collab-editor/protocol";
 import type { AckBatcher } from "./ackBatcher.js";
 import type { OperationStore } from "./db/operationStore.js";
+import type { DocumentRole } from "./db/documentStore.js";
 import { SNAPSHOT_OP_THRESHOLD, SNAPSHOT_TIME_THRESHOLD_MS } from "./snapshotter.js";
 import type { ConnectionSendQueues } from "./sendQueues.js";
 
@@ -16,6 +17,20 @@ import type { ConnectionSendQueues } from "./sendQueues.js";
  * applies operations, never originates them.
  */
 export const SERVER_REPLICA_ID = 0;
+
+/** `null` (no permission row — including a nonexistent user) maps to `null` here too, distinct from every real `DocumentRole`, so callers can tell "this user genuinely has no access" apart from a real VIEWER role. */
+function documentRoleToSessionRole(role: DocumentRole | null): SessionRole | null {
+  switch (role) {
+    case "owner":
+      return SessionRole.OWNER;
+    case "editor":
+      return SessionRole.EDITOR;
+    case "viewer":
+      return SessionRole.VIEWER;
+    case null:
+      return null;
+  }
+}
 
 /**
  * Phase 25 (DUR-06 fix) — plain identity data for a still-BUFFERED operation's original
@@ -313,17 +328,32 @@ export class DocumentCoordinator {
 
   /**
    * Step 1 of writePath.ts's write path (API Spec §6.3 line 1) — re-evaluated on every call, not
-   * read once at connect. Today's actual check (`session.role !== VIEWER`) is cheap enough that
-   * this cache buys nothing on its own; it exists so the SHAPE of "authorize per operation,
-   * bounded-staleness cache" is already in place for Phase 29+, when this is expected to become a
-   * real per-user DB lookup keyed off a genuine authenticated WS identity that doesn't exist yet.
+   * read once at connect. As of Phase 29, when this coordinator was constructed with a real
+   * {@link lookupRole} (a real server, `auth` deps present), a cache MISS performs a genuine,
+   * fresh `document_permissions` lookup — not merely a re-read of `session.role`, which would
+   * never change unless something explicitly pushed a new value. This distinction is what makes
+   * SEC-05 possible: "with the invalidation push suppressed, revocation still takes effect within
+   * 2s via the cache TTL alone" — a design that ONLY works if expiring the cache and recomputing
+   * can independently discover a revocation nobody told this session about directly. A coordinator
+   * with no `lookupRole` (every pre-Phase-29 test, and any test that doesn't care about real auth)
+   * falls back to the original Phase 28 behavior — reading `session.role` directly — preserving
+   * that entire test surface unchanged. `session.role` is also kept in sync with a fresh lookup's
+   * result (informational — WELCOME/PERMISSION_CHANGED's own role field reads it), so a UI-facing
+   * read of `session.role` is never staler than the cache itself.
    */
-  authorizeSession(session: CoordinatorSession, now: number = Date.now()): boolean {
+  async authorizeSession(session: CoordinatorSession, now: number = Date.now()): Promise<boolean> {
     const cached = this.authDecisionCache.get(session.sessionId);
     if (cached && cached.expiresAt > now) {
       return cached.allowed;
     }
-    const allowed = session.role !== SessionRole.VIEWER;
+    let allowed: boolean;
+    if (this.lookupRole) {
+      const role = await this.lookupRole(session.userId);
+      session.role = documentRoleToSessionRole(role) ?? SessionRole.VIEWER;
+      allowed = role === "editor" || role === "owner";
+    } else {
+      allowed = session.role !== SessionRole.VIEWER;
+    }
     this.authDecisionCache.set(session.sessionId, {
       allowed,
       expiresAt: now + DocumentCoordinator.AUTH_DECISION_TTL_MS,
@@ -338,15 +368,14 @@ export class DocumentCoordinator {
 
   /**
    * Phase 28 — generalizes Phase 24's `testOnlyQueueRoleOverride` (which only ever affected the
-   * NEXT session to join) to also change an ALREADY-CONNECTED session's role live. This is what
-   * makes "authorize on every operation, not just at connect" an observable difference from a
-   * connect-time-only check: a real caller would reach this via a genuine, authenticated
-   * grant/revoke landing on a live WS session, but no real WS identity/ticket-based admission
-   * exists yet (Phase 29's own job — see `HelloMessage.ticket`'s own doc comment) — matching by
-   * session id here, never by the WS session's own fake per-connection `userId`. Returns `false`
-   * if no session with that id is currently connected (the caller — httpApp.ts's grant/revoke
-   * routes — treats this as "nothing to push," not an error, since the affected user may simply
-   * not be connected over WS right now).
+   * NEXT session to join) to also change an ALREADY-CONNECTED session's role live. As of Phase
+   * 29, a real caller (httpApp.ts's grant/revoke/transfer routes) reaches this via
+   * `getSessionsByUserId` — a REAL authenticated userId now flows into `CoordinatorSession.userId`
+   * (Phase 29's real ticket-based admission, see gateway.ts), so this is no longer only a test
+   * seam for the WS side, though `testOnlySetConnectedSessionRole` below remains for tests that
+   * don't want to build a real ticket. Returns `false` if no session with that id is currently
+   * connected (the caller treats this as "nothing to push," not an error, since the affected user
+   * may simply not be connected over WS right now).
    */
   setSessionRoleLive(sessionId: string, role: SessionRole): boolean {
     const session = this.sessions.get(sessionId);
@@ -363,15 +392,14 @@ export class DocumentCoordinator {
 
   /**
    * Phase 28 (API Spec §4.7/§4.8: "pushes PERMISSION_CHANGED to every open session for that user
-   * on that document") — matches by `CoordinatorSession.userId`, which is a fresh `randomUUID()`
-   * per WS connection (gateway.ts, unchanged since Phase 8/16), NOT a real authenticated user
-   * identity. DISCLOSED GAP, consistent with this project's standing "the WS gateway still does
-   * not verify any access token" stance (CLAUDE.md's own "What is explicitly NOT yet built"):
-   * in production today, a REST-authenticated `userId` (from a real JWT) will structurally never
-   * match any live WS session's own `userId` field, so this will typically find nothing to push
-   * to. The mechanism itself — find every open session for a given user, on this document — is
-   * real and correct, and is what Phase 29's real ticket-based admission needs the moment WS
-   * sessions carry a real, authenticated userId instead of a random one.
+   * on that document") — matches by `CoordinatorSession.userId`. Through Phase 28 this was a
+   * fresh `randomUUID()` per WS connection, so this method structurally never matched anything in
+   * production. As of Phase 29, when a session was admitted through real ticket-based validation
+   * (gateway.ts, `auth` deps configured), `userId` is the REAL authenticated user id from the
+   * ticket, so this now genuinely reaches a live session for that real user. A session admitted
+   * with no real auth wiring (every pre-Phase-29 test, and any server built without `auth` deps)
+   * still carries the old random placeholder, so this remains a correct no-op finder for that
+   * case — it never matches an unrelated real userId by accident.
    */
   getSessionsByUserId(userId: string): CoordinatorSession[] {
     const result: CoordinatorSession[] = [];
@@ -383,16 +411,28 @@ export class DocumentCoordinator {
     return result;
   }
 
+  /**
+   * Phase 29 — a real, per-user `document_permissions` lookup, bound to THIS coordinator's own
+   * `documentId` by whoever constructs it (`gateway.ts`'s `getOrCreateCoordinator`, only when
+   * `auth` deps are configured). `undefined` for every coordinator built without real auth wiring
+   * (the overwhelming majority of this project's own tests) — `authorizeSession` falls back to
+   * the original Phase 28 `session.role`-only check in that case, so none of that test surface
+   * needs to change for this phase.
+   */
+  private readonly lookupRole: ((userId: string) => Promise<DocumentRole | null>) | undefined;
+
   constructor(
     documentId: string,
     operationStore: OperationStore,
     snapshotThresholds?: { readonly opThreshold?: number; readonly timeThresholdMs?: number },
+    lookupRole?: (userId: string) => Promise<DocumentRole | null>,
   ) {
     this.documentId = documentId;
     this.operationStore = operationStore;
     this.snapshotOpThreshold = snapshotThresholds?.opThreshold ?? SNAPSHOT_OP_THRESHOLD;
     this.snapshotTimeThresholdMs =
       snapshotThresholds?.timeThresholdMs ?? SNAPSHOT_TIME_THRESHOLD_MS;
+    this.lookupRole = lookupRole;
     this.lastSnapAt = new Date(); // provisional — warmStart() below sets the real baseline once it completes
     this.ready = this.warmStart();
   }
