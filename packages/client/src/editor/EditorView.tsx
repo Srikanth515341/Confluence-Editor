@@ -16,26 +16,29 @@
 // REMOTE operations (this session's own edits already update the DOM
 // directly, via DomWriter, from the input pipeline), this component
 // re-mounts the WHOLE subtree from `engine.text()` — through the SAME
-// `sentinel.applyPatches()` wrapper — and does a best-effort caret restore
-// (capture this session's own visible-index position, remount, restore
-// that SAME numeric index). This is NOT cursor transformation (Phase 32):
-// a remote insert/delete before the local caret should shift its index by
-// the change's length to stay in the same RELATIVE spot, which this does
-// not do — restoring the identical raw index is the simplest thing that
-// keeps typing usable at all when remote edits interleave (discovered
-// necessary by actually running a two-window manual test during this
-// phase's own development — without ANY re-render on remote ops, a peer's
-// edits never appeared in this session's DOM at all, only in `engine.text()`,
-// which would have made Milestone M1's whole premise unverifiable in a
-// real browser). Real relative-position preservation across concurrent
-// remote edits remains Phase 32's job.
+// `sentinel.applyPatches()` wrapper — and restores the caret/selection
+// afterward.
+//
+// Phase 32 (API Spec §7.5/§11.7, Test Plan CUR-01..05, blocker B19) replaced
+// Phase 14's own "capture the raw numeric visible index, remount, restore
+// that SAME numeric index" stand-in — which kept typing usable but did NOT
+// keep the caret attached to the character the user actually placed it on,
+// since a remote insert/delete before that index shifts what that index now
+// points at. `captureCaret`/`restoreCaret` (caretTracker.ts) instead resolve
+// the live selection's anchor AND focus to stable node identifiers
+// (`resolvePresenceAnchor`, the same identifier-resolution convention Phase
+// 31's presence protocol already uses) before the remount, then resolve
+// those identifiers back to a CURRENT visible index (`Engine.resolveCaret`,
+// this phase) afterward — tracking the same character even through a
+// remote edit that shifted or deleted content around it.
 
 import { useEffect, useRef } from "react";
 import type { Engine } from "@collab-editor/engine";
-import { DomWriter, domToVis, totalVisibleLength, visToDom } from "../binding/index.js";
+import { DomWriter } from "../binding/index.js";
 import { attachInputPipeline } from "../input/index.js";
 import { MutationSentinel } from "../sentinel/index.js";
 import type { SyncClient } from "../sync/syncClient.js";
+import { captureCaret, restoreCaret } from "./caretTracker.js";
 
 export interface EditorViewProps {
   readonly sync: SyncClient;
@@ -76,47 +79,19 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
       }
     });
 
-    // Arrow expressions, not function declarations — TS narrows a captured `const` (here, `root`
-    // after the early-return above) through an arrow closure but not reliably through a hoisted
-    // function declaration, since the latter could in principle be invoked before the narrowing
-    // check runs.
-    /** Best-effort: see this file's own header comment for why this is a numeric-index restore, not real cursor transformation. */
-    const captureCaretVisIndex = (): number => {
-      const sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) {
-        return 0;
-      }
-      try {
-        const range = sel.getRangeAt(0);
-        return domToVis(domWriter.index, range.startContainer, range.startOffset);
-      } catch {
-        return 0;
-      }
-    };
-
-    const restoreCaretVisIndex = (visIndex: number): void => {
-      const sel = window.getSelection();
-      if (!sel) {
-        return;
-      }
-      const total = totalVisibleLength(domWriter.index);
-      const clamped = Math.max(0, Math.min(visIndex, total));
-      const pos = visToDom(domWriter.index, root, clamped);
-      const range = document.createRange();
-      range.setStart(pos.node, pos.offset);
-      range.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(range);
-    };
-
     const unsubscribeRemoteOps = sync.onRemoteOpsApplied(() => {
       const engine = sync.engine;
       if (!engine || engine !== mountedEngineRef.current) {
         return; // a SNAPSHOT re-mount (mountIfNewEngine) already covers a brand-new engine
       }
-      const savedVisIndex = captureCaretVisIndex();
+      // capture() BEFORE the mutation (Scope-IN's own ordering) -- the live selection's DOM
+      // node/offset only means something relative to the CURRENT, pre-mutation render index.
+      const snapshot = captureCaret(domWriter.index, engine);
       sentinel.applyPatches(() => domWriter.mount(root, engine.text()));
-      restoreCaretVisIndex(savedVisIndex);
+      // restore() AFTER all of them -- against the FRESH render index `mount()` just produced.
+      if (snapshot) {
+        restoreCaret(snapshot, root, domWriter.index, engine);
+      }
     });
 
     const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });

@@ -378,4 +378,75 @@ export class FugueTree {
     this.byId.delete(serializeId(id));
     return this.toPublicNode(node);
   }
+
+  /**
+   * Phase 32 (API Spec §7.5.3's `resolveCaret`, reinterpreted for a tree — see
+   * `Engine.resolveCaret`'s own doc comment for the full contract and the correction from the
+   * pre-Fugue, flat-array design this replaces). Returns the number of VISIBLE nodes at-or-before
+   * `id`'s own position in the tree's in-order traversal (Definition 2.3's `vis(S)` order) —
+   * which is EXACTLY the caret contract's "visible index immediately right of the nearest
+   * surviving node at or before `id`," computed WITHOUT a separate "walk left to find a
+   * survivor" step:
+   *
+   *   - If `id` is currently LIVE: the augmented `visibleSize` fields already give the count of
+   *     visible nodes in `id`'s own left subtree; adding 1 for `id` itself, then adding every
+   *     preceding sibling-subtree's `visibleSize` while walking up to the root, yields precisely
+   *     `id`'s own 0-based rank among visible nodes, plus one — "immediately right of a live
+   *     node."
+   *   - If `id` is currently TOMBSTONED: the identical sum (this time WITHOUT the "+1 for self",
+   *     since a tombstoned node contributes 0 to its own `visibleSize`) yields the count of
+   *     visible nodes STRICTLY BEFORE `id`'s position — which is, by construction, exactly the
+   *     rank-plus-one of whichever LIVE node is nearest to `id` in in-order traversal (every
+   *     visible node strictly before a given position is, definitionally, every visible node up
+   *     to and including that nearest live predecessor). No explicit "walk left through the
+   *     structure looking for a survivor" is needed — the aggregate sum already IS that answer.
+   *   - If `id` was never known, or has since been PHYSICALLY removed by GC (Phase 21) — a case
+   *     the pre-Fugue design never had to consider, since it predates GC removing anything from
+   *     the flat sequence outright — there is no position left to resolve at all. This falls back
+   *     to 0 (document start), the same "no survivor exists" answer the contract already defines
+   *     for an entirely-tombstoned prefix; disclosed here as a graceful-degradation case, the same
+   *     category of fallback `reconcileOfflineQueue.ts`'s own `visibleIndexAfter` already
+   *     documents for an unresolvable anchor (Phase 22/24).
+   *
+   * Cost is O(depth) — the SAME cost class every other position-aware `FugueTree` operation
+   * already carries (`nodeAtVisible`, `decidePlacement`), including this project's own already-
+   * disclosed Fugue O(N) worst-case chain depth for purely sequential typing (CLAUDE.md's Open
+   * Item 3) — not a new performance regression introduced by this phase.
+   *
+   * Determinism (API Spec §7.5.3: "MUST be... identical on every replica"): every input this
+   * method reads (`visibleSize`, `deleted`, `parent`, `side`, sibling order) is a pure function of
+   * the SET of operations applied, never of delivery order or wall-clock time — the same property
+   * that makes this tree's full STRUCTURE (not merely its visible text) identical across any two
+   * replicas that have applied the same operations (see this file's own header comment on why
+   * Fugue's `parent`/`side` are decided once and never recomputed). Two replicas holding the same
+   * tree therefore always compute the identical answer for the identical `id` — verified directly
+   * across three independently-converged replicas by `engine.test.ts`'s CUR-04 test.
+   */
+  visibleIndexRightOf(id: Identifier | null): number {
+    if (id === null) return 0;
+    const node = this.byId.get(serializeId(id));
+    if (node === undefined) return 0; // unknown or GC-collected — no resolvable position; see doc comment
+    let count = 0;
+    for (const child of node.leftChildren) count += child.visibleSize;
+    if (!node.deleted) count += 1;
+    let cur: TreeNode = node;
+    while (cur.parent !== null) {
+      const parent = cur.parent;
+      if (cur.side === "L") {
+        for (const sib of parent.leftChildren) {
+          if (sib === cur) break;
+          count += sib.visibleSize;
+        }
+      } else {
+        for (const sib of parent.leftChildren) count += sib.visibleSize;
+        if (parent !== this.root && !parent.deleted) count += 1;
+        for (const sib of parent.rightChildren) {
+          if (sib === cur) break;
+          count += sib.visibleSize;
+        }
+      }
+      cur = parent;
+    }
+    return count;
+  }
 }

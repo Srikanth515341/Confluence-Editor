@@ -680,3 +680,150 @@ describe("Engine — tryRevertLocalInsert() (Phase 25, Option 2 / R0012's own sc
     expect(engine.tryRevertLocalInsert(opA.id)).toBe(false); // second attempt: already gone
   });
 });
+
+describe("Engine — resolveCaret() (Phase 32, API Spec §7.5.3 corrected for the Fugue engine, Engine Spec §11.3, Test Plan blocker B19)", () => {
+  it("null anchor (document start) resolves to 0", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, "A".codePointAt(0)!);
+    expect(engine.resolveCaret(null)).toBe(0);
+  });
+
+  it("a LIVE anchor resolves to the visible index immediately right of it", () => {
+    const engine = new Engine(1);
+    const a = engine.localInsert(0, "A".codePointAt(0)!);
+    const b = engine.localInsert(1, "B".codePointAt(0)!);
+    engine.localInsert(2, "C".codePointAt(0)!);
+    expect(engine.text()).toBe("ABC");
+    expect(engine.resolveCaret(a.id)).toBe(1);
+    expect(engine.resolveCaret(b.id)).toBe(2);
+  });
+
+  it("a TOMBSTONED anchor with a surviving predecessor resolves to that predecessor's own index", () => {
+    const engine = new Engine(1);
+    const a = engine.localInsert(0, "A".codePointAt(0)!);
+    const b = engine.localInsert(1, "B".codePointAt(0)!);
+    engine.localInsert(2, "C".codePointAt(0)!);
+    engine.localDelete(1, 1); // deletes "B"
+    expect(engine.text()).toBe("AC");
+    expect(engine.resolveCaret(b.id)).toBe(engine.resolveCaret(a.id)); // both resolve to right-after-"A"
+    expect(engine.resolveCaret(b.id)).toBe(1);
+  });
+
+  it("a TOMBSTONED anchor with NO surviving predecessor resolves to 0, not document end or a throw", () => {
+    const engine = new Engine(1);
+    const a = engine.localInsert(0, "A".codePointAt(0)!);
+    engine.localInsert(1, "B".codePointAt(0)!);
+    engine.localDelete(0, 1); // deletes "A", the very first character -- nothing survives before it
+    expect(engine.text()).toBe("B");
+    expect(engine.resolveCaret(a.id)).toBe(0);
+  });
+
+  it("an UNKNOWN/GC'd identifier resolves to 0 rather than throwing (disclosed graceful degradation)", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, "A".codePointAt(0)!);
+    expect(engine.resolveCaret({ c: 999, r: 999 })).toBe(0);
+  });
+
+  it("CUR-01/02 shape: an anchor deep in a document resolves through surrounding remote insert AND delete churn", () => {
+    const engine = new Engine(1);
+    const ids: { id: { c: number; r: number } }[] = [];
+    for (const ch of "ABCDEFGHIJ") {
+      ids.push(engine.localInsert(ids.length, ch.codePointAt(0)!));
+    }
+    expect(engine.text()).toBe("ABCDEFGHIJ");
+    const anchor = ids[4]!.id; // "E"
+    expect(engine.resolveCaret(anchor)).toBe(5);
+    // A peer inserts BEFORE the anchor -- the anchor's visible index shifts, but resolveCaret
+    // tracks the SAME character, not the old numeric position (CUR-01).
+    engine.localInsert(2, "x".codePointAt(0)!);
+    expect(engine.text()).toBe("ABxCDEFGHIJ");
+    expect(engine.resolveCaret(anchor)).toBe(6);
+    // A peer deletes BEFORE the anchor too -- the index shifts back down, still the same
+    // character (CUR-02).
+    engine.localDelete(0, 1); // delete "A"
+    expect(engine.text()).toBe("BxCDEFGHIJ");
+    expect(engine.resolveCaret(anchor)).toBe(5);
+  });
+
+  it("CUR-04: resolveCaret is deterministic and IDENTICAL across three independently-converged replicas, for both a live and a tombstoned anchor", () => {
+    // Three replicas apply the same operations in three DIFFERENT arrival orders -- Fugue's own
+    // structural determinism (this file's own header comment) means the full tree, not just its
+    // visible text, converges identically regardless of delivery order, so resolveCaret must too.
+    const author = new Engine(1);
+    const seed = [];
+    for (const ch of "hello world") {
+      seed.push(author.localInsert(seed.length, ch.codePointAt(0)!));
+    }
+    const anchorOp = seed[4]!; // the "o" in "hello"
+    const peerDelete = author.localDelete(0, 1)[0]!; // delete "h" -- a real causal op naming a real target
+
+    const allOps = [...seed, peerDelete];
+    const ordersToTry = [allOps, [...allOps].reverse(), [...allOps.slice(1), allOps[0]!]];
+
+    const liveResults: number[] = [];
+    const tombstonedResults: number[] = [];
+    for (const order of ordersToTry) {
+      const replica = new Engine(2 + liveResults.length);
+      for (const op of order) {
+        replica.applyRemote(op);
+      }
+      expect(replica.pending.length).toBe(0); // fully drained -- a genuine converged replica
+      expect(replica.text()).toBe(author.text());
+      liveResults.push(replica.resolveCaret(anchorOp.id));
+      tombstonedResults.push(replica.resolveCaret(peerDelete.target));
+    }
+    expect(new Set(liveResults).size).toBe(1); // all three replicas agree, byte for byte
+    expect(liveResults[0]).toBe(author.resolveCaret(anchorOp.id)); // and match the authoring replica too
+    expect(new Set(tombstonedResults).size).toBe(1);
+    expect(tombstonedResults[0]).toBe(author.resolveCaret(peerDelete.target));
+  });
+
+  it("cross-checks resolveCaret against an independent, naive full-traversal oracle across 200 randomized structures", () => {
+    // An independent, deliberately-naive re-derivation (NOT calling FugueTree.visibleIndexRightOf's
+    // own augmented-size walk) -- the same "don't let a check share a bug with the code it's
+    // verifying" discipline this project has used since Phase 4's property suites.
+    function naiveResolveCaret(engine: Engine, id: { c: number; r: number } | null): number {
+      if (id === null) return 0;
+      const nodes = engine.nodes; // public getter, full in-order traversal
+      const idx = nodes.findIndex((n) => n.id.c === id.c && n.id.r === id.r);
+      if (idx === -1) return 0;
+      let count = 0;
+      for (let i = 0; i <= idx; i++) {
+        if (!nodes[i]!.deleted) count++;
+      }
+      return count;
+    }
+
+    let seedState = 1;
+    function rand(): number {
+      // A small deterministic PRNG (mulberry32-shaped) -- reproducible on failure, matching this
+      // project's own seeded-PRNG convention rather than Math.random().
+      seedState |= 0;
+      seedState = (seedState + 0x6d2b79f5) | 0;
+      let t = seedState;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+
+    for (let seed = 0; seed < 200; seed++) {
+      const engine = new Engine(1);
+      const mintedIds: { c: number; r: number }[] = [];
+      for (let step = 0; step < 40; step++) {
+        const len = engine.stats().visibleLength;
+        if (len === 0 || rand() < 0.7) {
+          const pos = Math.floor(rand() * (len + 1));
+          const op = engine.localInsert(pos, 97 + Math.floor(rand() * 26));
+          mintedIds.push(op.id);
+        } else {
+          const pos = Math.floor(rand() * len);
+          engine.localDelete(pos, 1);
+        }
+      }
+      for (const id of mintedIds) {
+        expect(engine.resolveCaret(id)).toBe(naiveResolveCaret(engine, id));
+      }
+      expect(engine.resolveCaret(null)).toBe(naiveResolveCaret(engine, null));
+    }
+  });
+});
