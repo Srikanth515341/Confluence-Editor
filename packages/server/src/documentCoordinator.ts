@@ -120,6 +120,22 @@ export interface CoordinatorSession {
    * `CoordinatorSession` literal directly with no real `ws` to close.
    */
   readonly disconnectForRateLimit?: () => void;
+  /**
+   * Phase 31 (API Spec §3.8, the 8-second presence-stale timer) — a closure, set only in
+   * gateway.ts's own real session construction, called by heartbeat.ts's `markPresenceStale` the
+   * instant this session's presence-stale timer fires (8s with no PING). Removes this session
+   * from its document's PRESENCE room and broadcasts `PRESENCE_LEAVE{reason: stale}` to the
+   * remaining participants — see `presenceManager.ts`'s `PresenceRoom.leave`, which this closure
+   * calls. OPTIONAL for the SAME reason `disconnectForRevocation`/`disconnectForRateLimit` above
+   * are: a dozen pre-existing test fixtures construct a `CoordinatorSession` literal directly with
+   * no presence room to remove from. Distinct from `disconnectForRevocation`/`disconnectForRateLimit`
+   * in one important way: it never closes the socket or ends the OPS session — presence staleness
+   * and connection liveness are deliberately separate concerns (this is exactly the conflation
+   * this project's own heartbeat.ts comment warns against re-introducing, one layer up: presence
+   * going stale must never evict this session from the GC stability frontier or its `sessions` row,
+   * only from the presence roster).
+   */
+  onPresenceStale?: () => void;
 }
 
 /**

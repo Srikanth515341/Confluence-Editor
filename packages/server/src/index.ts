@@ -66,6 +66,7 @@ export {
   runOneDocument as runOneOfflineWindowSweep,
   type OfflineWindowScheduler,
 } from "./offlineWindowScheduler.js";
+export { PresenceRoom, PresenceLeaveReason, type PresenceParticipant } from "./presenceManager.js";
 export type {
   GcConfig,
   OfflineWindowConfig,

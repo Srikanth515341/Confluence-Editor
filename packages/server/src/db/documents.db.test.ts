@@ -15,11 +15,13 @@ import { afterEach, beforeAll, afterAll, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { Engine } from "@collab-editor/engine";
 import {
+  Channel,
   GoodbyeReason,
   decodeControlFrame,
   encodeControlFrame,
   encodeFrame,
   operationToOpInsert,
+  peekChannel,
   type WelcomeMessage,
 } from "@collab-editor/protocol";
 import { loadConfig } from "../config.js";
@@ -508,9 +510,11 @@ describe("Phase 27 — REST document lifecycle (API Spec §4.3-§4.6, §4.16, §
     const goodbyeReceived = new Promise<number>((resolve) => {
       ws.on("message", (data, isBinary) => {
         if (!isBinary) return;
-        const msg = decodeControlFrame(new Uint8Array(data as Buffer), {
-          direction: "serverOrigin",
-        });
+        const bytes = new Uint8Array(data as Buffer);
+        // Phase 31: a PRESENCE_ROSTER frame (channel 2) can also arrive on this same socket —
+        // only decode frames actually on the CONTROL channel here.
+        if (peekChannel(bytes) !== Channel.CONTROL) return;
+        const msg = decodeControlFrame(bytes, { direction: "serverOrigin" });
         if (msg.kind === "goodbye") resolve(msg.reason);
       });
     });

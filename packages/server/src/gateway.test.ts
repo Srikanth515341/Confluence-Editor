@@ -6,6 +6,7 @@ import {
   Channel,
   decodeControlFrame,
   decodeFrame,
+  decodePresenceFrame,
   decodeStructureSnapshotBody,
   encodeControlFrame,
   encodeFrame,
@@ -22,6 +23,8 @@ import {
   type ControlMessage,
   type ErrorMessage,
   type OpsMessage,
+  type PresenceMessage,
+  type PresenceRosterMessage,
   type SnapshotMessage,
   type WelcomeMessage,
 } from "@collab-editor/protocol";
@@ -105,6 +108,10 @@ class IncomingFrames {
   async nextOps(): Promise<OpsMessage> {
     return decodeFrame(await this.next(), { direction: "serverOrigin" });
   }
+
+  async nextPresence(): Promise<PresenceMessage> {
+    return decodePresenceFrame(await this.next(), { direction: "serverOrigin" });
+  }
 }
 
 function helloBytes(
@@ -135,7 +142,11 @@ function helloBytes(
  * consumed here, not left buffered — otherwise a later `frames.next()`/
  * `frames.nextControl()` call elsewhere in this file (e.g. the PONG checks
  * in the heartbeat tests below) would silently receive this leftover
- * frame instead of the one it actually expects.
+ * frame instead of the one it actually expects. Phase 31 adds a FOURTH
+ * frame, PRESENCE_ROSTER — on the PRESENCE channel/queue, not CONTROL, but
+ * still part of the same handshake-completion sequence (API Spec §3.8:
+ * "sent once after sync completes") — which this helper also consumes for
+ * the identical reason.
  */
 async function connectAndHandshake(
   port: number,
@@ -146,6 +157,9 @@ async function connectAndHandshake(
   welcome: WelcomeMessage;
   snapshot: SnapshotMessage;
   alreadyHave: AlreadyHaveMessage;
+  roster: PresenceRosterMessage;
+  /** Any CONTROL frame(s) arriving between ALREADY_HAVE and PRESENCE_ROSTER — normally empty; a queued RC-32 role override (Phase 24) inserts exactly one PERMISSION_CHANGED here. */
+  extraControl: ControlMessage[];
 }> {
   const ws = new WebSocket(wsUrl(port), WS_SUBPROTOCOL);
   await waitForOpen(ws);
@@ -165,8 +179,36 @@ async function connectAndHandshake(
   if (alreadyHaveMsg.kind !== "alreadyHave") {
     throw new Error(`expected ALREADY_HAVE, got ${alreadyHaveMsg.kind}`);
   }
+  // PRESENCE_ROSTER is always the LAST frame of this whole sequence — gateway.ts enqueues it
+  // (on the PRESENCE queue) only after every CONTROL frame this handshake will ever send,
+  // including an optional PERMISSION_CHANGED (RC-32), and the three-queue priority drain (§3.3)
+  // guarantees CONTROL always fully empties before PRESENCE starts. So: keep reading raw frames,
+  // decoding each as CONTROL until one arrives on the PRESENCE channel instead — that one is the
+  // roster.
+  const extraControl: ControlMessage[] = [];
+  let rosterMsg: PresenceRosterMessage | undefined;
+  while (!rosterMsg) {
+    const bytes = await frames.next();
+    if (peekChannel(bytes) === Channel.PRESENCE) {
+      const presenceMsg = decodePresenceFrame(bytes, { direction: "serverOrigin" });
+      if (presenceMsg.kind !== "presenceRoster") {
+        throw new Error(`expected PRESENCE_ROSTER, got ${presenceMsg.kind}`);
+      }
+      rosterMsg = presenceMsg;
+    } else {
+      extraControl.push(decodeControlFrame(bytes, { direction: "serverOrigin" }));
+    }
+  }
 
-  return { ws, frames, welcome: welcomeMsg, snapshot: snapshotMsg, alreadyHave: alreadyHaveMsg };
+  return {
+    ws,
+    frames,
+    welcome: welcomeMsg,
+    snapshot: snapshotMsg,
+    alreadyHave: alreadyHaveMsg,
+    roster: rosterMsg,
+    extraControl,
+  };
 }
 
 function sendSyncComplete(ws: WebSocket, lastServerSeq: number): void {
@@ -414,7 +456,7 @@ describe("Permission downgrade while offline (Phase 24, Test Plan RC-32, API Spe
     const second = await connectAndHandshake(port, documentId);
     expect(second.welcome.role).toBe(SessionRole.VIEWER); // "viewers may read" -- HELLO still succeeds, CATCHUP/SNAPSHOT still delivered
 
-    const permissionChanged = await second.frames.nextControl();
+    const permissionChanged = second.extraControl[0];
     expect(permissionChanged).toEqual({
       kind: "permissionChanged",
       role: SessionRole.VIEWER,
@@ -447,8 +489,8 @@ describe("Permission downgrade while offline (Phase 24, Test Plan RC-32, API Spe
     coordinator.testOnlyQueueRoleOverride(SessionRole.VIEWER);
 
     const second = await connectAndHandshake(port, documentId);
-    const permissionChanged = await second.frames.nextControl();
-    expect(permissionChanged.kind).toBe("permissionChanged");
+    const permissionChanged = second.extraControl[0];
+    expect(permissionChanged?.kind).toBe("permissionChanged");
 
     // Simulates C's own reconnection reconciliation (reconcileOfflineQueue.ts, Phase 22/23) --
     // this WELCOME's own resident-engine replica id is what a real re-mint would use.

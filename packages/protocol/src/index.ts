@@ -89,3 +89,19 @@ export {
   encodeTextSnapshotBody,
 } from "./snapshotBody.js";
 export { replaySnapshotNodesInto, seedEngineFromSnapshot } from "./snapshotSeed.js";
+export {
+  PresenceLeaveReason,
+  PresenceMessageType,
+  type PresenceJoinMessage,
+  type PresenceLeaveMessage,
+  type PresenceMessage,
+  type PresenceRosterEntry,
+  type PresenceRosterMessage,
+  type PresenceUpdateMessage,
+} from "./presenceMessages.js";
+export {
+  type DecodePresenceFrameOptions,
+  type EncodePresenceFrameOptions,
+  decodePresenceFrame,
+  encodePresenceFrame,
+} from "./presenceCodec.js";
