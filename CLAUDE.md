@@ -5729,6 +5729,580 @@ check:purity` was ALSO silently broken by two comments (one in
   project has followed since Phase 24's `offlineWindowStatus`. Presence
   (Phase 31) is unaffected either way.
 
+- **Phase 30 — Rate limiting, circuit breaker, and the security suite** (RFC
+  §8.2 (T2), §8.7, §8.8; API Spec §3.5.8; Test Plan SEC-08/09/10/11h/11i/j).
+  Defends against the metadata-exhaustion attack this project's own CRDT
+  choice specifically creates: an AUTHORIZED, well-formed insert-then-
+  delete script at scattered positions produces real tombstones that
+  propagate to every peer through the ordinary convergence mechanism — no
+  authorization/identity check (Phase 28/29) can distinguish it from
+  ordinary fast typing, since every operation is legitimate; only its
+  RATE and its cumulative effect on structure size give it away.
+  Milestone M3, tagged `v0.3.0-m3` on merge. Dependencies: Phases 21 (GC,
+  which reclaims the damage once an attack stops), 28 (the per-operation
+  write-path shape this phase's own new checks slot into).
+
+  **Per-session/per-document op rate limiting (Scope-IN: "200 ops/s, then
+  throttle, then disconnect")** — `writePath.ts`'s step 3, previously a
+  stub since Phase 25 ("rate check (stubbed until Phase 30)"), is now
+  real: `DocumentCoordinator.checkOpRateLimit(sessionId)` consults TWO
+  independent `InMemoryRateLimiter` instances (Phase 26's own class,
+  reused rather than reinvented) — one keyed per-session, one shared
+  per-document — returning `"session"`/`"document"`/`"ok"` so the caller
+  can react differently to each. A rejected message gets `OP_REJECT
+  {RATE_LIMITED}` (API Spec §3.5.8's already-existing 0x05 code — never
+  wired up to anything real before this phase); a session whose own
+  violations are CONTINUOUS for `perSessionSustainedViolationMs`
+  (`DocumentCoordinator.recordRateLimitViolation`, cleared on the next
+  passing check) is disconnected via a new, optional
+  `CoordinatorSession.disconnectForRateLimit` closure — gateway.ts's own
+  version sends GOODBYE with `GoodbyeReason.EVICTED` (an existing value,
+  reused rather than adding a new one — "the server is ending this
+  session" already names exactly this category) and closes with a new
+  application-specific code, `4002` (distinct from revocation's `4001`).
+
+  **Counted per incoming MESSAGE, never per expanded engine operation —
+  a deliberate design decision, disclosed at length in `RateLimitConfig`'s
+  own doc comment (config.ts), not an oversight.** A single
+  `OP_INSERT_RUN`/`OP_DELETE_BATCH` frame (a 2,000-character paste, or a
+  reconnection's own `operationsToWireMessages`-coalesced resend) can
+  legitimately represent thousands of engine operations sent all at once
+  by a real user or a normal reconnection — counting by expanded
+  operation count would reject an ordinary large paste outright, a real
+  product regression, not a security improvement. SEC-08's own attack
+  shape is exactly what per-message counting catches correctly instead:
+  scattered-position insert-then-delete pairs cannot be coalesced into a
+  compact run/batch frame at all (this is SEC-09's own point, see below),
+  so the attack's own 1,000 ops/second arrives as ~1,000-2,000 SEPARATE
+  messages/second, comfortably tripping a 200-messages/second cap while a
+  real paste (one message, however large) never does.
+
+  **`RateLimitConfig` defaults to DISABLED (`undefined`) on
+  `DocumentCoordinator`, unlike every other Phase 30 protection — a
+  necessary, disclosed exception to this project's usual "generous
+  always-on default" pattern (GcConfig/OfflineWindowConfig's own
+  precedent).** Dozens of pre-existing tests across this codebase drive a
+  coordinator through rapid, tight loops of many individual small
+  operations completing in well under a second of REAL wall-clock time
+  (`headlessHarness.test.ts`'s 1,000-operation convergence workload,
+  RC-27's repeated-reconnection reconciliation) — an always-on per-message
+  cap would trip on these for reasons having nothing to do with this
+  phase's own threat model. The SAME "undefined disables" pattern
+  `DocumentCoordinator`'s own `lookupRole` already established (Phase 29)
+  is used here: `index.ts`'s real, direct-run production path ALWAYS
+  supplies a real `RateLimitConfig` (from `loadConfig()`); every test
+  that doesn't explicitly opt in keeps its pre-Phase-30 behavior
+  unchanged. Verified directly: the full default `pnpm test` (515 tests)
+  and `pnpm --filter @collab-editor/client run test:reconnection` both
+  re-ran clean after this landed — see this phase's own DoD verification
+  paragraph below for the exact numbers.
+
+  **The document-wide circuit breaker (Scope-IN: "beyond a hard
+  structure-size ceiling, stop accepting operations, alert, mark
+  read-only") is, BY CONTRAST, ALWAYS active**, with a generous default
+  (`DEFAULT_CIRCUIT_BREAKER_CONFIG`, config.ts: 200,000-node ceiling,
+  100,000-node/tombstone alert thresholds) safely above the largest
+  document any pre-Phase-30 fast test builds (Phase 21's own 90,000-
+  character M8-c fixture) — and, per Fugue's own disclosed O(N²)
+  sequential-insertion cost (CLAUDE.md's Open Item 3), a document
+  anywhere near that scale is already prohibitively slow to build in a
+  fast test's own real time budget, so no existing test could accidentally
+  trip it even if it wanted to. `DocumentCoordinator.evaluateCircuitBreaker()`
+  re-evaluates reactively — after every successfully-committed operation
+  (`writePath.ts`'s fast AND slow paths) so a trip happens the instant a
+  real commit crosses the ceiling, not on a later polling interval — and
+  again after every GC cycle (`gcScheduler.ts`), which is what lets it
+  SELF-HEAL the moment GC reclaims enough tombstones to fall back under
+  the ceiling, with no separate "reset" action required from an operator
+  (SEC-08's own "GC reclaims the damage once the attack stops and the
+  frontier advances," verified end to end — see the DoD paragraph below).
+  A tripped breaker is checked as writePath.ts's new **Step 0**, ahead of
+  EVEN authorization (Step 1) — deliberately: "failing CLOSED protects
+  other participants' clients" means literally NO session may write while
+  tripped, including the document's own OWNER, which a role-based check
+  alone could never enforce. Rejected with `RejectReason.DOCUMENT_LOCKED`
+  (API Spec §3.5.8's already-existing 0x07 code — reserved since Phase 7,
+  never used until this phase; its own doc comment's "document state"
+  category is exactly what this is) — no new protocol surface needed for
+  either of this phase's two rejection paths, since both 0x05 and 0x07
+  were sitting unused, seemingly reserved for exactly this.
+
+  **Connection-level rate limiting (RFC §8.8: "per IP and per account")**
+  — a NEW `InMemoryRateLimiter` instance, one per `Gateway`, checked at
+  the very top of `wss.on("connection", ...)`, BEFORE any HELLO parsing:
+  per-IP (keyed by `req.socket.remoteAddress`, no `X-Forwarded-For`
+  trust — this project has no reverse-proxy deployment story yet) always
+  applies once configured; per-ACCOUNT applies only once a real ticket
+  has been consumed (`gateway.ts`'s `realIdentity`), since there is no
+  "account" to key on before that — a server with no `auth` deps skips
+  the per-account half entirely, the same conditional-on-real-auth
+  pattern Phase 29's ticket validation already established. A rejected
+  connection gets a real CONTROL-channel ERROR frame — a NEW `ErrorCode`
+  value, `RATE_LIMITED = 3` (`controlMessages.ts`'s own doc comment
+  explicitly invited a third value: "a later phase needing a THIRD code
+  should extend this enum, not invent a separate one") — then closes
+  1008, mirroring `rejectHandshake`'s own send-then-close ordering.
+  `ConnectionRateLimitConfig` is optional on `CreateGatewayDeps`/
+  `CreateCollabServerDeps` (`undefined` disables it), the same pattern as
+  every other Phase 30 config; `index.ts`'s real path always supplies it.
+
+  **The bounded causal buffer (RFC §8.7, Test Plan SEC-11i: "bounded in
+  size AND age")** extends `offlineWindowScheduler.ts`'s existing sweep
+  (Phase 24's own age-based eviction, unchanged) with a SIZE bound in the
+  SAME pass over `engine.pending` — a new, optional
+  `OfflineWindowConfig.maxPendingPerDocument` field (default 5,000,
+  `DEFAULT_MAX_PENDING_PER_DOCUMENT`, exported from config.ts; optional,
+  unlike this interface's other two fields, specifically because dozens
+  of PRE-EXISTING tests already construct an `OfflineWindowConfig`
+  literal with only the original two fields — making this required would
+  have forced updating every one of them for a bound none of them
+  exercise). Once `engine.pending.length` exceeds the cap, the OLDEST
+  entries (by `pendingFirstSeenAtMs`, independent of whether they're
+  still within their own age-based grace period) are evicted first, via
+  the SAME `rejectPending`/`sendOpReject` mechanism the age-based path
+  already uses, reusing `RejectReason.RATE_LIMITED` (a capacity-driven
+  eviction is a rate/load-protection rejection in every sense that
+  matters to a client receiving it — no new code needed, matching this
+  phase's own "reuse, don't invent" theme for `RejectReason`).
+
+  **SEC-09 ("explicitly verify that the attack's scattered-position
+  pattern defeats block encoding") — a REAL redesign was needed here
+  too, and a genuine discrepancy from this document's own prior
+  disclosure was found and corrected.** CLAUDE.md's own Open Item 5 (from
+  the Fugue-port investigation, 2026-09-05) stated `snapshotBody.ts`'s
+  block run-length wire format still "needs a full from-scratch redesign
+  for a tree structure." Checking the file directly this phase found that
+  redesign had, in fact, ALREADY been completed (Phase 25's own Bug 3 fix
+  — "genuinely redesigned, not merely renamed, for a tree structure" —
+  see that phase's own CLAUDE.md account) — a real Fugue-native "chain"
+  block format exists today, grouping a maximal run of consecutive-
+  counter, same-replica, `parent`-chained nodes into one block. Open Item
+  5 is hereby retracted as stale, not still open; this document's own
+  "green isn't evidence until checked" discipline applied here to ITS OWN
+  prior claim, not just to code. New tests
+  (`packages/protocol/src/snapshotBody.test.ts`) measure, with REAL
+  numbers: a realistic prose fixture (88 sequential-typed characters)
+  compresses to exactly **1 block** (an 88x ratio for this fixture); the
+  SEC-08 attack workload (200 scattered insert-then-delete operations,
+  seeded/deterministic) compresses to **exactly 200 blocks — a measured
+  1.00x ratio**, confirming block encoding provides NO mitigation for
+  this specific attack shape, exactly as SEC-09 asks to be verified.
+  Phase 20's own retired "prose ~5.5x" figure is NOT re-asserted here —
+  it was measured against the pre-Fugue YATA-era block format this
+  project no longer uses, and is cited in the new test only as historical
+  context, never as a number being re-verified.
+
+  **SEC-10 ("the attack propagates to peers ... assert peer client
+  memory rises correspondingly, and that the circuit breaker bounds
+  it")** — verified with two REAL, independent `Engine` instances (one
+  attacker, one peer) connected to the same in-memory coordinator, the
+  peer's engine fed ONLY through the coordinator's own real broadcast
+  relay (never a direct reference to the attacker's or coordinator's own
+  engine) — standing in for what a real peer `SyncClient` actually
+  receives and integrates. `peerEngine.stats().totalElements` is asserted
+  equal to the coordinator's own structure size after EVERY exchanged
+  operation, not just at the end, and is confirmed to STOP growing
+  entirely — together with the coordinator's own structure size — the
+  instant the circuit breaker trips and further attacker operations are
+  rejected `DOCUMENT_LOCKED` before ever reaching the broadcast step at
+  all. `engine.stats().totalElements` is used as this project's own
+  established memory proxy (each node ≈ fixed per-node memory cost — the
+  same metric Phase 20/21's own compression/GC accounts already treat as
+  the meaningful unit), not a literal process-memory measurement.
+
+  **SEC-11h ("an operation replayed from a capture is absorbed
+  idempotently and changes nothing")** — verified by literally capturing
+  one operation's real wire bytes (`encodeFrame`), sending them through
+  `processIncomingOperation` TWICE, and confirming the SECOND delivery
+  changes neither the document's text nor its node count. Engine Spec
+  §6.3's own idempotence guarantee (Phase 3, exercised by every fuzz/
+  property/mutation suite this project has ever run) is what actually
+  absorbs this — this test's own scope is proving that guarantee holds
+  reached THROUGH the full write path, not re-verifying the engine-level
+  mechanism itself. A resent operation's own DUPLICATE-ROW suppression at
+  the database layer (`operations_stamp_uq`'s SAVEPOINT-based dedup) is a
+  separate, already-covered concern (Phase 16's own `durability.db.test.ts`
+  DoD test) — deliberately not re-asserted here.
+
+  **SEC-11j ("presence for a document the caller cannot access is never
+  delivered") is explicitly, deliberately SKIPPED, exactly as the
+  reference text names — "not testable yet, presence doesn't exist until
+  Phase 31."** No presence message types or broadcast mechanism exist
+  anywhere in this codebase yet (unchanged since Phase 8's own original
+  scoping) — deferred to Phase 31's own verification, not silently
+  dropped from this phase's Definition of Done.
+
+  **The Fugue O(N²)-vs-rate-limiter question, asked directly by this
+  phase's own reference material — answered with a real, bounded
+  measurement, not speculation.** A new benchmark
+  (`packages/testkit/src/benchmark/attackWorkload.ts`/
+  `.bench.test.ts`, `pnpm test:benchmark`) builds a document via the
+  EXACT SEC-08 attack shape (scattered insert-then-delete, not
+  sequential typing — a deliberately DIFFERENT workload than
+  `scaling.ts`'s own worst-case chain, since this project's own
+  discipline is to measure the specific scenario in question, not assume
+  a different one's numbers transfer) up to sizes 500/2,000/4,000 nodes
+  — the same practical scale ceiling Phase 25's own M8-a benchmark
+  already established under Fugue's disclosed O(N²) cost (true numbers
+  at tens-of-thousands-of-nodes scale and beyond remain genuinely
+  UNKNOWN, the SAME still-open Item 3 gap, not newly discovered here).
+  **Measured, real numbers**: at structure size ≈800, p95 per-op cost
+  0.051ms (implied throughput ceiling ≈19,763 ops/s); at ≈2,300, p95
+  0.115ms (≈8,703 ops/s); at ≈4,300, p95 0.096ms (≈10,417 ops/s). At
+  every measured scale, accepting the FULL 200 ops/s per-session cap
+  would consume only **1.0-2.3% of the per-op-cost-implied throughput
+  ceiling** — the rate limiter engages with enormous headroom at every
+  practical scale this project can currently measure. **The honest,
+  disclosed limit of this finding**: since Phase 25's own account
+  measured per-op cost growing from the pre-existing scaling.ts's own
+  0.031ms/op at N=500 to 0.069ms/op at N=4,000 under a WORSE (pure
+  sequential-append) workload, a naive linear extrapolation of THAT
+  growth curve out to structure sizes near this phase's own circuit-
+  breaker ceiling (200,000 nodes) would still leave real, if reduced,
+  headroom under the 200 ops/s cap — but this is an extrapolation from a
+  different, worse-case workload's own measured trend, not a real
+  measurement at that scale, and is disclosed as exactly that: a
+  reassuring signal, not proof. The circuit breaker's own hard ceiling is
+  what actually bounds the worst case regardless of how per-op cost
+  trends at scales this project cannot yet practically measure.
+
+  **A real test-harness bug found and fixed while building this phase's
+  own connection-rate-limit test, not a product bug** — `gateway.test.ts`'s
+  new SEC-08/RFC-§8.8 test initially hung indefinitely (5-second Vitest
+  timeout) despite the SERVER behaving completely correctly (confirmed via
+  temporary diagnostic instrumentation: the connection-count sequence, the
+  ERROR frame, and the 1008 close all arrived exactly as expected). The
+  actual cause: the test's OWN cleanup code called `.close()` on two
+  already-open client sockets and awaited both `waitForClose()` promises
+  sequentially — the SECOND of the two never resolved, for reasons not
+  further root-caused (a real, if narrow, closing-handshake race under
+  this specific test's own three-connections-on-one-port shape, not
+  reproduced by any other existing test in this file). Fixed not by
+  chasing that race, but by removing the unnecessary manual cleanup
+  entirely: `afterEach`'s own `server.close()` already calls
+  `Gateway.close()`, which `ws.terminate()`s every still-open connection
+  itself — exactly the same pattern every OTHER test in this file already
+  relies on, and the manual close/await pair this new test had added was
+  the one thing making it behave differently. Recorded here per this
+  project's own "report the real cause, not a plausible-sounding one, and
+  disclose what wasn't fully chased" discipline (Phases 5/7/14/20/24's own
+  precedent) — the underlying double-close race itself remains
+  unexplained and unfixed, but is now understood to be a TEST-ONLY
+  artifact (every production code path already tears down sockets via
+  `Gateway.close()`'s own sweep, never via a test's own manual
+  close-and-await pair), not a server defect worth chasing further under
+  this phase's own scope.
+
+  **A new, read-only `GET /v1/documents/:documentId/security-status`
+  endpoint** (`httpApp.ts`, mirroring `/gc-status`/`/audit-runs`'s own
+  established pattern exactly — 404 for no live coordinator, nothing here
+  TRIGGERS anything) exposes `circuitBreakerTripped`/`structureSize`/
+  `tombstoneCount`/the three configured thresholds for observability.
+  `documents.structure_size`/`tombstone_count` (the DURABLE columns,
+  Phase 15's own schema) remain UNWRITTEN by any code path — this
+  phase's own circuit breaker and alert thresholds are evaluated
+  entirely from the LIVE `engine.stats()` (O(1), reactive, no DB round
+  trip on the hot path), not from those columns; the pre-existing,
+  already-disclosed gap (Phase 27's own CLAUDE.md account: "no code path
+  anywhere in this project currently WRITES these two columns") is
+  UNCHANGED by this phase, not newly closed — disclosed explicitly here
+  rather than silently left implied-fixed by this phase's own new
+  security-adjacent work living nearby.
+
+  **DoD verification, all against the real, merged code**: `pnpm -r exec
+  tsc --noEmit` clean across all 6 packages; `pnpm eslint` clean for
+  every file this phase touched; the full default `pnpm test` — **515
+  tests across 58 files, 512 passing, 2 disclosed pre-existing skips,
+  1 single-run failure** (`passwordHash.test.ts`'s Argon2id timing test,
+  confirmed via isolated re-run — 5/5 passing standalone — to be CPU
+  contention from a concurrently-running 160-second `fugueTree.crosscheck`
+  test in the same full-suite run, not a regression; Phase 26 code,
+  untouched by this phase, the same class of finding Phase 29's own
+  session already documented for this identical file). The five
+  `db/*.db.test.ts` files most exercising this phase's own shared-file
+  changes (`documentCoordinator.ts`, `writePath.ts`, `gateway.ts`) —
+  `documents`, `permissions` (including its own real 50-concurrent-
+  request SEC-07 burst), `auth`, `durability`, `tickets` — all re-run
+  clean together, **42/42**, against a real Postgres instance. Two
+  ALREADY-DISCLOSED, pre-existing, unrelated failures were reconfirmed,
+  not newly caused: `snapshots.db.test.ts`'s 50,000-operation warm-start
+  budget (measured 59.1s against a 2s budget) and its own latency-
+  comparison test (30s timeout) — both the SAME Fugue O(N²) finding
+  Phase 27/28's own CLAUDE.md accounts already attribute to Open Item 3,
+  confirmed via `git status` that this phase's own diff never touches
+  `snapshotter.ts`/`operationStore.ts`/`engine.ts`, the files that test
+  actually exercises. `pnpm --filter @collab-editor/client run
+  test:reconnection` — 35/36, the one failure being RC-27's own already-
+  extensively-documented, pre-existing Fugue O(N²) timing flake
+  (CLAUDE.md's own Open Item 7) — confirmed NOT attributable to this
+  phase: `reconnection.test.ts` never constructs a coordinator with
+  `RateLimitConfig`/`ConnectionRateLimitConfig` supplied (op-rate-limiting
+  and connection-rate-limiting both stay OFF, this phase's own default),
+  so none of this phase's new checks activate on that suite's own path at
+  all — the failure is the identical `waitForState` timeout signature
+  this project has documented for this exact test since Phase 24.
+
+  **What is deliberately NOT built this phase**: `documents.structure_size`/
+  `tombstone_count`'s own durable persistence (see the security-status
+  endpoint paragraph above — this remains a pre-existing, disclosed,
+  UNCHANGED gap, not newly introduced or newly closed); any client-side
+  (`SyncClient`) reaction to a rate-limit-triggered disconnect beyond
+  what the EXISTING generic reconnect/backoff machinery already does —
+  `GoodbyeReason`/the WS close code are both real signals on the wire,
+  but `syncClient.ts`'s own `onClose`/`"goodbye"` handling still ignores
+  both uniformly (a PRE-EXISTING gap, Phase 27's own account already
+  notes `retryAfterMs` is written by the server but never read anywhere
+  client-side — unchanged by this phase, since a malicious/misbehaving
+  client's own backoff behavior is never something the SERVER'S defenses
+  should depend on trusting anyway); UI for any of this
+  (`ConnectionIndicator.tsx`/`EditorView.tsx` untouched) — the real
+  server-side capability this phase builds is what a future UI phase
+  would surface (e.g. a "you're editing too fast" or "this document is
+  temporarily read-only" banner), the same "build the real capability
+  now, a future phase wires up the UI" precedent this project has
+  followed since Phase 24's `offlineWindowStatus`; Option 1's own
+  structurally-safe GC/undo-horizon redesign (Open Item 9, unrelated to
+  this phase's own scope, still deliberately deferred to its own future
+  session); multi-instance/horizontal-scaling-aware rate limiting — every
+  limiter in this phase is `InMemoryRateLimiter`, per-process, the SAME
+  disclosed scoping limitation `AuthConfig`'s own login-rate-limiting
+  fields already carry (Phase 26) and every other piece of this project's
+  in-memory server-side state shares.
+
+## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
+
+This entry documents a real, load-bearing investigation that happened AFTER
+Phase 30's own initial merge described above — the phase's two core
+defenses (SEC-08's "then disconnect," and SEC-11i's bounded causal buffer)
+were each found, by actually running the real attack rather than trusting
+the unit-level tests, to not actually work end to end. Both are now fixed,
+verified empirically, and locked in with permanent regression tests. This
+does not replace anything in the Phase 30 entry above — it is the
+continuation of that same phase's own DoD closeout.
+
+### The empirical measurement that found both gaps
+
+Per direct instruction ("I need this actually tested, not just reasoned
+about theoretically"), the real SEC-08 scenario was built and run: a real,
+authorized client (a real `Engine`, a real server-assigned replica id, a
+real HELLO/WELCOME handshake) sending ~500-600 real insert-then-delete
+operations/second at scattered positions, against a real
+`createCollabServer()`, for 15+ real seconds. Critically, the attacker ran
+in a SEPARATE OS process from the server — an earlier, same-process version
+of this measurement had conflated the attacker's own client-side CPU cost
+with the server's, and was corrected before any conclusion was drawn from
+it (see the methodology note below).
+
+**Finding 1 — the disconnect trigger never fired, in any run, ever, up to
+20 real seconds of sustained attack.** Direct instrumentation of
+`recordRateLimitViolation` showed `sustainedTrue: 0` across ~6,000 calls.
+Root cause, not a fluke: the original design required a session's
+op-rate-limit violations to be CONTINUOUS — zero acceptances — for a full
+`perSessionSustainedViolationMs` (1000ms) window before disconnecting. But
+a sliding-window-log rate limiter that is successfully THROTTLING an
+attacker, by definition, keeps admitting `perSessionRule.max` messages per
+`perSessionRule.windowMs` forever (that is what "throttle" means), and
+every acceptance called `clearRateLimitViolation`, resetting the streak
+clock to zero. Since acceptances happen roughly every `windowMs/max`
+(≈5ms at the real 200/1000ms default) — far more often than the 1000ms
+sustained-violation window — the streak could structurally never
+accumulate to the threshold. "Successfully throttle" and "require zero
+acceptances for a full second" are mutually exclusive as that design was
+coded; this was not a rare edge case, it was the guaranteed outcome for
+ANY sustained attacker the limiter was actually able to throttle at all.
+
+**Finding 2 — the vast majority of rate-limit-ACCEPTED operations never
+actually integrated, and the resulting `engine.pending` buffer grew
+unboundedly** (reaching ~2,600 in a 15-second run) because
+`offlineWindowScheduler.ts`'s sweep — which enforces both the 30-second
+age-out AND Phase 30's own `maxPendingPerDocument=5000` size cap — was
+NOT running at all: `createCollabServer()` never started it; only
+`index.ts`'s direct-run production path did (the same "no test needs to
+remember to stop it" reasoning already applied, correctly, to the GC and
+audit schedulers — but applied here too, INCORRECTLY, without separately
+checking whether this scheduler's own absence was actually safe the way
+GC/audit's absence is). The mechanism behind the growth: the client's own
+causal chain has some operations rejected (rate-limited) and others
+accepted; an accepted operation whose parent was one of the rejected ones
+can never resolve, and sits in `pending` forever without the sweep
+running to evict it. At the observed ~170/s growth rate, a real
+deployment that forgot to start this scheduler (every test, and any
+integration relying on `createCollabServer()`'s own defaults) would blow
+past the 5,000-entry cap in under 30 seconds of sustained abuse.
+
+Both fixes were designed, hand-traced against two specific non-regression
+cases, approved, then implemented and verified — in that order, per this
+project's own standing discipline.
+
+### Fix 1 — the disconnect trigger, redesigned around rejection VOLUME, not an unbroken streak
+
+`RateLimitConfig.perSessionSustainedViolationMs: number` → replaced with
+`perSessionDisconnectRule: RateLimitRule` (the same `{max, windowMs}`
+shape as `perSessionRule`/`perDocumentRule`). `recordRateLimitViolation`
+now reuses the SAME `InMemoryRateLimiter.consume()` mechanism
+`checkOpRateLimit` itself already uses, under a second, independent key
+(`violation:<sessionId>`):
+
+```ts
+recordRateLimitViolation(sessionId: string, nowMs: number = Date.now()): boolean {
+  const config = this.rateLimitConfig;
+  if (!config) return false;
+  return !this.opRateLimiter.consume(`violation:${sessionId}`, config.perSessionDisconnectRule, nowMs);
+}
+```
+
+An accepted message no longer resets anything — only real time aging old
+violations out of the rolling window ever lowers this count, so a session
+under CONSTANT heavy rejection (regardless of how many messages happen to
+slip through) still accumulates toward disconnect. `clearRateLimitViolation`
+and its call site in `writePath.ts` were removed entirely (no longer
+needed — the rolling window self-decays). Document-scope violations still
+never trigger this — unchanged, only `"session"`-scope results ever call
+it, since a document-wide trip says nothing about which session is at
+fault.
+
+**Default**: `perSessionDisconnectRule = {max: 200, windowMs: 1000}` — the
+SAME numbers as `perSessionRule` itself. Reading: disconnect once a
+session's rejection RATE has reached parity with its own entire allowed
+ACCEPTANCE-rate cap within one second — a strong, unambiguous signal of
+sustained, overwhelming abuse.
+
+**Hand-traced, then confirmed under real execution (new permanent tests,
+`gateway.test.ts`)**:
+- The real SEC-08 attack shape (500+/s): session cap saturates in well
+  under half a second; violations then accumulate at ~300-400/s; the
+  violation limiter itself (also 200/1000ms) saturates in under a second
+  more. **Real measured result: disconnected in 92-171ms** across three
+  repeated empirical re-runs (median ~120ms) — a dramatic improvement
+  over "never," not merely "eventually."
+- A large legitimate paste (500 characters, one `OP_INSERT_RUN` — Phase
+  12/24's wire coalescing) under an artificially tight cap (max=1/60s):
+  counts as exactly ONE message, never approaches either rule. Confirmed
+  via a real WebSocket connection receiving a real ack, socket staying
+  open — `gateway.test.ts`'s "a large legitimate paste is NEVER
+  penalized..." test.
+- A legitimate, non-batchable burst MODERATELY over the cap (~70 msgs/s
+  for 2 real seconds against a 50/1000ms cap — only ~20/s of genuine
+  excess): violations accumulate at ~20/s, nowhere near the 50/1000ms
+  disconnect threshold. Confirmed via a real WebSocket connection that
+  stays open and never receives a GOODBYE — `gateway.test.ts`'s "a
+  legitimate, non-batchable burst MODERATELY over the cap..." test.
+
+### Fix 2 — the offline-window sweep, now started unconditionally by `createCollabServer()` itself
+
+Unlike the GC and audit schedulers (which deliberately stay OUT of the
+shared factory — every test constructing its own server directly would
+otherwise need to remember to stop them, and their own absence is a
+"nice to have liveness metric" gap, not an exploitable one: GC not
+running just means tombstones accumulate, already bounded by the circuit
+breaker; audit not running is pure observability loss), the offline-window
+sweep is now started by `createCollabServer()` itself, always, for every
+server this factory ever constructs. This is a deliberate, disclosed
+EXCEPTION to the GC/audit pattern, not a copy of it: this scheduler's own
+absence is exploitable (unbounded `engine.pending` growth, defeating
+SEC-11i's own "bounded in size AND age" promise), and — unlike GC/audit —
+it is cheap and safe to always run (fully synchronous, in-memory, no
+database I/O whatsoever).
+
+`config.ts` gained `DEFAULT_OFFLINE_WINDOW_CONFIG` (built from the same
+underlying `DEFAULT_OFFLINE_WINDOW_*` constants `loadConfig()` already
+used, avoiding a second, independently-maintained copy — the same pattern
+`DEFAULT_CIRCUIT_BREAKER_CONFIG` already established). `CreateCollabServerDeps`
+gained an optional `offlineWindow` field; `createCollabServer()` always
+calls `startOfflineWindowScheduler(gateway, deps.offlineWindow ??
+DEFAULT_OFFLINE_WINDOW_CONFIG)`, stores the handle, and calls its
+`.stop()` inside `close()` — safe to do unconditionally since the
+scheduler's own `timer.unref()` was already in place (Phase 24), so this
+adds no new "tests must remember to clean this up" burden. `index.ts`'s
+direct-run block no longer starts this scheduler itself (would otherwise
+run TWO independent, redundant timers on the same coordinators) — it now
+just threads the real `config.offlineWindow` through
+`createCollabServer()`'s own deps instead.
+
+Confirmed safe against the two test files that manually drive
+`runOneDocument` at custom intervals for full control
+(`securityLimits.test.ts`'s SEC-11i test, `soak.db.test.ts`) — both
+construct `DocumentCoordinator` directly, never through
+`createCollabServer()`, so neither is affected by this change at all.
+
+**Verified under real execution, properly isolated (the same empirical
+re-run methodology, against the real production defaults)**: `engine.pending`
+sampled every 250ms throughout a full attack window stayed at **0** the
+entire time (the disconnect now fires so fast — under 200ms — that almost
+nothing has a chance to accumulate in the first place; the sweep is the
+backstop for whatever amount DOES, e.g. a slower or more sophisticated
+attacker that stays just under the disconnect threshold).
+
+### Methodology note — the empirical measurement's own first version was corrected before being trusted
+
+The FIRST version of this empirical test ran the attacker's own
+send-loop in the SAME Node process as the server under test — this
+conflated the attacker's own client-side CPU cost (JSON/binary encoding,
+`Engine` mutations, `ws.send()` calls in a tight loop) with genuine
+server-side event-loop unresponsiveness. Concurrent HTTP-probe latency to
+an unrelated document initially measured p95≈200ms/max≈460ms under this
+flawed methodology — before any conclusion was drawn, the attacker was
+moved to a genuinely separate OS process (spawned via `child_process.spawn`,
+a plain script importing only `ws`/`@collab-editor/protocol`/
+`@collab-editor/engine`, never this package's own `server.ts`/`tokens.ts`
+chain) and the measurement was re-run. Corrected numbers: p50≈2ms,
+p95≈4-25ms (one occasional single spike up to ~90ms), essentially
+indistinguishable from idle — confirming Fugue's own per-op cost never
+gets a chance to compound at the tiny structure sizes (~115-150 nodes)
+the now-fast disconnect keeps the attack confined to. This is the same
+"verify the measurement apparatus before trusting its output" discipline
+this project applied to its own delay-relay test infrastructure back in
+Phase 14 — a flawed measurement is not evidence, even when it happens to
+point toward a plausible-sounding conclusion.
+
+### New permanent regression coverage
+
+- `securityLimits.test.ts`: the `recordRateLimitViolation`/
+  `processIncomingOperation` tests rewritten for the new volume-based
+  mechanism, plus a new dedicated test proving a legitimate,
+  moderately-over-cap burst is never disconnected.
+- `gateway.test.ts`, new describe block "SEC-08 real attack scenario:
+  sustained scattered insert-then-delete DOES get the attacker
+  disconnected" — three tests: the real attack (asserts the actual close
+  code `4002` and `GoodbyeReason.EVICTED`, not merely "was throttled" —
+  this is the permanent version of the empirical finding, closing the
+  exact gap the investigation found), the large-paste non-regression
+  case, and the moderate-burst non-regression case — all three real
+  WebSocket connections against a real server.
+- `db/tickets.db.test.ts`, new describe block "per-ACCOUNT WebSocket
+  connection rate limiting, over the real wire, with real auth" — the
+  one piece of this phase's own original DoD ("connection rate limits
+  per IP AND account") that had config-level plumbing and a per-IP test
+  but no test actually exercising the per-account rejection path (which
+  structurally requires real auth deps + a real, single-use ticket per
+  attempt — only this file's own real-Postgres setup has that). Three
+  real tickets issued for the same real account, two admitted, the third
+  rejected with a real `ERROR{RATE_LIMITED}` and a real 1008 close.
+
+### DoD verification
+
+`pnpm -r exec tsc --noEmit` and `eslint` clean on every touched file.
+Full default `pnpm test`: 517/519 (2 disclosed skips), clean exit, no
+hang/leaked-timer warnings, confirmed via two full runs. `pnpm
+test:reconnection`: one run hit RC-27's own already-documented ~120s
+timing flake (Open Item 7); a direct A/B (the real offline-window
+scheduler temporarily disabled vs. enabled) reproduced the IDENTICAL
+~120-125s failure signature in BOTH configurations, confirming this is
+the pre-existing, machine-load-sensitive flake, not a regression from
+either fix — a subsequent clean run (36/36) confirmed the mechanism
+still works correctly once the machine wasn't under concurrent load from
+this session's own repeated benchmark runs. The five most relevant
+`db/*.db.test.ts` files (`documents`, `permissions` — including its own
+real 50-concurrent-request SEC-07 burst, `durability`, `auth`, `schema`,
+`tickets`) re-run clean together, 50/50, against a real Postgres
+instance. The two files known to time out entirely at 100,000-operation
+scale (`audit.db.test.ts`, `gc.db.test.ts` — the same already-disclosed
+Fugue O(N²) finding, Open Item 3, unrelated to and untouched by either
+of today's fixes) were not re-run to completion — consistent with this
+project's own established precedent (Phase 27/28's identical treatment)
+of not re-chasing an already-disclosed, unrelated, pre-existing gap on
+every touching phase.
+
 ## 🛑 CRITICAL, OPEN, UNRESOLVED FINDING — READ THIS FIRST (2026-09-05)
 
 **The core convergence guarantee is currently known to be BROKEN under
@@ -6673,20 +7247,33 @@ workspace — it did not.
    just this file's own record of what changed. Flagged as its own
    deliberately-deferred item, not attempted this session.
 
-5. **`packages/protocol/src/snapshotBody.ts`'s block run-length wire
+5. **✅ RETRACTED 2026-09-10 (Phase 30) — this redesign was already
+   completed and this item was stale.** Checking `snapshotBody.ts`
+   directly while building Phase 30's own SEC-09 test found a real
+   Fugue-native "chain" block format already in place (Phase 25's own
+   Bug 3 fix — "genuinely redesigned, not merely renamed, for a tree
+   structure," per that phase's own CLAUDE.md account) — this item's own
+   claim that the redesign "still needs" doing was simply never updated
+   once it was actually done. Original text, kept for historical
+   accuracy of what this item used to say, not because it's still
+   true: "`packages/protocol/src/snapshotBody.ts`'s block run-length wire
    format needs a full from-scratch redesign for a tree structure, not a
-   field rename** — folded into item 1 above but worth calling out
+   field rename — folded into item 1 above but worth calling out
    separately since it's a different KIND of work. Phase 20's block
    encoding (`Block`/`canFollowInBlock`/`decodeBlock`, and the compression
    benchmark `packages/testkit/src/benchmark/compression.ts`/
    `.bench.test.ts`) was built entirely around YATA's flat, consecutive-
    counter node storage and has already been deleted outright (not
    adapted) as part of this session's Fugue merge — there is no
-   Fugue-tree analogue of "a maximal run of consecutive-counter,
-   same-replica nodes" to fall back on. SNAPSHOT's structure-form body
+   Fugue-tree analogue of 'a maximal run of consecutive-counter,
+   same-replica nodes' to fall back on. SNAPSHOT's structure-form body
    will need a genuinely new design for compactly encoding a Fugue tree
    (parent/side/sibling-order) on the wire, and the compression benchmark
-   will need an equivalent new design once that format exists.
+   will need an equivalent new design once that format exists." A
+   NEW compression benchmark, specific to Phase 30's own SEC-09 needs
+   (not a re-creation of the old, retired `compression.ts`), now exists
+   in `packages/protocol/src/snapshotBody.test.ts` with real measured
+   numbers — see the Phase 30 completed-phase entry.
 
 6. **The Phase 19 index cross-check's replacement
    (`fugueTree.crosscheck.test.ts`) is deliberately NARROWER in scope
@@ -6802,6 +7389,59 @@ entry (see the Phase 25 final report, same date, for the complete DoD
 status and v0.2.0-m2 tag readiness determination).
 
 ## Current phase in progress
+
+**Phase 30 (Rate limiting, circuit breaker, and the security suite) —
+COMPLETE as of 2026-09-11 (empirically verified, not just unit-tested).
+Milestone M3, tag `v0.3.0-m3` on merge.** See the "✅ PHASE 30 UPDATE
+(2026-09-11)" section immediately below for the full account of a real
+empirical measurement (a real attacker in a real, separate process,
+sustained for 15-20 real seconds) that found the phase's own two most
+important defenses were dead code end to end despite passing their own
+unit tests: the disconnect trigger never fired against ANY sustained
+real attacker (a structural design flaw — "successfully throttle" and
+"require zero acceptances for a full second" are mutually exclusive),
+and the offline-window sweep that bounds the causal buffer wasn't
+running at all under `createCollabServer()`'s own default construction,
+letting `engine.pending` grow unboundedly. Both are now fixed (a
+rejection-VOLUME-based disconnect trigger, reusing the existing rate
+limiter's own class; the sweep started unconditionally by the shared
+server factory itself), hand-traced against two non-regression cases
+(a legitimate large paste, a legitimate moderately-over-cap burst — both
+confirmed under real execution, not just on paper), and locked in with
+permanent regression tests asserting the REAL disconnect happens, not
+merely "was throttled." Real re-measured result: the attacker is now
+disconnected in 92-171ms, down from never.
+
+`writePath.ts`'s step 3 (rate check) is now real — per-session AND
+per-document op-rate limiting, counted per incoming MESSAGE (not per
+expanded operation, a deliberate design choice — see the "Phase 30"
+bullet in the Completed Phases list above for why), with sustained
+per-session violation leading to a real disconnect (redesigned as of the
+2026-09-11 update above — see that section for why the original design
+never actually triggered). A document-wide
+circuit breaker (always active, unlike the opt-in rate limiter) trips at
+a structure-size ceiling and makes the document read-only for literally
+everyone, including its own owner, self-healing once GC reclaims enough
+tombstones. Connection-level per-IP/per-account limiting now guards the
+raw WebSocket handshake itself. SEC-09's own block-encoding-non-mitigation
+claim is verified with real measured numbers (88 nodes → 1 block for
+prose; 200 attack nodes → 200 blocks, a 1.00x ratio) — and this same
+verification found CLAUDE.md's own prior Open Item 5 was stale (the
+Fugue-native chain block redesign it described as still-needed had
+already been completed in Phase 25), now retracted. A real benchmark
+answers the phase brief's own explicit Fugue-O(N²)-vs-rate-limiter
+question with measured numbers, not speculation: at every practical
+scale this project can currently build (up to ~4,300 nodes), the 200
+ops/s cap consumes only 1.0-2.3% of the per-op-cost-implied throughput
+ceiling. See the "Phase 30" bullet in the Completed Phases list above
+for the full account, including the real (test-only) hang bug found and
+fixed while building the connection-rate-limit test, and exactly what
+remains deliberately unbuilt (structure_size/tombstone_count's own
+durable persistence is UNCHANGED, still not written by any code path;
+SEC-11j is explicitly deferred to Phase 31's own verification, per the
+reference material's own instruction). No open item from this phase
+blocks anything — the next phase to pick up is whichever one builds
+PRESENCE (Phase 31) or cursor transformation (Phase 32).
 
 **Phase 29 (WebSocket admission tickets and live revocation) — COMPLETE as
 of 2026-09-10.** HELLO's `ticket` field is now genuinely validated —
@@ -6988,6 +7628,23 @@ rate) — it was under suspicion early in that investigation and is now
 cleared.
 
 ## What is explicitly NOT yet built
+
+**Metadata-exhaustion defenses (RFC §8.2 (T2), §8.7, §8.8) are now BUILT
+as of Phase 30** — per-session/per-document op rate limiting, a
+document-wide circuit breaker, per-IP/per-account connection limiting,
+and a size-bounded causal buffer. See that phase's own Completed Phases
+entry for the full account. What remains genuinely unbuilt from that
+same threat area: `documents.structure_size`/`tombstone_count`'s own
+DURABLE persistence (Phase 15's own schema columns) — still never
+written by any code path, unchanged by Phase 30, which evaluates its
+own circuit breaker entirely from the live, in-memory `engine.stats()`
+instead; any client-side (`SyncClient`) special-casing of a rate-limit
+disconnect (the wire signals — `GoodbyeReason`/the WS close code/
+`retryAfterMs` — all exist, but `syncClient.ts`'s own generic reconnect/
+backoff machinery still ignores all of them uniformly, a pre-existing
+gap Phase 27's own account already noted for `retryAfterMs`
+specifically); and any UI surfacing any of this (rate-limited/read-only
+states) to a real user.
 
 Undo/redo's real resurrection semantics beyond Undelete's structural
 inverse (Phase 36). Tombstone garbage collection is now BUILT (Phase 21,
@@ -7831,7 +8488,7 @@ pnpm test:properties   # the property-based suite ONLY — PROP-1..5, 10,000 gen
 pnpm test:adversarial  # the adversarial suite ONLY — ADV-01..22, hand-constructed, also part of `pnpm test`
 pnpm test:mutation     # the mutation matrix — ten mutants x four suites, MUT-KILL-01 at a small sanity budget
 pnpm test:index        # PositionIndex reference cross-check ONLY — 10,000 seeds vs. a linear-scan oracle (Phase 19, Test Plan §2.6 I6)
-pnpm test:benchmark    # testkit's scaling/compression/GC-safety-cap benchmarks (Phases 19-21) PLUS client's keystroke-latency benchmark (Phase 22) — real numbers in docs/benchmarks.md and this file's own Phase 22 entry
+pnpm test:benchmark    # testkit's scaling/compression/GC-safety-cap/attack-workload benchmarks (Phases 19-21, 30) PLUS client's keystroke-latency benchmark (Phase 22) — real numbers in docs/benchmarks.md and this file's own Phase 22/30 entries
 pnpm test:db           # schema (Phase 15) + write-path/durability (Phase 16) suites — requires a real, migrated Postgres
 pnpm test:reconnection # the RC-* reconnection matrix ONLY (Phase 23, Test Plan §5.1) — 27-cell matrix + RC-27/28/33/34, many real WebSocket reconnects, several minutes
 ```

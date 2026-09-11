@@ -876,5 +876,29 @@ export function createHttpApp(deps: HttpAppDeps): Express {
       tombstones: stats.tombstones,
     });
   });
+  // Phase 30 (RFC §8.2 (T2), Test Plan SEC-08) — read-only observability, the same "nothing here
+  // TRIGGERS anything" pattern as `/gc-status`/`/audit-runs` above: the circuit breaker is
+  // evaluated reactively (writePath.ts after every commit; gcScheduler.ts after every GC cycle),
+  // never by this endpoint being polled.
+  app.get("/v1/documents/:documentId/security-status", (req, res) => {
+    const coordinator = deps.getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    const status = coordinator.getSecurityStatus();
+    res.status(200).json({
+      circuitBreakerTripped: status.circuitBreakerTripped,
+      circuitBreakerTrippedAt: status.circuitBreakerTrippedAtMs
+        ? new Date(status.circuitBreakerTrippedAtMs).toISOString()
+        : null,
+      circuitBreakerReason: status.circuitBreakerReason,
+      structureSize: status.structureSize,
+      tombstoneCount: status.tombstoneCount,
+      structureSizeAlertThreshold: status.circuitBreakerConfig.structureSizeAlertThreshold,
+      structureSizeCeiling: status.circuitBreakerConfig.structureSizeCeiling,
+      tombstoneCountAlertThreshold: status.circuitBreakerConfig.tombstoneCountAlertThreshold,
+    });
+  });
   return app;
 }

@@ -9,6 +9,8 @@ import {
   encodeTextSnapshotBody,
 } from "./snapshotBody.js";
 import { ProtocolDecodeError } from "./errors.js";
+import { ByteReader } from "./bytes.js";
+import { readVarint } from "./varint.js";
 
 function sameNodes(a: readonly Node[], b: readonly Node[]): boolean {
   if (a.length !== b.length) return false;
@@ -185,5 +187,81 @@ describe("plain-text snapshot body", () => {
       ),
       { numRuns: 1_000 },
     );
+  });
+});
+
+// Phase 30 (RFC §8.2 (T2)/§8.9, Test Plan SEC-09) — "explicitly verify that the [metadata-
+// exhaustion] attack's scattered-position pattern defeats block encoding." Deliberately proves
+// the ABSENCE of a mitigation, not the presence of one, so a future engineer reading this file's
+// own chain-encoding doc comment (above) doesn't wrongly conclude blocks bound this specific
+// attack -- they compress LOCALLY-TYPED, CONTIGUOUS bursts (Definition 7.5's own chain
+// condition), which a scattered insert-then-delete script, by construction, never produces.
+function blockCountOf(nodes: readonly Node[]): number {
+  const body = encodeStructureSnapshotBody(nodes);
+  return readVarint(new ByteReader(body));
+}
+
+describe("SEC-09 — the block-encoding non-mitigation for the scattered-position metadata-exhaustion attack", () => {
+  it("realistic prose (sequential typing) compresses to noticeably fewer blocks than nodes", () => {
+    const engine = new Engine(1);
+    const prose =
+      "The quick brown fox jumps over the lazy dog. Collaborative editing requires convergence.";
+    let at = 0;
+    for (const ch of prose) {
+      engine.localInsert(at, ch.codePointAt(0)!);
+      at += 1;
+    }
+    const nodeCount = engine.nodes.length;
+    const blockCount = blockCountOf(engine.nodes);
+    // A single uninterrupted typing burst is the IDEAL case for this chain format -- MEASURED at
+    // 88 nodes -> 1 block (an 88x ratio) for this exact fixture, not "somewhat fewer" -- but the
+    // assertion below only requires meaningfully fewer blocks than nodes (a real, if generous,
+    // margin) rather than pinning that exact count, since the property SEC-09 actually cares
+    // about is the CONTRAST against the attack's own measured ~1.0x below, not a specific
+    // compression-ratio target (Phase 20's own retired YATA-era "prose ~5.5x" figure was measured
+    // against a DIFFERENT encoding this project no longer uses post-Fugue -- see CLAUDE.md's own
+    // disclosure on this point; it is cited here only as historical context, never as a number
+    // this test is re-verifying).
+    expect(blockCount).toBeLessThan(nodeCount / 2);
+  });
+
+  it("the scattered insert-then-delete attack workload compresses at ~1.0x -- essentially ONE block per node, confirming block encoding does NOT bound this attack", () => {
+    const engine = new Engine(1);
+    // A seeded PRNG (not Math.random -- this project's own engine-purity discipline doesn't
+    // apply to testkit-style test code, but determinism here is still what makes a specific
+    // numeric assertion meaningful rather than a coin flip run to run).
+    let seed = 42;
+    function nextRandom(): number {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    }
+    const ATTACK_OPS = 200;
+    for (let i = 0; i < ATTACK_OPS; i++) {
+      const text = engine.text();
+      const insertAt = text.length === 0 ? 0 : Math.floor(nextRandom() * (text.length + 1));
+      engine.localInsert(insertAt, 0x61 + (i % 26));
+      // Immediately delete something else, at a SCATTERED (unrelated) position -- SEC-08's own
+      // "insert-then-delete at scattered positions" shape -- never the character just inserted,
+      // so this never degenerates into "insert then immediately undo," which would leave the
+      // document empty rather than actually growing its structure the way the real attack does.
+      const afterInsertText = engine.text();
+      if (afterInsertText.length > 1) {
+        const deleteAt = Math.floor(nextRandom() * afterInsertText.length);
+        engine.localDelete(deleteAt, 1);
+      }
+    }
+    const nodeCount = engine.nodes.length;
+    const blockCount = blockCountOf(engine.nodes);
+    const compressionRatio = nodeCount / blockCount;
+    // "~1.0x" -- MEASURED, for this exact seeded fixture, at EXACTLY 200 nodes -> 200 blocks
+    // (ratio 1.0), not merely "close to 1" -- every single node started its own block, nothing
+    // chained at all. A generous upper-bound assertion (not a tight 1.0 pin) is used regardless,
+    // since a genuinely random scattered sequence could in principle produce the occasional
+    // two-node chain by sheer chance with a different seed; the bound stays robust to that while
+    // still failing loudly if block encoding ever DID start meaningfully compressing this
+    // workload (which would mean this test's own premise -- that scattered positions defeat the
+    // chain condition -- had silently stopped being true, e.g. after a future encoding redesign).
+    expect(compressionRatio).toBeLessThan(1.5);
+    expect(blockCount).toBeGreaterThan(nodeCount * 0.7);
   });
 });

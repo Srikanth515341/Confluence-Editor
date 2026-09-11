@@ -87,6 +87,12 @@ export async function runOneDocument(
       coordinator.gcCycleIncompleteCount += 1;
     }
 
+    // Phase 30 (RFC §8.2 (T2)) — re-evaluated after every GC cycle too, not just after each
+    // committed operation (writePath.ts's own reactive check): this is what lets a tripped
+    // circuit breaker SELF-HEAL the moment GC reclaims enough tombstones to fall back under the
+    // ceiling, with no separate "reset" action required from an operator.
+    coordinator.evaluateCircuitBreaker();
+
     const stats = coordinator.engine.stats();
     logger.info("gc.cycle", {
       documentId: coordinator.documentId,

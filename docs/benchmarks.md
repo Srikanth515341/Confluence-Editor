@@ -461,3 +461,53 @@ failures. M8-e's own DoD claims (no audit failure, tombstone ratio
 bounded, heap does not grow unboundedly, `pending` converges to 0) are
 all now confirmed true. See `tests/regression/R0013` for the full,
 updated investigation record.
+
+## Attack-workload apply-latency benchmark (Phase 30, SEC-08 — "does Fugue's own per-op cost outrun the rate limiter?")
+
+The phase brief for Phase 30 (rate limiting, circuit breaker, security
+suite; RFC §8.2 (T2)) asked directly: given Fugue's disclosed O(N²)
+sequential-insertion cost (Open Item 3, above), does a sustained
+1,000 ops/second metadata-exhaustion attack cause the server itself to
+become unresponsive due to Fugue's own per-op cost BEFORE the rate
+limiter even has a chance to throttle it?
+
+`packages/testkit/src/benchmark/attackWorkload.ts`/`.bench.test.ts`
+(`pnpm test:benchmark`) measures `Engine.localInsert`'s real per-op cost
+under the ATTACK's own actual shape — scattered insert-then-delete pairs
+at uniformly random positions, not sequential typing (a deliberately
+different, and structurally distinct, workload from `scaling.ts`'s own
+worst-case single unbroken chain) — at increasing structure sizes,
+bounded to 500/2,000/4,000 nodes: the same practical scale ceiling
+Phase 25's own M8-a benchmark (`finalMemoryLatency.bench.test.ts`)
+already established as buildable in a fast test's own real time budget
+under Fugue's disclosed O(N²) cost.
+
+**Measured, real numbers**:
+
+| Structure size (real) | Build time | p50 | p95 | p99 | max | Implied max ops/s at p95 |
+|---|---|---|---|---|---|---|
+| 800 | 86.4ms | 0.009ms | 0.051ms | 0.208ms | 2.469ms | 19,763 |
+| 2,300 | 4,475.1ms | 0.042ms | 0.115ms | 0.208ms | 2.465ms | 8,703 |
+| 4,300 | 5,515.9ms | 0.023ms | 0.096ms | 0.139ms | 2.183ms | 10,417 |
+
+At every one of these measured scales, accepting the FULL 200 ops/s
+per-session rate-limit cap (`RateLimitConfig`'s own default, config.ts)
+would consume only **1.0-2.3%** of the per-op-cost-implied throughput
+ceiling — the rate limiter engages with enormous headroom at every
+scale this project can currently measure directly.
+
+**The honest, disclosed limit of this finding**: true numbers at
+tens-of-thousands-of-nodes scale and beyond remain genuinely UNKNOWN —
+the SAME already-disclosed Open Item 3 gap, not a new one. Phase 25's
+own `scaling.ts`-adjacent measurements (a WORSE, pure sequential-append
+workload) showed per-op cost growing from 0.031ms/op at N=500 to
+0.069ms/op at N=4,000 — a naive linear extrapolation of that growth
+curve out to structure sizes near Phase 30's own circuit-breaker
+ceiling (200,000 nodes) would still leave real, if much-reduced,
+headroom under the 200 ops/s cap. This is offered as a reassuring
+signal, explicitly NOT as proof — it extrapolates from a different,
+worse-case workload's own measured trend, not a real measurement at
+that scale. The circuit breaker's own hard structure-size ceiling
+(Phase 30) is what actually bounds the worst case regardless of how
+per-op cost trends at scales this project cannot yet practically build
+and measure.

@@ -71,10 +71,14 @@ function testAuthConfig(overrides: Partial<AuthConfig> = {}): AuthConfig {
   };
 }
 
-async function buildServer(authConfig: AuthConfig = testAuthConfig()): Promise<number> {
+async function buildServer(
+  authConfig: AuthConfig = testAuthConfig(),
+  connectionRateLimit?: { perIp: { max: number; windowMs: number }; perAccount: { max: number; windowMs: number } },
+): Promise<number> {
   const server = createCollabServer({
     operationStore: new PostgresOperationStore(pool),
     auth: { pool, authConfig },
+    ...(connectionRateLimit ? { connectionRateLimit } : {}),
   });
   servers.push(server);
   return server.listen(0);
@@ -438,5 +442,41 @@ describe("Phase 29 — live revocation (SEC-04, SEC-05)", () => {
     // Fresh HELLO-time lookup finds no role at all -> SESSION_EXPIRED, not merely a downgrade.
     const rejection = await connectExpectingRejection(port, documentId, ticket);
     expect(rejection.error.code).toBe(ErrorCode.SESSION_EXPIRED);
+  });
+});
+
+describe("Phase 30 — per-ACCOUNT WebSocket connection rate limiting, over the real wire, with real auth (RFC §8.8)", () => {
+  it("rejects a connection attempt with ERROR{RATE_LIMITED} and closes 1008, once the SAME real authenticated account's own connection cap is exceeded -- checked only AFTER a real ticket is consumed", async () => {
+    // Per-IP limiting (gateway.test.ts) needs no real identity at all -- checked before HELLO is
+    // even parsed. Per-account is structurally different: it can only be checked once a real
+    // ticket has been consumed and the connecting user's own identity is known (gateway.ts's own
+    // `realIdentity`), which requires the real Postgres-backed auth stack this file already
+    // builds for Phase 29's own ticket tests. A generous perIp cap keeps that OTHER limiter from
+    // ever tripping first and confounding this test.
+    const port = await buildServer(testAuthConfig(), {
+      perIp: { max: 1000, windowMs: 60_000 },
+      perAccount: { max: 2, windowMs: 60_000 },
+    });
+    const user = await createTestUser("connlimit-owner", "pw");
+    const token = await login(port, user.email, "pw");
+    const documentId = await createDocumentAs(port, token, "Connection Rate Limit");
+
+    // Each connection attempt needs its OWN, unused ticket (single-use, Phase 29) -- issue one
+    // per attempt, all for the SAME real account, so the per-account key is shared across them.
+    const ticket1 = ((await issueTicket(port, token, documentId)).body as Ticket).ticket;
+    const ticket2 = ((await issueTicket(port, token, documentId)).body as Ticket).ticket;
+    const ticket3 = ((await issueTicket(port, token, documentId)).body as Ticket).ticket;
+
+    // First two connections: within the per-account cap of 2 -- both admitted normally.
+    const conn1 = await connectWithTicket(port, documentId, ticket1);
+    conn1.ws.close();
+    const conn2 = await connectWithTicket(port, documentId, ticket2);
+    conn2.ws.close();
+
+    // Third connection, same real account: the per-account cap is now exceeded, even though this
+    // is a BRAND NEW, otherwise perfectly valid, unused ticket for the same document/user.
+    const rejection = await connectExpectingRejection(port, documentId, ticket3);
+    expect(rejection.error.code).toBe(ErrorCode.RATE_LIMITED);
+    expect(rejection.closeCode).toBe(1008);
   });
 });
