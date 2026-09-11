@@ -66,7 +66,14 @@ export {
   runOneDocument as runOneOfflineWindowSweep,
   type OfflineWindowScheduler,
 } from "./offlineWindowScheduler.js";
-export type { GcConfig, OfflineWindowConfig } from "./config.js";
+export type {
+  GcConfig,
+  OfflineWindowConfig,
+  RateLimitConfig,
+  CircuitBreakerConfig,
+  ConnectionRateLimitConfig,
+} from "./config.js";
+export { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./config.js";
 export {
   ALL_CRASH_SITES,
   armCrashSite,
@@ -179,7 +186,6 @@ import { PostgresOperationStore } from "./db/operationStore.js";
 import { createCollabServer } from "./server.js";
 import { startAuditScheduler } from "./auditScheduler.js";
 import { startGcScheduler } from "./gcScheduler.js";
-import { startOfflineWindowScheduler } from "./offlineWindowScheduler.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
 // or `tsx src/index.ts`, Phase 14's `pnpm --filter @collab-editor/server run
@@ -205,6 +211,16 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const server = createCollabServer({
     operationStore,
     auth: { pool, authConfig: config.auth },
+    // Phase 30 (RFC §8.2 (T2)/§8.8) — only the real, direct-run server ever enables op-level rate
+    // limiting; every test constructing `createCollabServer()` directly (the overwhelming
+    // majority of this project's own suite) omits these and keeps its pre-Phase-30 behavior.
+    rateLimit: config.rateLimit,
+    circuitBreaker: config.circuitBreaker,
+    connectionRateLimit: config.connectionRateLimit,
+    // Phase 24/30 — `createCollabServer()` itself ALWAYS starts this scheduler now (see its own
+    // `offlineWindow` doc comment for why it's treated differently from GC/audit below); this is
+    // just threading the REAL config through instead of leaving it at the generous default.
+    offlineWindow: config.offlineWindow,
   });
   void server.listen(config.port);
   // Phase 18: the continuously-running production control — audits every currently-open
@@ -215,6 +231,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   // Phase 21: tombstone garbage collection — same "only the direct-run block starts this"
   // reasoning as the audit scheduler immediately above.
   startGcScheduler(server.gateway, config.gc);
-  // Phase 24: the offline-window sweep (Engine Spec §7.6 Rule 7.2) — same reasoning again.
-  startOfflineWindowScheduler(server.gateway, config.offlineWindow);
+  // Phase 24/30's offline-window sweep is NO LONGER started here — `createCollabServer()` itself
+  // now starts it unconditionally (structurally impossible to construct a server without it),
+  // using the real `config.offlineWindow` passed in above. Starting it a second time here would
+  // just run two independent, redundant timers sweeping the same coordinators.
 }

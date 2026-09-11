@@ -9,6 +9,13 @@ import type { OperationStore } from "./db/operationStore.js";
 import type { DocumentRole } from "./db/documentStore.js";
 import { SNAPSHOT_OP_THRESHOLD, SNAPSHOT_TIME_THRESHOLD_MS } from "./snapshotter.js";
 import type { ConnectionSendQueues } from "./sendQueues.js";
+import {
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
+  type CircuitBreakerConfig,
+  type RateLimitConfig,
+} from "./config.js";
+import { logger } from "./logger.js";
+import { InMemoryRateLimiter } from "./rateLimiter.js";
 
 /**
  * Replica id 0 is reserved for the server and is never handed to a session
@@ -103,6 +110,16 @@ export interface CoordinatorSession {
    * skipped rather than throwing.
    */
   readonly disconnectForRevocation?: () => void;
+  /**
+   * Phase 30 (RFC §8.2 (T2), Test Plan SEC-08: "throttles at 200 ops/s, then disconnects") — a
+   * closure, set only in gateway.ts's own real session construction, that ends this session once
+   * its own rejection VOLUME has crossed `RateLimitConfig.perSessionDisconnectRule` within a
+   * rolling window (see `recordRateLimitViolation`'s own doc comment for why this is a rolling
+   * violation-count check, not a continuous-streak one). OPTIONAL for the SAME reason
+   * `disconnectForRevocation` above is: a dozen pre-existing test fixtures construct a
+   * `CoordinatorSession` literal directly with no real `ws` to close.
+   */
+  readonly disconnectForRateLimit?: () => void;
 }
 
 /**
@@ -412,6 +429,38 @@ export class DocumentCoordinator {
   }
 
   /**
+   * Phase 30 (RFC §8.2 (T2), Test Plan SEC-08) — `undefined` disables per-session/per-document
+   * op-rate limiting entirely (writePath.ts's own step 3 skips the check outright when this is
+   * unset) — see `RateLimitConfig`'s own doc comment (config.ts) for why this defaults to OFF
+   * rather than ON with a generous default, unlike `circuitBreakerConfig` below.
+   */
+  private readonly rateLimitConfig: RateLimitConfig | undefined;
+  /**
+   * One shared limiter across every session on this document, used for THREE independent
+   * key/rule pairs: `session:<id>` (the per-session cap), `document:<documentId>` (the
+   * per-document cap), and `violation:<id>` (SEC-08's own disconnect trigger — see
+   * `recordRateLimitViolation`'s own doc comment).
+   */
+  private readonly opRateLimiter = new InMemoryRateLimiter();
+
+  /**
+   * Phase 30 (RFC §8.2 (T2), Test Plan SEC-08) — ALWAYS active, unlike {@link rateLimitConfig}
+   * above; see `CircuitBreakerConfig`'s own doc comment (config.ts) for why a generous default is
+   * safe to leave on unconditionally. Overridable (constructor's `securityLimits` parameter,
+   * below) so a test can trip it without building a document anywhere near the real default's
+   * scale.
+   */
+  private readonly circuitBreakerConfig: CircuitBreakerConfig;
+  private circuitBreakerState: {
+    tripped: boolean;
+    trippedAtMs: number | null;
+    reason: string | null;
+  } = { tripped: false, trippedAtMs: null, reason: null };
+  /** Edge-triggered logging state for the two alert thresholds (config.ts's own doc comment: "logged once, not per operation") — `false` until the threshold is first crossed, reset back to `false` once the metric falls back under it (e.g. after GC), so a LATER re-crossing logs again rather than staying silent forever after the first time. */
+  private structureSizeAlertLogged = false;
+  private tombstoneCountAlertLogged = false;
+
+  /**
    * Phase 29 — a real, per-user `document_permissions` lookup, bound to THIS coordinator's own
    * `documentId` by whoever constructs it (`gateway.ts`'s `getOrCreateCoordinator`, only when
    * `auth` deps are configured). `undefined` for every coordinator built without real auth wiring
@@ -426,6 +475,16 @@ export class DocumentCoordinator {
     operationStore: OperationStore,
     snapshotThresholds?: { readonly opThreshold?: number; readonly timeThresholdMs?: number },
     lookupRole?: (userId: string) => Promise<DocumentRole | null>,
+    /**
+     * Phase 30 — bundles the two new, unrelated-in-scope-but-both-optional threshold overrides
+     * (see `rateLimitConfig`/`circuitBreakerConfig`'s own field doc comments above for why one
+     * defaults to disabled and the other to a generous always-on default) rather than adding two
+     * more positional parameters to an already five-parameter constructor.
+     */
+    securityLimits?: {
+      readonly rateLimit?: RateLimitConfig;
+      readonly circuitBreaker?: Partial<CircuitBreakerConfig>;
+    },
   ) {
     this.documentId = documentId;
     this.operationStore = operationStore;
@@ -433,6 +492,11 @@ export class DocumentCoordinator {
     this.snapshotTimeThresholdMs =
       snapshotThresholds?.timeThresholdMs ?? SNAPSHOT_TIME_THRESHOLD_MS;
     this.lookupRole = lookupRole;
+    this.rateLimitConfig = securityLimits?.rateLimit;
+    this.circuitBreakerConfig = {
+      ...DEFAULT_CIRCUIT_BREAKER_CONFIG,
+      ...securityLimits?.circuitBreaker,
+    };
     this.lastSnapAt = new Date(); // provisional — warmStart() below sets the real baseline once it completes
     this.ready = this.warmStart();
   }
@@ -553,6 +617,146 @@ export class DocumentCoordinator {
       userId: s.userId,
       displayName: s.displayName,
     }));
+  }
+
+  /**
+   * Phase 30 (RFC §8.2 (T2), Test Plan SEC-08) — writePath.ts's own step 3. Returns `"ok"` when
+   * either no `rateLimitConfig` was ever supplied to this coordinator (rate limiting disabled —
+   * see that field's own doc comment) or the incoming message is under BOTH the per-session and
+   * the shared per-document budget; otherwise names WHICH ONE tripped, so writePath.ts's own
+   * rejection detail and disconnect logic can react differently (only a SESSION-scope violation
+   * ever leads to a disconnect — see `recordRateLimitViolation` below). Counts once per call
+   * (one incoming message = one unit), never by the number of operations that message expands
+   * to — see `RateLimitConfig`'s own doc comment (config.ts) for the full reasoning.
+   */
+  checkOpRateLimit(sessionId: string, nowMs: number = Date.now()): "ok" | "session" | "document" {
+    if (!this.rateLimitConfig) {
+      return "ok";
+    }
+    if (!this.opRateLimiter.consume(`session:${sessionId}`, this.rateLimitConfig.perSessionRule, nowMs)) {
+      return "session";
+    }
+    if (
+      !this.opRateLimiter.consume(
+        `document:${this.documentId}`,
+        this.rateLimitConfig.perDocumentRule,
+        nowMs,
+      )
+    ) {
+      return "document";
+    }
+    return "ok";
+  }
+
+  /**
+   * Records one SESSION-scope rate-limit violation and reports whether this session has now
+   * exceeded `RateLimitConfig.perSessionDisconnectRule` — SEC-08's own "throttles ... then
+   * disconnects": a single rejected message throttles (the caller already sent OP_REJECT); only
+   * a genuinely high VOLUME of rejections within a rolling window disconnects.
+   *
+   * Reuses the SAME `InMemoryRateLimiter.consume()` mechanism `checkOpRateLimit` itself already
+   * uses, under a second, independent key (`violation:<sessionId>`) — NOT a continuous-streak
+   * check. An earlier design required the streak to be CONTINUOUS (zero acceptances) for a full
+   * `perSessionSustainedViolationMs` window, which turned out to be structurally unreachable
+   * against a real sustained attacker: a limiter that is successfully THROTTLING an attacker, by
+   * design, keeps admitting `perSessionRule.max` messages per `perSessionRule.windowMs` forever,
+   * and every acceptance reset that streak to zero — see `perSessionDisconnectRule`'s own doc
+   * comment (config.ts) for the full account of why, and this project's own real empirical
+   * measurement (Phase 30) that found it. This version counts REJECTIONS, not the absence of
+   * acceptances — an accepted message no longer resets anything; only real time aging old
+   * violations out of the rolling window ever lowers this count, so a session under CONSTANT,
+   * heavy rejection (regardless of how many messages happen to slip through) still accumulates
+   * toward disconnect.
+   */
+  recordRateLimitViolation(sessionId: string, nowMs: number = Date.now()): boolean {
+    const config = this.rateLimitConfig;
+    if (!config) return false;
+    // consume() returns true = "still under its own violation budget"; false = "this violation
+    // itself pushed the session over budget" -- THAT'S the disconnect signal.
+    return !this.opRateLimiter.consume(`violation:${sessionId}`, config.perSessionDisconnectRule, nowMs);
+  }
+
+  /**
+   * Phase 30 (RFC §8.2 (T2), Test Plan SEC-08) — re-evaluates the document-wide circuit breaker
+   * against the engine's OWN live structural metrics (`engine.stats()`, O(1)). Called reactively
+   * after every successfully-committed operation (writePath.ts, both its fast and slow paths) —
+   * so the breaker trips as soon as a commit actually crosses the ceiling, not on some later
+   * polling interval — and again after every GC cycle (gcScheduler.ts), which is what lets it
+   * SELF-HEAL: once GC reclaims enough tombstones to fall back under the ceiling, the very next
+   * evaluation (the same GC cycle's own) clears it automatically, with no separate "reset" action
+   * required from an operator. Alert-threshold logging is edge-triggered (see
+   * `structureSizeAlertLogged`/`tombstoneCountAlertLogged`'s own doc comments) — a document that
+   * stays above an alert threshold for a long time logs it exactly once, not on every operation.
+   */
+  evaluateCircuitBreaker(nowMs: number = Date.now()): void {
+    const stats = this.engine.stats();
+    const config = this.circuitBreakerConfig;
+
+    const shouldBeTripped = stats.totalElements >= config.structureSizeCeiling;
+    if (shouldBeTripped && !this.circuitBreakerState.tripped) {
+      this.circuitBreakerState = {
+        tripped: true,
+        trippedAtMs: nowMs,
+        reason: `structure size ${stats.totalElements} reached the ${config.structureSizeCeiling}-node circuit-breaker ceiling (RFC §8.2)`,
+      };
+      logger.error("documentCoordinator.circuitBreakerTripped", {
+        documentId: this.documentId,
+        totalElements: stats.totalElements,
+        tombstones: stats.tombstones,
+        ceiling: config.structureSizeCeiling,
+      });
+    } else if (!shouldBeTripped && this.circuitBreakerState.tripped) {
+      logger.warn("documentCoordinator.circuitBreakerRecovered", {
+        documentId: this.documentId,
+        totalElements: stats.totalElements,
+        tombstones: stats.tombstones,
+      });
+      this.circuitBreakerState = { tripped: false, trippedAtMs: null, reason: null };
+    }
+
+    const structureAlerted = stats.totalElements >= config.structureSizeAlertThreshold;
+    if (structureAlerted && !this.structureSizeAlertLogged) {
+      logger.warn("documentCoordinator.structureSizeAlert", {
+        documentId: this.documentId,
+        totalElements: stats.totalElements,
+        threshold: config.structureSizeAlertThreshold,
+      });
+    }
+    this.structureSizeAlertLogged = structureAlerted;
+
+    const tombstoneAlerted = stats.tombstones >= config.tombstoneCountAlertThreshold;
+    if (tombstoneAlerted && !this.tombstoneCountAlertLogged) {
+      logger.warn("documentCoordinator.tombstoneCountAlert", {
+        documentId: this.documentId,
+        tombstones: stats.tombstones,
+        threshold: config.tombstoneCountAlertThreshold,
+      });
+    }
+    this.tombstoneCountAlertLogged = tombstoneAlerted;
+  }
+
+  isCircuitBreakerTripped(): boolean {
+    return this.circuitBreakerState.tripped;
+  }
+
+  /** Read-only introspection for httpApp.ts's `/security-status` endpoint. */
+  getSecurityStatus(): {
+    readonly circuitBreakerTripped: boolean;
+    readonly circuitBreakerTrippedAtMs: number | null;
+    readonly circuitBreakerReason: string | null;
+    readonly structureSize: number;
+    readonly tombstoneCount: number;
+    readonly circuitBreakerConfig: CircuitBreakerConfig;
+  } {
+    const stats = this.engine.stats();
+    return {
+      circuitBreakerTripped: this.circuitBreakerState.tripped,
+      circuitBreakerTrippedAtMs: this.circuitBreakerState.trippedAtMs,
+      circuitBreakerReason: this.circuitBreakerState.reason,
+      structureSize: stats.totalElements,
+      tombstoneCount: stats.tombstones,
+      circuitBreakerConfig: this.circuitBreakerConfig,
+    };
   }
 
   /**

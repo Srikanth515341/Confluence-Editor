@@ -4,12 +4,17 @@
 // own framing): get the broadcast/commit/ack ordering wrong and either
 // M4 latency or M2 durability breaks.
 //
+//   0. (Phase 30, RFC §8.2 (T2)) circuit breaker check -- ahead of every other step, since a
+//      tripped breaker makes the document read-only for EVERYONE, including its own owner; this
+//      is not an authorization decision (step 1), it is "there is currently no valid operation
+//      to authorize a check against" -- see DocumentCoordinator.isCircuitBreakerTripped
 //   1. authorize (Phase 24 gave this a real, minimal check -- session.role !== VIEWER, evaluated
 //      once at that phase. Phase 28 makes this a genuine PER-OPERATION re-check, through a ≤2s
 //      decision cache (SEC-06) that a live role change invalidates immediately -- see
 //      DocumentCoordinator.authorizeSession/setSessionRoleLive)
 //   2. verify stamp.r === session.replica_id
-//   3. rate check (stubbed until Phase 30)
+//   3. rate check (Phase 30, RFC §8.2 (T2), Test Plan SEC-08) -- per-session AND per-document,
+//      independently -- see DocumentCoordinator.checkOpRateLimit
 //   4. expand run/batch
 //   5. engine.applyRemote
 //   6. assign seq
@@ -122,11 +127,6 @@ export interface WritePathTestHooks {
 /** `OpsMessage` minus the two server-only, seq-less kinds — narrowed once here rather than at every downstream call site, since `processIncomingOperation`'s own early throw guard only narrows within that function's own body, not across the `runFastPath`/`runSlowPath` function boundary. */
 type ClientOpsMessage = Exclude<OpsMessage, OpAckMessage | OpRejectMessage>;
 
-/** Step 3: rate check. Stubbed until Phase 30. Always allows. */
-function rateCheckStub(_session: CoordinatorSession): boolean {
-  return true;
-}
-
 /** Sends OP_REJECT to the SENDER only (never broadcast) — used by every rejection path in this module, and (exported) by offlineWindowScheduler.ts's own, separate OFFLINE_WINDOW_EXCEEDED rejection. */
 export function sendOpReject(
   session: CoordinatorSession,
@@ -171,6 +171,22 @@ export async function processIncomingOperation(
 
   const ops = toOperations(msg);
   if (ops.length === 0) {
+    return;
+  }
+
+  // Step 0 (Phase 30, RFC §8.2 (T2), Test Plan SEC-08): "tripping the breaker makes the document
+  // READ-ONLY for everyone -- failing CLOSED protects other participants' clients." Checked BEFORE
+  // authorization deliberately -- a tripped breaker rejects the document's own OWNER too, which
+  // step 1's role check alone would never do. `DOCUMENT_LOCKED` (API Spec §3.5.8, 0x07) was
+  // reserved in the enum since Phase 7 and never used until now -- this is exactly the "document
+  // state" rejection category its own doc comment names.
+  if (coordinator.isCircuitBreakerTripped()) {
+    sendOpReject(
+      session,
+      ops,
+      RejectReason.DOCUMENT_LOCKED,
+      "this document is read-only: its structure-size circuit breaker has tripped (RFC §8.2)",
+    );
     return;
   }
 
@@ -228,9 +244,35 @@ export async function processIncomingOperation(
     return;
   }
 
-  // Step 3.
-  if (!rateCheckStub(session)) {
-    sendOpReject(session, ops, RejectReason.RATE_LIMITED, "rate limit exceeded");
+  // Step 3 (Phase 30, RFC §8.2 (T2), Test Plan SEC-08). Counts once per MESSAGE, never per
+  // expanded operation -- see RateLimitConfig's own doc comment (config.ts) for why (a large
+  // legitimate paste or reconciliation resend must never be rejected for the SIZE of the batch
+  // it happens to arrive as one frame).
+  const rateResult = coordinator.checkOpRateLimit(session.sessionId);
+  if (rateResult !== "ok") {
+    logger.warn("writePath.rateLimited", {
+      documentId: coordinator.documentId,
+      sessionId: session.sessionId,
+      replicaId: session.replicaId,
+      scope: rateResult,
+    });
+    sendOpReject(
+      session,
+      ops,
+      RejectReason.RATE_LIMITED,
+      `${rateResult === "session" ? "per-session" : "per-document"} rate limit exceeded`,
+    );
+    if (rateResult === "session" && coordinator.recordRateLimitViolation(session.sessionId)) {
+      // SEC-08: "throttles ... then disconnects" -- sustained (not merely one-off) abuse from
+      // THIS session specifically disconnects it; a per-document trip never disconnects anyone,
+      // since the document budget being exceeded says nothing about which session(s) caused it.
+      logger.warn("writePath.rateLimitDisconnect", {
+        documentId: coordinator.documentId,
+        sessionId: session.sessionId,
+        replicaId: session.replicaId,
+      });
+      session.disconnectForRateLimit?.();
+    }
     return;
   }
 
@@ -429,6 +471,11 @@ async function runFastPath(
   // completion entirely (snapshotter.ts) — this line must never be what makes
   // processIncomingOperation take longer to resolve.
   maybeScheduleSnapshot(coordinator, ops.length);
+
+  // Also not one of the nine steps -- Phase 30 (RFC §8.2 (T2)). Re-evaluated reactively, right
+  // after a real commit, so the breaker trips the moment a commit ACTUALLY crosses the ceiling
+  // rather than on some later polling interval. Cheap: `engine.stats()` is O(1).
+  coordinator.evaluateCircuitBreaker();
 }
 
 function toWireMessage(op: Operation, seq: number): OpInsertMessage | OpDeleteMessage | OpUndeleteMessage {
@@ -569,4 +616,5 @@ async function runSlowPath(deps: {
   }
 
   maybeScheduleSnapshot(coordinator, finalized.length);
+  coordinator.evaluateCircuitBreaker();
 }

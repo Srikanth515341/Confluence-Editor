@@ -36,10 +36,16 @@
 // shape as gcScheduler.ts/auditScheduler.ts (Phase 18/21): this is the one
 // place with direct in-memory access to each coordinator's own live
 // `engine.pending`.
+//
+// Phase 30 (RFC §8.7, Test Plan SEC-11i) extends this SAME sweep with a SIZE bound, independent
+// of the age bound above: "the causal buffer is bounded in size AND age ... discarded with a
+// logged warning, not accumulated." One scheduler, one pass over `engine.pending`, two related
+// (but independently-triggerable) eviction reasons — see this file's own size-bound block near
+// the end of `runOneDocument` for the full reasoning.
 
 import { serializeId, type Operation } from "@collab-editor/engine";
 import { RejectReason } from "@collab-editor/protocol";
-import type { OfflineWindowConfig } from "./config.js";
+import { DEFAULT_MAX_PENDING_PER_DOCUMENT, type OfflineWindowConfig } from "./config.js";
 import type { CoordinatorSession, DocumentCoordinator } from "./documentCoordinator.js";
 import type { Gateway } from "./gateway.js";
 import { logger } from "./logger.js";
@@ -164,5 +170,53 @@ export function runOneDocument(coordinator: DocumentCoordinator, config: Offline
       RejectReason.OFFLINE_WINDOW_EXCEEDED,
       `${ops.length} operation(s) buffered longer than ${config.pendingRejectTimeoutMs}ms with an unresolvable origin (Engine Spec §7.6)`,
     );
+  }
+
+  // Phase 30 (RFC §8.7, Test Plan SEC-11i) — the SIZE half of "bounded in size and age," checked
+  // on a FRESH snapshot of whatever is left after the age-based pass above already ran (the two
+  // are independent conditions, not a priority order — an operation can be evicted for being too
+  // OLD, too NUMEROUS, or both). Evicts the OLDEST remaining entries first (by
+  // `pendingFirstSeenAtMs`, falling back to "now" for one this exact tick just started tracking —
+  // never possible for it to be the oldest, so the fallback value is never actually load-bearing)
+  // until back at or under `config.maxPendingPerDocument`, regardless of how much of their own
+  // age-based grace period each one still has left — RFC §8.7 bounds the buffer's SIZE
+  // unconditionally, not "size, but only for operations already old enough to be suspicious."
+  const maxPendingPerDocument = config.maxPendingPerDocument ?? DEFAULT_MAX_PENDING_PER_DOCUMENT;
+  const stillPendingSnapshot = [...coordinator.engine.pending];
+  const overflow = stillPendingSnapshot.length - maxPendingPerDocument;
+  if (overflow > 0) {
+    const oldestFirst = stillPendingSnapshot
+      .map((op) => ({
+        op,
+        firstSeen: coordinator.pendingFirstSeenAtMs.get(serializeId(op.id)) ?? nowMs,
+      }))
+      .sort((a, b) => a.firstSeen - b.firstSeen)
+      .slice(0, overflow);
+    for (const { op } of oldestFirst) {
+      const key = serializeId(op.id);
+      logger.warn("offlineWindow.causalBufferOverflow", {
+        documentId: coordinator.documentId,
+        opId: key,
+        pendingSize: stillPendingSnapshot.length,
+        maxPendingPerDocument,
+      });
+      coordinator.engine.rejectPending(op.id);
+      coordinator.pendingFirstSeenAtMs.delete(key);
+      coordinator.pendingOpOrigin.delete(key);
+      const session = coordinator.getSessionByReplicaId(op.id.r);
+      if (session) {
+        // Reuses RATE_LIMITED (API Spec §3.5.8, 0x05) rather than a new reason code — a
+        // capacity-driven eviction IS a rate/load-protection rejection in every sense that
+        // matters to a client receiving it, and this project's own RejectReason enum doc comment
+        // (messages.ts) reserves new codes strictly for genuinely distinct rejection CATEGORIES,
+        // not a second name for the same one.
+        sendOpReject(
+          session,
+          [op],
+          RejectReason.RATE_LIMITED,
+          `document's causal buffer capacity (${maxPendingPerDocument}) exceeded (RFC §8.7)`,
+        );
+      }
+    }
   }
 }

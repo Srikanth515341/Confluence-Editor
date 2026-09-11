@@ -2,10 +2,18 @@ import { createServer as createHttpServer, type Server as HttpServer } from "nod
 import { InMemoryOperationStore, type OperationStore } from "./db/operationStore.js";
 import type { DbPool } from "./db/pool.js";
 import type { DocumentCoordinator } from "./documentCoordinator.js";
-import type { AuthConfig } from "./config.js";
+import {
+  DEFAULT_OFFLINE_WINDOW_CONFIG,
+  type AuthConfig,
+  type CircuitBreakerConfig,
+  type ConnectionRateLimitConfig,
+  type OfflineWindowConfig,
+  type RateLimitConfig,
+} from "./config.js";
 import { createGateway, type Gateway } from "./gateway.js";
 import { createHttpApp } from "./httpApp.js";
 import { logger } from "./logger.js";
+import { startOfflineWindowScheduler } from "./offlineWindowScheduler.js";
 import { InMemoryTicketStore } from "./ticketStore.js";
 
 export interface CollabServer {
@@ -39,6 +47,25 @@ export interface CreateCollabServerDeps {
    * `db/authTiming.db.test.ts` are the only real callers that ever supply it.
    */
   readonly auth?: { readonly pool: DbPool; readonly authConfig: AuthConfig };
+  /** Phase 30 (RFC §8.2 (T2)) — threaded straight through to `createGateway`'s own identically-named field; see that field's own doc comment. */
+  readonly rateLimit?: RateLimitConfig;
+  /** Phase 30 (RFC §8.2 (T2)) — threaded straight through to `createGateway`'s own identically-named field. */
+  readonly circuitBreaker?: Partial<CircuitBreakerConfig>;
+  /** Phase 30 (RFC §8.8) — threaded straight through to `createGateway`'s own identically-named field. */
+  readonly connectionRateLimit?: ConnectionRateLimitConfig;
+  /**
+   * Phase 24/30 (Engine Spec §7.6 Rule 7.2, RFC §8.7, Test Plan RC-30/SEC-11i) — the offline-
+   * window sweep's own config. UNLIKE the GC and audit schedulers (started only by `index.ts`'s
+   * direct-run block, never here — see that file's own comment for why: no test constructing its
+   * own server needs to remember to stop them), this scheduler is ALWAYS started by
+   * `createCollabServer()` itself, deliberately: its absence is not a "nice to have liveness
+   * metric" gap the way GC/audit's absence is — it's the ONLY thing bounding `engine.pending`'s
+   * own growth (SEC-11i's "bounded in size AND age" requirement structurally depends on this
+   * sweep actually running), and unlike GC/audit it is cheap and safe to always run (synchronous,
+   * in-memory, no database I/O). Defaults to `DEFAULT_OFFLINE_WINDOW_CONFIG` when omitted (every
+   * pre-this-fix test) — the same generous defaults `loadConfig()` uses for a real server.
+   */
+  readonly offlineWindow?: OfflineWindowConfig;
 }
 
 /** Builds the Express app and WebSocket gateway on one shared HTTP server (so HTTP and WS share a single port). Does not start listening — call `listen()`. */
@@ -69,8 +96,19 @@ export function createCollabServer(deps: CreateCollabServerDeps = {}): CollabSer
   const gateway = createGateway(httpServer, {
     operationStore,
     ...(deps.auth && ticketStore ? { auth: { pool: deps.auth.pool, ticketStore } } : {}),
+    ...(deps.rateLimit ? { rateLimit: deps.rateLimit } : {}),
+    ...(deps.circuitBreaker ? { circuitBreaker: deps.circuitBreaker } : {}),
+    ...(deps.connectionRateLimit ? { connectionRateLimit: deps.connectionRateLimit } : {}),
   });
   gatewayBox.current = gateway;
+
+  // Phase 24/30 (Rule 7.2, RFC §8.7, SEC-11i) — see `CreateCollabServerDeps.offlineWindow`'s own
+  // doc comment for why this scheduler (unlike GC/audit) is started HERE, unconditionally, for
+  // every server this factory ever constructs, not only `index.ts`'s direct-run path.
+  const offlineWindowScheduler = startOfflineWindowScheduler(
+    gateway,
+    deps.offlineWindow ?? DEFAULT_OFFLINE_WINDOW_CONFIG,
+  );
 
   return {
     httpServer,
@@ -88,6 +126,7 @@ export function createCollabServer(deps: CreateCollabServerDeps = {}): CollabSer
       }),
     close: () =>
       new Promise<void>((resolve, reject) => {
+        offlineWindowScheduler.stop();
         gateway.close();
         httpServer.close((err) => (err ? reject(err) : resolve()));
       }),

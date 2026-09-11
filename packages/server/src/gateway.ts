@@ -1,4 +1,4 @@
-import type { Server as HttpServer } from "node:http";
+import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
@@ -30,8 +30,10 @@ import {
   decideSyncMode,
 } from "./handshake.js";
 import { logger } from "./logger.js";
+import { InMemoryRateLimiter } from "./rateLimiter.js";
 import { ConnectionSendQueues } from "./sendQueues.js";
 import type { InMemoryTicketStore } from "./ticketStore.js";
+import type { CircuitBreakerConfig, ConnectionRateLimitConfig, RateLimitConfig } from "./config.js";
 import { processIncomingOperation } from "./writePath.js";
 
 function documentRoleToSessionRole(role: DocumentRole): SessionRole {
@@ -74,6 +76,8 @@ function getOrCreateCoordinator(
   documentId: string,
   operationStore: OperationStore,
   pool: DbPool | undefined,
+  rateLimit: RateLimitConfig | undefined,
+  circuitBreaker: Partial<CircuitBreakerConfig> | undefined,
 ): DocumentCoordinator {
   let coordinator = coordinators.get(documentId);
   if (!coordinator) {
@@ -81,7 +85,14 @@ function getOrCreateCoordinator(
     // DocumentCoordinator's own `lookupRole` field doc comment for why it's `undefined`
     // (falling back to Phase 28's `session.role`-only check) whenever `pool` isn't configured.
     const lookupRole = pool ? (userId: string) => getUserRole(pool, documentId, userId) : undefined;
-    coordinator = new DocumentCoordinator(documentId, operationStore, undefined, lookupRole);
+    // Phase 30: `rateLimit`/`circuitBreaker` come straight from this gateway's own construction
+    // deps (below) — `undefined` for every pre-Phase-30 test (op-rate-limiting stays disabled,
+    // circuit-breaker stays at its generous, always-on default; see DocumentCoordinator's own
+    // field doc comments for why that split is safe).
+    coordinator = new DocumentCoordinator(documentId, operationStore, undefined, lookupRole, {
+      ...(rateLimit ? { rateLimit } : {}),
+      ...(circuitBreaker ? { circuitBreaker } : {}),
+    });
     coordinators.set(documentId, coordinator);
   }
   return coordinator;
@@ -102,12 +113,31 @@ export interface CreateGatewayDeps {
    * issues tickets into — server.ts's own construction is what guarantees this.
    */
   readonly auth?: { readonly pool: DbPool; readonly ticketStore: InMemoryTicketStore };
+  /**
+   * Phase 30 (RFC §8.2 (T2), Test Plan SEC-08) — per-session/per-document operation rate
+   * limiting, threaded straight into every `DocumentCoordinator` this gateway creates. `undefined`
+   * (every pre-Phase-30 test) disables it entirely — see `RateLimitConfig`'s own doc comment
+   * (config.ts) for why this specific feature defaults to off rather than a generous always-on
+   * default.
+   */
+  readonly rateLimit?: RateLimitConfig;
+  /** Phase 30 — overrides `DocumentCoordinator`'s own generous, always-on circuit-breaker defaults; mainly for tests wanting a tiny ceiling. */
+  readonly circuitBreaker?: Partial<CircuitBreakerConfig>;
+  /**
+   * Phase 30 (RFC §8.8) — per-IP and (once a real ticket identity is known) per-account
+   * WebSocket CONNECTION-attempt limiting, checked before any HELLO handshake work happens.
+   * `undefined` (every pre-Phase-30 test) disables it entirely.
+   */
+  readonly connectionRateLimit?: ConnectionRateLimitConfig;
 }
 
 /** Wires the WebSocket server (path/subprotocol per API Spec §1.2/§3) onto an existing HTTP server, with one DocumentCoordinator per open document. */
 export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): Gateway {
-  const { operationStore, auth } = deps;
+  const { operationStore, auth, rateLimit, circuitBreaker, connectionRateLimit } = deps;
   const coordinators = new Map<string, DocumentCoordinator>();
+  // Phase 30 (RFC §8.8) — ONE shared limiter for this whole gateway's lifetime, keyed
+  // `ip:<addr>`/`account:<userId>` so the two scopes never collide in the same map.
+  const connectionLimiter = new InMemoryRateLimiter();
 
   const wss = new WebSocketServer({
     server: httpServer,
@@ -115,8 +145,29 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
     handleProtocols: (protocols) => (protocols.has(WS_SUBPROTOCOL) ? WS_SUBPROTOCOL : false),
   });
 
-  wss.on("connection", (ws: WebSocket) => {
+  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const sessionId = randomUUID();
+    // No trusted-proxy handling (`X-Forwarded-For`) — this project has no reverse-proxy
+    // deployment story yet, so the raw socket's own remote address is the only value that
+    // can't be spoofed by whoever is actually opening the TCP connection.
+    const remoteIp = req.socket.remoteAddress ?? "unknown";
+
+    // Phase 30 (RFC §8.8) — checked BEFORE anything else, including HELLO: a connection that
+    // never even attempts to authenticate still costs a TCP/WS handshake and an entry in `wss`'s
+    // own client set, so this must reject as early as possible, not after HELLO is parsed.
+    if (connectionRateLimit && !connectionLimiter.consume(`ip:${remoteIp}`, connectionRateLimit.perIp)) {
+      logger.warn("ws.connectionRateLimited", { sessionId, scope: "ip" });
+      const frame = encodeControlFrame({
+        kind: "error",
+        code: ErrorCode.RATE_LIMITED,
+        fatal: true,
+        message: "too many connection attempts from this address",
+      });
+      ws.send(frame, { binary: true }, () => {
+        ws.close(1008, "connection rate limit exceeded");
+      });
+      return;
+    }
     // `bound` is set the moment HELLO completes the handshake (API Spec §1.2: "bound to
     // exactly one document at handshake time and never rebinds" — this is that binding).
     // Before that, the socket exists but belongs to no document and no coordinator.
@@ -216,6 +267,23 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           return;
         }
         realIdentity = { userId: consumed.userId, displayName: consumed.displayName };
+
+        // Phase 30 (RFC §8.8) — the per-ACCOUNT half of connection-rate limiting. Only reachable
+        // here, never earlier: there is no real identity to key on before a ticket is consumed
+        // (see ConnectionRateLimitConfig's own doc comment for why a server with no `auth` deps
+        // skips this entirely).
+        if (
+          connectionRateLimit &&
+          !connectionLimiter.consume(`account:${realIdentity.userId}`, connectionRateLimit.perAccount)
+        ) {
+          logger.warn("ws.connectionRateLimited", { sessionId, scope: "account" });
+          rejectHandshake(
+            ErrorCode.RATE_LIMITED,
+            "too many connection attempts for this account",
+            "too many connection attempts",
+          );
+          return;
+        }
       }
 
       const coordinator = getOrCreateCoordinator(
@@ -223,6 +291,8 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         ctrlMsg.documentId,
         operationStore,
         auth?.pool,
+        rateLimit,
+        circuitBreaker,
       );
       try {
         await coordinator.ready;
@@ -312,6 +382,26 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           // close frame racing ahead of the GOODBYE payload on some platforms.
           ws.send(frame, { binary: true }, () => {
             ws.close(4001, "document access revoked");
+          });
+        },
+        // Phase 30 (RFC §8.2 (T2), Test Plan SEC-08: "throttles ... then disconnects") — see
+        // CoordinatorSession.disconnectForRateLimit's own doc comment. `EVICTED` (not a new
+        // GoodbyeReason value) already names exactly this category ("the server is ending this
+        // session"); `4002`, a second application-specific close code distinct from revocation's
+        // `4001`, so a real client's own transport-level logging can tell the two apart even
+        // though the GOODBYE frame's own `reason` is the actual, protocol-defined signal.
+        // `retryAfterMs` is nonzero, unlike revocation's `0` -- a rate-limited session is welcome
+        // to reconnect once it backs off, unlike a permission revocation, which never reverses
+        // itself without a NEW grant.
+        disconnectForRateLimit: () => {
+          if (ws.readyState !== ws.OPEN) return;
+          const frame = encodeControlFrame({
+            kind: "goodbye",
+            reason: GoodbyeReason.EVICTED,
+            retryAfterMs: 5000,
+          });
+          ws.send(frame, { binary: true }, () => {
+            ws.close(4002, "sustained rate limit violation");
           });
         },
       };

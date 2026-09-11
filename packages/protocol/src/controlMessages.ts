@@ -203,6 +203,8 @@ export enum ErrorCode {
   INVALID_TICKET = 1,
   /** Phase 29, Test Plan SEC-11e: this session's own authorization can no longer be confirmed (e.g. the connecting user's `document_permissions` row is gone) on an already-admitted, long-lived socket — the SAME condition PERMISSION_CHANGED{role: null} reports when caught by an explicit push; this code covers the case where nothing pushed it, and the decision cache's own ≤2s re-check (SEC-05/06) is what surfaced it instead. */
   SESSION_EXPIRED = 2,
+  /** Phase 30 (RFC §8.8): this raw WebSocket connection ATTEMPT itself was rejected by the per-IP or per-account connection-rate limiter, before any HELLO handshake could even begin — distinct from `RejectReason.RATE_LIMITED` (API Spec §3.5.8), which rejects individual OPERATIONS on an already-admitted connection. */
+  RATE_LIMITED = 3,
 }
 
 /** §3.6.3's form byte. */

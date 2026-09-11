@@ -12,6 +12,43 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 30 — Rate limiting, circuit breaker, and the security suite
+(Milestone M3, tag `v0.3.0-m3`).** Defends against the metadata-
+exhaustion attack this project's own CRDT choice specifically creates:
+an authorized, well-formed insert-then-delete script at scattered
+positions produces real tombstones that propagate to every peer through
+the ordinary convergence mechanism, and no authorization check can tell
+it apart from ordinary fast typing — only its rate gives it away. A real,
+separate-process empirical attack found the phase's first cut of its own
+disconnect trigger never actually fired against a sustained attacker (a
+structural design flaw, not a rare edge case) and that the causal-buffer
+sweep wasn't running under the shared server factory at all — both are
+now fixed, verified against a real re-run (disconnect now happens in
+92-171ms, not never), and locked in with a permanent regression test
+asserting the real disconnect, not merely "was throttled." See
+[`CLAUDE.md`](./CLAUDE.md)'s own dated Phase 30 update for the full
+investigation. Per-session and per-document operation rate limiting
+(`writePath.ts`'s long-stubbed step 3, now real) throttles and, on
+sustained abuse, disconnects a session; a document-wide circuit
+breaker — always active,
+with a generous default — trips at a structure-size ceiling and makes
+the document read-only for literally everyone, including its own owner,
+self-healing automatically once garbage collection reclaims enough
+tombstones. Connection-level per-IP/per-account limits now guard the raw
+WebSocket handshake itself, and the causal buffer is bounded in size as
+well as age. A dedicated test confirms block-encoding compression
+provides **no** protection against this specific attack (measured: a
+realistic prose fixture compresses 88 nodes into 1 block; the attack's
+own scattered pattern compresses 200 nodes into 200 blocks — a 1.00x
+ratio) — and a real benchmark answers the phase's own central question
+directly: at every practical scale this project can currently measure,
+accepting the full rate-limit cap consumes only 1-2% of the throughput
+this project's own CRDT engine can sustain, leaving the rate limiter
+enormous headroom before the engine's own per-operation cost could ever
+become the bottleneck. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 30 entry
+for the full account, including the real, disclosed limits of that
+benchmark's own extrapolation to larger document sizes.
+
 **Phase 29 — WebSocket admission tickets and live revocation.** HELLO's
 `ticket` field — accepted but never validated since Phase 9 — is now REAL:
 `POST /v1/documents/{id}/rt-ticket` issues an opaque, single-use, 30-second
@@ -515,6 +552,7 @@ runs this at full scale on a schedule.
 | REST document lifecycle                    | ✅ **Phase 27** (create/list/get/rename/revoke-access, real Bearer-token auth, §5.1 error envelope, §9.2 idempotency, DELETE broadcasts a real GOODBYE) |
 | Permissions (grant/revoke/transfer)        | ✅ **Phase 28** (PUT/DELETE .../permissions/{userId}, POST .../owner; per-operation authorization with a ≤2s decision cache; SEC-07 atomicity proven with 50 real concurrent transfer requests) |
 | WS gateway authorization (real ticket-based identity) | ✅ **Phase 29** (POST .../rt-ticket, single-use/30s/scoped; HELLO's ticket field now genuinely validated; live PERMISSION_CHANGED push with effectiveAtSeq; client-side write-blocking on downgrade/revocation) |
+| Rate limiting + circuit breaker (metadata-exhaustion defense) | ✅ **Phase 30 — Milestone M3** (per-session/per-document op rate limiting, always-on self-healing structure-size circuit breaker, per-IP/per-account connection limits, size-bounded causal buffer; SEC-09's block-encoding non-mitigation measured at a real 1.00x ratio) |
 | Presence (cursors/avatars for other users) | ⏳ not started (Phase 31)                                                                                  |
 | Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
 | Version history                            | ⏳ not started                                                                                             |

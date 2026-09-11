@@ -3,19 +3,24 @@ import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { Engine } from "@collab-editor/engine";
 import {
+  Channel,
   decodeControlFrame,
   decodeFrame,
   decodeStructureSnapshotBody,
   encodeControlFrame,
   encodeFrame,
+  ErrorCode,
+  GoodbyeReason,
   operationToOpDelete,
   operationToOpInsert,
+  peekChannel,
   RejectReason,
   SessionRole,
   SnapshotForm,
   SyncMode,
   type AlreadyHaveMessage,
   type ControlMessage,
+  type ErrorMessage,
   type OpsMessage,
   type SnapshotMessage,
   type WelcomeMessage,
@@ -550,4 +555,279 @@ describe("Offline-window sweep, end to end over the real wire protocol (Phase 24
     ws.close();
     await waitForClose(ws);
   }, 15_000); // above vitest's 5000ms default -- several real round trips plus a deliberate real wait
+});
+
+describe("Phase 30 — connection-rate limiting over a real WebSocket connection (RFC §8.8)", () => {
+  it("rejects a connection attempt with ERROR{RATE_LIMITED} and closes 1008, once the per-IP cap for this fixed testing window has been exceeded", async () => {
+    // Every connection in this test comes from the same loopback address, so a real per-IP
+    // limiter genuinely applies to all of them without needing to fake or spoof any client
+    // address -- see `X-Forwarded-For`'s own absence from this project's design (gateway.ts's
+    // own comment: no reverse-proxy deployment story yet).
+    const s = createCollabServer({ connectionRateLimit: { perIp: { max: 2, windowMs: 60_000 }, perAccount: { max: 1000, windowMs: 60_000 } } });
+    server = s;
+    const port = await s.listen(0);
+
+    // The first TWO connections are admitted normally -- each completes a real handshake. Not
+    // explicitly closed afterward: `afterEach` (below) already tears down every socket this
+    // test's own server still has open via `Gateway.close()`'s own `ws.terminate()` sweep.
+    await connectAndHandshake(port, randomUUID());
+    await connectAndHandshake(port, randomUUID());
+
+    // The THIRD raw connection attempt, from the SAME address, is rejected before HELLO is even
+    // parsed -- a real ERROR{RATE_LIMITED} CONTROL frame, then a real 1008 close. Unlike
+    // `connectAndHandshake` above (where the CLIENT always speaks first, so the server can never
+    // possibly reply before a listener is attached), the server reacts here the INSTANT the raw
+    // connection opens, unprompted -- so every listener is registered synchronously, right after
+    // construction, before anything can possibly arrive.
+    const third = new WebSocket(wsUrl(port), WS_SUBPROTOCOL);
+    const messagePromise = new Promise<Uint8Array>((resolve) => {
+      third.once("message", (data, isBinary) => {
+        if (isBinary) resolve(new Uint8Array(data as Buffer));
+      });
+    });
+    const closePromise = waitForClose(third);
+
+    const errorMsg = decodeControlFrame(await messagePromise, { direction: "serverOrigin" }) as ErrorMessage;
+    expect(errorMsg.kind).toBe("error");
+    expect(errorMsg.code).toBe(ErrorCode.RATE_LIMITED);
+    expect(errorMsg.fatal).toBe(true);
+    const { code } = await closePromise;
+    expect(code).toBe(1008);
+
+    // No explicit cleanup of `first`/`second` here -- `afterEach` (below) already calls
+    // `server.close()`, which `Gateway.close()` (gateway.ts) implements by `ws.terminate()`-ing
+    // every still-open connection itself, precisely so a test never needs to remember to close
+    // every socket it opened.
+  });
+
+  it("with no `connectionRateLimit` configured (every pre-Phase-30 test), connection attempts are never throttled at all", async () => {
+    const { port } = await startServer(); // startServer()'s own default: no connectionRateLimit
+    for (let i = 0; i < 5; i++) {
+      const { ws } = await connectAndHandshake(port, randomUUID());
+      ws.close();
+      await waitForClose(ws);
+    }
+  });
+});
+
+describe("Phase 30 — DOCUMENT_LOCKED over the real wire protocol, once the circuit breaker trips (RFC §8.2 (T2))", () => {
+  it("an OWNER's own operation is rejected DOCUMENT_LOCKED, never applied, once the document's structure-size ceiling is reached", async () => {
+    const s = createCollabServer({ circuitBreaker: { structureSizeCeiling: 2, structureSizeAlertThreshold: 1, tombstoneCountAlertThreshold: 100 } });
+    server = s;
+    const port = await s.listen(0);
+    const documentId = randomUUID();
+    const { ws, frames, welcome } = await connectAndHandshake(port, documentId);
+
+    const engine = new Engine(welcome.replicaId);
+    // Two inserts reach the ceiling of 2 -- both still accepted (the breaker trips reactively,
+    // right after the SECOND one actually commits, not before).
+    const op1 = engine.localInsert(0, 0x61);
+    ws.send(encodeFrame(operationToOpInsert(op1, 0)), { binary: true });
+    await frames.nextOps(); // ack
+    const op2 = engine.localInsert(1, 0x62);
+    ws.send(encodeFrame(operationToOpInsert(op2, 0)), { binary: true });
+    await frames.nextOps(); // ack
+
+    // A THIRD operation, from this document's own OWNER (the hardcoded default role every real
+    // connection gets, per API Spec §3.6.2, absent real auth wiring) is rejected outright.
+    const op3 = engine.localInsert(2, 0x63);
+    ws.send(encodeFrame(operationToOpInsert(op3, 0)), { binary: true });
+    const rejectMsg = await frames.nextOps();
+    if (rejectMsg.kind !== "opReject") {
+      throw new Error(`expected opReject, got ${rejectMsg.kind}`);
+    }
+    expect(rejectMsg.rejects).toEqual([{ rejectedId: op3.id, reason: RejectReason.DOCUMENT_LOCKED }]);
+
+    ws.close();
+    await waitForClose(ws);
+  });
+});
+
+describe("Phase 30 — SEC-08 real attack scenario: sustained scattered insert-then-delete DOES get the attacker disconnected (RFC §8.2 (T2))", () => {
+  // This test exists because an earlier version of the disconnect mechanism NEVER actually
+  // fired against a real sustained attacker -- confirmed by an empirical measurement (a real
+  // scripted client, in a SEPARATE OS process from the server, sending ~530-600 real
+  // insert-then-delete ops/s at scattered positions for 15+ real seconds) that found the
+  // original "disconnect after CONTINUOUS, zero-acceptance violation for N ms" design was
+  // structurally unreachable: a limiter that successfully THROTTLES an attacker, by definition,
+  // keeps admitting messages at its own cap forever, and every acceptance reset the streak to
+  // zero. See RateLimitConfig.perSessionDisconnectRule's own doc comment (config.ts) for the
+  // fix. This test proves the FIX, not merely "was throttled" -- it asserts the socket actually
+  // closes, with the real GOODBYE{EVICTED} frame and the real 4002 close code, within a bounded
+  // real time. Numbers are scaled down from the real 200/1000ms production default purely for
+  // test speed -- the MECHANISM under test (rolling violation-volume tracking via the same
+  // InMemoryRateLimiter class) is identical.
+  it("a real client sending real, validly-anchored scattered insert-then-delete operations well above the per-session cap is disconnected within a bounded real time", async () => {
+    const s = createCollabServer({
+      rateLimit: {
+        perSessionRule: { max: 10, windowMs: 200 },
+        perSessionDisconnectRule: { max: 10, windowMs: 200 },
+        perDocumentRule: { max: 10_000, windowMs: 200 },
+      },
+    });
+    server = s;
+    const port = await s.listen(0);
+    const documentId = randomUUID();
+    const { ws, frames, welcome } = await connectAndHandshake(port, documentId);
+
+    const engine = new Engine(welcome.replicaId);
+    let rngState = 42;
+    const rng = () => {
+      rngState = (rngState * 1103515245 + 12345) & 0x7fffffff;
+      return rngState / 0x7fffffff;
+    };
+
+    const closePromise = waitForClose(ws);
+    let goodbyeReason: GoodbyeReason | undefined;
+    // A SINGLE unified drain loop, not two competing consumers -- `IncomingFrames.next()` hands
+    // out frames strictly FIFO to whichever caller is next in line, regardless of channel, so two
+    // separate loops each blindly calling `nextControl()`/`nextOps()` could each receive the
+    // OTHER channel's frame and throw on the wrong decode, silently ending early (a real bug
+    // caught by hand-tracing this exact test before trusting it). Peek the channel byte first,
+    // decode with the matching function, and route to the right handling.
+    void (async () => {
+      try {
+        for (;;) {
+          const bytes = await frames.next();
+          if (peekChannel(bytes) === Channel.CONTROL) {
+            const ctrl = decodeControlFrame(bytes, { direction: "serverOrigin" });
+            if (ctrl.kind === "goodbye") {
+              goodbyeReason = ctrl.reason;
+            }
+          }
+          // OPS-channel frames (acks/rejects) are drained too, just never inspected -- this
+          // test cares about the eventual close, not each individual response.
+        }
+      } catch {
+        /* socket closed -- frames.next() rejects nothing on close, but a decode of a frame that
+           arrives in the same tick as the close is not guaranteed complete; irrelevant once
+           we're racing against closePromise below */
+      }
+    })();
+
+    // Real, validly-anchored operations minted by a real Engine, sent as fast as this loop can
+    // go -- scattered insert-then-delete, SEC-08's own literal shape. Each iteration sends TWO
+    // separate frames (never coalescible -- scattered positions, per SEC-09's own point), well
+    // above the 10-per-200ms cap.
+    let stopped = false;
+    closePromise.then(() => {
+      stopped = true;
+    });
+    const sendLoop = setInterval(() => {
+      if (stopped || ws.readyState !== WebSocket.OPEN) {
+        clearInterval(sendLoop);
+        return;
+      }
+      for (let i = 0; i < 5; i++) {
+        if (stopped || ws.readyState !== WebSocket.OPEN) break;
+        const text = engine.text();
+        const insertAt = text.length === 0 ? 0 : Math.floor(rng() * (text.length + 1));
+        const insertOp = engine.localInsert(insertAt, 97 + Math.floor(rng() * 26));
+        ws.send(encodeFrame(operationToOpInsert(insertOp, 0)), { binary: true });
+
+        const afterText = engine.text();
+        if (afterText.length > 1 && rng() < 0.7) {
+          const deleteAt = Math.floor(rng() * afterText.length);
+          for (const dop of engine.localDelete(deleteAt, 1)) {
+            ws.send(encodeFrame(operationToOpDelete(dop, 0)), { binary: true });
+          }
+        }
+      }
+    }, 5);
+
+    const { code } = await closePromise;
+    clearInterval(sendLoop);
+
+    expect(code).toBe(4002);
+    expect(goodbyeReason).toBe(GoodbyeReason.EVICTED);
+  }, 10_000);
+
+  // The two hand-traced non-regression cases from the fix's own design, confirmed here under
+  // REAL execution (a real WebSocket, a real server, real operations) -- not just the direct
+  // `processIncomingOperation`/`recordRateLimitViolation` unit-level proofs in
+  // securityLimits.test.ts.
+
+  it("a large legitimate paste is NEVER penalized, even under an extremely tight per-session cap -- it counts as ONE message, not 500", async () => {
+    const s = createCollabServer({
+      rateLimit: {
+        perSessionRule: { max: 1, windowMs: 60_000 },
+        perSessionDisconnectRule: { max: 1, windowMs: 60_000 },
+        perDocumentRule: { max: 1, windowMs: 60_000 },
+      },
+    });
+    server = s;
+    const port = await s.listen(0);
+    const documentId = randomUUID();
+    const { ws, frames, welcome } = await connectAndHandshake(port, documentId);
+
+    const engine = new Engine(welcome.replicaId);
+    const ops = Array.from({ length: 500 }, (_, i) => engine.localInsert(i, 0x61));
+    const first = ops[0]!;
+    const runMsg: OpsMessage = {
+      kind: "opInsertRun",
+      seq: 0,
+      firstId: first.id,
+      firstParent: first.parent,
+      firstSide: first.side,
+      bind: false,
+      values: ops.map(() => 0x61),
+    };
+    ws.send(encodeFrame(runMsg), { binary: true });
+
+    // A real ack, not a reject -- the whole 500-character paste landed in ONE message, so it
+    // never even approached the per-session cap of 1.
+    const response = await frames.nextOps();
+    expect(response.kind).toBe("opAck");
+
+    ws.close();
+    await waitForClose(ws);
+  });
+
+  it("a legitimate, non-batchable burst MODERATELY over the cap is throttled but NEVER disconnected -- distinct from the SEC-08 attack shape above", async () => {
+    const s = createCollabServer({
+      rateLimit: {
+        perSessionRule: { max: 50, windowMs: 1000 },
+        perSessionDisconnectRule: { max: 50, windowMs: 1000 }, // this project's own real default ratio
+        perDocumentRule: { max: 100_000, windowMs: 1000 },
+      },
+    });
+    server = s;
+    const port = await s.listen(0);
+    const documentId = randomUUID();
+    const { ws, frames, welcome } = await connectAndHandshake(port, documentId);
+
+    const engine = new Engine(welcome.replicaId);
+    let goodbyeSeen = false;
+    void (async () => {
+      try {
+        for (;;) {
+          const bytes = await frames.next();
+          if (peekChannel(bytes) === Channel.CONTROL) {
+            const ctrl = decodeControlFrame(bytes, { direction: "serverOrigin" });
+            if (ctrl.kind === "goodbye") goodbyeSeen = true;
+          }
+        }
+      } catch {
+        /* socket closed */
+      }
+    })();
+
+    // ~70 individual (non-coalescible -- distinct, separately-sent) messages/second for 2 real
+    // seconds -- modestly over the 50/1000ms cap, unlike SEC-08's own 500+/s shape above.
+    // Violations accumulate at only ~(70-50)=20/s, well under the 50/1000ms disconnect
+    // threshold, so this must NEVER disconnect.
+    const start = Date.now();
+    let i = 0;
+    while (Date.now() - start < 2000) {
+      ws.send(encodeFrame(operationToOpInsert(engine.localInsert(0, 97 + (i % 26)), 0)), { binary: true });
+      i++;
+      await new Promise((r) => setTimeout(r, 1000 / 70));
+    }
+
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    expect(goodbyeSeen).toBe(false);
+
+    ws.close();
+    await waitForClose(ws);
+  }, 10_000);
 });
