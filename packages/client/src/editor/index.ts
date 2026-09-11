@@ -3,3 +3,4 @@
 // transformation under remote edits).
 
 export { EditorView, type EditorViewProps } from "./EditorView.js";
+export { captureCaret, restoreCaret, type CaretSnapshot } from "./caretTracker.js";

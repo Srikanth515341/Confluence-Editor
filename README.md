@@ -12,6 +12,32 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 32 — resolveCaret and cursor/selection transformation.** Each
+user's own caret and selection now stays anchored to the CHARACTERS
+they placed it on, not a numeric position — through a remote insert or
+delete before it, and even when the anchor character itself is deleted
+by someone else — closing Test Plan blocker B19.
+`Engine.resolveCaret(id)` corrects API Spec §7.5.3's pre-Fugue,
+flat-array design ("walk left through the sequence") for the current
+tree engine: rather than a separate predecessor-search traversal, the
+SAME augmented tree sizes `nodeAtVisible` already relies on turn out to
+already equal the answer for both a live and a tombstoned anchor, with
+no extra step. Verified deterministic and byte-for-byte identical
+across three independently-converged replicas (including for a
+tombstoned anchor), against an independent naive-oracle cross-check
+over 200 randomized structures, and — client-side — against a real
+`Engine` + real DOM render, including both a 600-sample proof that an
+untouched anchor never drifts AND a second 600-sample run that deletes
+the anchor mid-run and proves exactly one re-anchor followed by renewed
+stability. A same-day code review measured `resolveCaret`'s real cost
+(confirmed O(depth), not O(N)) and found its own capture-direction
+sibling was paying a real, separate O(N) traversal twice per remote
+batch — fixed to pay it once (roughly halves the cost), with the
+remaining O(N) class tracked as an open item rather than left for a
+future load test to discover. See [`CLAUDE.md`](./CLAUDE.md)'s Phase 32
+entry for the full derivation, the review findings, and DoD
+verification.
+
 **Phase 31 — Presence protocol and channel separation.** Cursors and
 selections now travel on their own PRESENCE channel — PRESENCE_UPDATE,
 PRESENCE_JOIN, PRESENCE_LEAVE, PRESENCE_ROSTER — structurally incapable
@@ -576,8 +602,8 @@ runs this at full scale on a schedule.
 | Permissions (grant/revoke/transfer)        | ✅ **Phase 28** (PUT/DELETE .../permissions/{userId}, POST .../owner; per-operation authorization with a ≤2s decision cache; SEC-07 atomicity proven with 50 real concurrent transfer requests) |
 | WS gateway authorization (real ticket-based identity) | ✅ **Phase 29** (POST .../rt-ticket, single-use/30s/scoped; HELLO's ticket field now genuinely validated; live PERMISSION_CHANGED push with effectiveAtSeq; client-side write-blocking on downgrade/revocation) |
 | Rate limiting + circuit breaker (metadata-exhaustion defense) | ✅ **Phase 30 — Milestone M3** (per-session/per-document op rate limiting, always-on self-healing structure-size circuit breaker, per-IP/per-account connection limits, size-bounded causal buffer; SEC-09's block-encoding non-mitigation measured at a real 1.00x ratio) |
-| Presence (cursors/avatars for other users) | ⏳ not started (Phase 31)                                                                                  |
-| Cursor transform under remote edits        | ⏳ not started (Phase 32)                                                                                  |
+| Presence (cursors/avatars for other users) | ✅ **Phase 31** (PRESENCE_UPDATE/JOIN/LEAVE/ROSTER, structurally isolated from the engine/persistence layer; 20/s cap enforced 3 independent ways) — no UI renders a peer's position yet |
+| Cursor transform under remote edits        | ✅ **Phase 32** (`Engine.resolveCaret`, corrected for the Fugue tree engine; CaretTracker; CUR-01..05 all passing, incl. 3-replica determinism and a 600-sample zero-drift proof) — closes Test Plan blocker B19 |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

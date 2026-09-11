@@ -6322,6 +6322,239 @@ check:purity` was ALSO silently broken by two comments (one in
   how often a cursor move ever reaches this function at all — not a
   hot per-keystroke document-mutation path.
 
+- **Phase 32 — resolveCaret and cursor/selection transformation** (API Spec
+  §7.5/§11.7 corrected for the Fugue engine; Engine Spec §11.3 change
+  request; PRD FR-PR-6/FR-PR-7/M11(b); Test Plan CUR-01..05, blocker
+  B19). Keeps each user's own caret and selection anchored to the
+  CHARACTERS they placed them on — including through a remote insert or
+  delete before them, and including when the anchor character itself is
+  deleted by someone else — closing Test Plan blocker B19. Dependencies:
+  Phases 11 (the DOM position-mapping primitives this reuses,
+  `domToVis`/`visToDom`) and 31 (`resolvePresenceAnchor`, the
+  identifier-resolution convention this phase's client half reuses
+  directly rather than duplicating).
+
+  **The critical correction, resolved before any implementation, exactly
+  as the phase's own reference text required**: API Spec §7.5.3's
+  original `resolveCaret` design predates the Fugue migration (Phase 25)
+  and describes "walking LEFT through the sequence" — a flat-array
+  operation with no meaning against `FugueTree`, a tree. Checked directly
+  against `fugueTree.ts` before writing any code, per the phase's own
+  explicit "stop and ask if unclear" instruction: no existing primitive
+  computed "the position of a given node," only the reverse
+  (`nodeAtVisible`, position → node). Rather than adding an explicit
+  "walk left through the tree looking for a live predecessor" traversal
+  (correct, but a second, separate O(depth) mechanism), the corrected
+  design realizes the SAME augmented `visibleSize` fields `nodeAtVisible`
+  already relies on already contain the whole answer: summing a node's
+  own left-subtree `visibleSize` plus every preceding sibling-subtree's
+  `visibleSize` while walking up to the root — the identical shape of
+  walk `nodeAtVisible` does top-down, just bottom-up — yields, for a LIVE
+  node, its own rank among visible nodes plus one (the caret contract's
+  "immediately right of it"); for a TOMBSTONED node (whose own
+  contribution to that sum is zero, since a tombstoned node's
+  `visibleSize` never counts itself), the IDENTICAL sum yields the count
+  of visible nodes strictly before it — which is, by construction,
+  exactly the rank-plus-one of whichever live node is nearest to it in
+  document order. **No separate "find the nearest surviving predecessor"
+  step is needed at all — the aggregate sum already IS that answer.**
+  This is `FugueTree.visibleIndexRightOf(id)` (new), and
+  `Engine.resolveCaret(id: Identifier | null): number` (new) is a thin
+  public wrapper over it. See both methods' own extensive doc comments
+  for the full derivation.
+
+  **Determinism (API Spec §7.5.3's own "MUST be deterministic and
+  identical on every replica") holds structurally, not by luck**: every
+  input `visibleIndexRightOf` reads (`visibleSize`, `deleted`, `parent`,
+  `side`, sibling order) is a pure function of the SET of operations
+  applied, never of delivery order or wall-clock time — the same
+  property (established during the Fugue port, Phase 25) that makes a
+  Fugue tree's full STRUCTURE, not merely its visible text, identical
+  across any two replicas that have applied the same operations. This is
+  what makes CUR-04's "identical on a third, uninvolved replica" a
+  provable consequence of the engine's own design, not something this
+  phase had to separately engineer.
+
+  **Client-side `CaretTracker`** (`packages/client/src/editor/
+  caretTracker.ts`, new — `captureCaret`/`restoreCaret`): `captureCaret`
+  reads the LIVE browser `Selection`'s own `anchorNode`/`anchorOffset`
+  and `focusNode`/`focusOffset` (the Selection API's own true,
+  direction-aware anchor/focus pair — deliberately NOT `Range.
+  startContainer`/`endContainer`, which the DOM always normalizes to
+  document order and would silently discard which end the user actually
+  dragged from for a backwards selection), maps each independently to a
+  visible index via `domToVis` (Phase 11), then resolves each
+  independently to a stable node identifier via `resolvePresenceAnchor`
+  (Phase 31, reused verbatim rather than duplicated — that function's
+  own doc comment already anticipated exactly this future caller).
+  `restoreCaret` reverses this: `Engine.resolveCaret` for each of
+  `anchor`/`focus` independently (Scope-IN's own explicit requirement,
+  CUR-03 — a selection is two independent positions, never one position
+  plus a derived length), `visToDom` back to a concrete DOM position, and
+  `Selection.setBaseAndExtent` (not a `Range` + `addRange`, which would
+  silently collapse a backwards selection's own direction) to restore
+  it. `EditorView.tsx`'s own `onRemoteOpsApplied` handler (Phase 14's
+  original "capture the raw numeric visible index, remount, restore that
+  SAME numeric index" stand-in — explicitly flagged at the time as NOT
+  real cursor transformation) is replaced by this: capture BEFORE the
+  remount, restore AFTER it, using identifiers instead of raw numbers —
+  the exact `capture()` / `restore()` ordering Scope-IN specifies.
+
+  **Test verification, at two layers, each chosen for what it's
+  positioned to prove**: `packages/engine/src/engine.test.ts`'s own new
+  `resolveCaret()` describe block (8 tests, no DOM at all) — a live
+  anchor, a tombstoned anchor with a surviving predecessor, a tombstoned
+  anchor with NO surviving predecessor (resolves to 0, never document end
+  or a throw), a null/document-start anchor, an UNKNOWN/GC'd identifier
+  (Phase 21's own physical-removal case the pre-Fugue design never had to
+  consider — resolves to 0, the same disclosed graceful-degradation
+  category `reconcileOfflineQueue.ts`'s own `visibleIndexAfter` already
+  established for an unresolvable anchor), the CUR-01/02 shape (an
+  anchor tracked correctly through both a remote insert AND a remote
+  delete before it in the same document), **CUR-04's own literal
+  "identical on a third replica" requirement** (three independently-
+  converged `Engine`s, three different delivery orders, both a live and
+  a tombstoned anchor — all three replicas, and the authoring replica,
+  agree byte for byte), and an independent, deliberately-naive
+  full-traversal oracle cross-check (200 randomized insert/delete
+  sequences, the same "don't let a check share a bug with the code it's
+  verifying" discipline this project has used since Phase 4's property
+  suites). `packages/client/src/editor/caretTracker.test.ts` (new, 8
+  tests, real `Engine` + real `DomWriter` + real jsdom `Selection`, no
+  `SyncClient`/network needed since caret tracking is a pure function of
+  selection/render-index/engine — the same layering Phase 11's own
+  `domEngineConsistency.test.ts` established): CUR-01 (a caret after
+  character 100 of a 500-char document stays on the SAME character, at
+  the SAME wire-specified new index 150, after 50 remote inserts before
+  it — including that the NEXT keystroke lands immediately after that
+  character); CUR-02 (the symmetric delete case, landing at exactly 50);
+  CUR-03 (a selection spanning [100, 200) grows to EXACTLY [100, 230)
+  when a peer inserts 30 characters inside it, plus a dedicated backwards-
+  selection case proving direction survives the round trip); CUR-04's
+  DOM-facing half (a caret whose anchor character is deleted resolves to
+  immediately after character 94, never to document start or end); a
+  capture/restore round trip with no mutation in between; a null-
+  selection capture returning `null` rather than throwing; and **CUR-05's
+  own "zero anchor changes across 600 samples" requirement**.
+
+  **CUR-05's own literal "60s at 10Hz" is deliberately NOT waited out in
+  real wall-clock time** — the same "accelerate what doesn't depend on
+  real timing, document why" precedent this project established for
+  RC-34 (Phase 23) and DUR-05/06's own fuzz-based fault injection (Phase
+  25): nothing about `capture()`/`restore()`'s own correctness depends on
+  REAL elapsed time (it is a pure per-mutation-batch operation, not a
+  timer), so the test instead runs 600 DETERMINISTIC capture/mutate/
+  remount/restore cycles back to back — three simulated "peers" editing
+  continuously above and below a fixed anchor character, an insert always
+  safe by construction and a delete deliberately steered away from the
+  anchor's own exact position so the anchor's OWN character is never the
+  one removed (the entire point of the scenario) — and asserts the
+  captured anchor IDENTIFIER is byte-for-byte identical across all 600
+  samples, not merely that its resolved numeric index stays "reasonable."
+
+  **Engine Spec §11.3's interface list is hereby recorded as updated to
+  include `resolveCaret(id: Identifier | null): number`** (the
+  Fugue-corrected contract documented in full in `Engine.resolveCaret`'s
+  own doc comment) — **this closes Test Plan blocker B19.**
+
+  **What is deliberately NOT built this phase**: any UI affordance for
+  RENDERING another user's cursor/selection as a visible caret/highlight
+  in the DOM (`EditorView.tsx` gained the CaretTracker machinery for
+  THIS session's own local caret only; Phase 31's presence protocol
+  already relays a peer's `anchor`/`focus` identifiers over the wire, and
+  `Engine.resolveCaret` now exists to resolve them, but nothing yet
+  renders a peer's resolved position as a visible marker — the same
+  "build the real capability now, a future UI phase wires it up"
+  precedent this project has followed since Phase 24's
+  `offlineWindowStatus`); IME composition's own caret behavior
+  (`insertCompositionText`/`deleteCompositionText` still never emit an
+  operation at all, Phase 12/13's own disclosed, still-unbuilt gap,
+  unrelated to and unaffected by this phase); undo/redo's own interaction
+  with a transformed caret (Phase 36's own job, unbuilt regardless).
+  `visibleIndexRightOf`'s O(depth) cost is the SAME cost class every
+  other position-aware `FugueTree` operation already carries, including
+  this project's own already-disclosed Fugue O(N) worst-case chain depth
+  for purely sequential typing (Open Item 3) — not a new performance
+  regression this phase introduces. **This claim was NOT left
+  unverified** — see the dedicated "Phase 32 code review" entry
+  immediately below for a real benchmark confirming it, and for a
+  genuinely separate, real finding the SAME review surfaced (and
+  partially fixed the same day): `resolvePresenceAnchor`'s own O(N)
+  `engine.visible()` cost, called from `CaretTracker` on every remote
+  batch with no rate limit, tracked as new Open Item 12.
+
+  **DoD verification**: `pnpm -r exec tsc --noEmit` clean across all 6
+  packages. `pnpm eslint` on every file this phase touched or added shows
+  only pre-existing, unrelated findings (confirmed via a direct
+  before/after `git stash` comparison: the identical 4 errors — 3
+  unused-variable warnings in `engine.test.ts`'s own pre-existing Phase
+  25 `tryRevertLocalInsert()` tests, 1 `prefer-const` in `engine.ts`'s
+  own pre-existing Phase 21 `collect()` method — are present byte-for-
+  byte identically BEFORE this phase's changes, confirming zero new lint
+  issues introduced). The full default `pnpm test` suite passes clean:
+  **573 passed, 2 skipped** (the same disclosed, deferred Fugue O(N²)
+  GC-chain tests, unchanged) across 64 files — up from Phase 31's own
+  end-of-phase count, the delta being this phase's own 16 new tests (8
+  engine-level, 8 client-level) plus no regressions anywhere else,
+  including the pre-existing `fugueTree.crosscheck.test.ts` (3,000
+  seeds, unaffected — this phase added a new READ-only query method,
+  `visibleIndexRightOf`, and touched no mutation path at all) and
+  `EditorView.test.tsx`'s own 4 pre-existing tests (unchanged, confirming
+  the CaretTracker wiring swap didn't regress the component's existing
+  mount/beforeinput behavior).
+
+  **Phase 32 code review, same day (2026-09-11) — two real findings, one
+  fixed, one tracked.** A direct question — "is `resolveCaret` O(N) per
+  call, and if so does it compound with Open Item 3 under sustained
+  editing at a realistic (10,000+ character) document size?" — was
+  answered with a REAL benchmark
+  (`packages/testkit/src/benchmark/caretResolution.ts`/
+  `.bench.test.ts`, `pnpm test:benchmark`), not by re-asserting the doc
+  comment's own reasoning. Result: `resolveCaret` itself is NOT the
+  problem (confirmed O(depth), not O(N) — the same cost `attach()`'s own
+  ancestor walk already pays on every insert, not a worse one) — but
+  `resolvePresenceAnchor`'s own `engine.visible()` call (a full,
+  genuinely O(N) traversal) IS a real, measured, roughly-linear cost,
+  and `captureCaret`'s FIRST version called it TWICE per remote batch
+  (anchor and focus each independently). **Fixed the same day**:
+  `captureCaret` now calls `engine.visible()` exactly once and resolves
+  both anchor and focus against that one shared snapshot — measured to
+  roughly HALVE the per-remote-batch caret-tracking overhead at 20,000
+  characters (p50 ≈3.3–3.5ms/p95 ≈6.9–7.6ms post-fix, vs. p50 ≈7.2ms/
+  p95 ≈9.7ms pre-fix). The underlying O(N) cost CLASS is not eliminated
+  by this fix, only halved — tracked as new **Open Item 12** (see the
+  open-items list) as a real, disclosed, currently-unresolved compounding
+  risk, not silently left for a future load-testing session to discover.
+  One benchmark run produced markedly worse numbers than the others
+  (build 42.6s vs. 12.5–16.4s at the same size); confirmed via `tasklist`
+  to be concurrent-process contention, the same "isolate before trusting
+  a timing measurement" discipline this project established in Phase
+  24 — the numbers quoted above and in Open Item 12 are from confirmed-
+  isolated runs, and the contended run is disclosed, not hidden.
+
+  **The same review separately asked whether CUR-05's own 600-sample
+  test ever actually exercises a peer deleting the tracked anchor
+  character itself — found it did NOT** (the test's own random-edit
+  logic deliberately steered every edit away from the anchor's exact
+  position, by design, to prove zero SPURIOUS drift — but this meant the
+  harder, more realistic case CUR-05's own reference text implies over
+  60 real seconds of concurrent editing was never actually reached,
+  making the original test a narrower proof than it looked). **Fixed the
+  same day**, not merely disclosed: a SECOND CUR-05 test was added,
+  identical in shape but with a scripted event at sample 300 that
+  deletes the EXACT character the caret is anchored to, then asserts the
+  tracked anchor identifier (a) stays the ORIGINAL id for every sample up
+  to and including that tick, (b) transitions to the new surviving
+  predecessor's id at EXACTLY the very next sample — never earlier,
+  never later, never more than once — and (c) stays at that new id,
+  unchanged, for the remainder of the 600-sample run. This is a strictly
+  stronger proof than either CUR-04 alone (a single isolated check) or
+  the original CUR-05 test alone (never challenges the anchor) —
+  together they now prove both "stable when untouched" and "re-anchors
+  exactly once, then stays stable again" under the SAME sustained-load
+  harness. `packages/client/src/editor/caretTracker.test.ts` now has 9
+  tests (was 8); full default `pnpm test`: **574 passed, 2 skipped**.
+
 ## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
 
 This entry documents a real, load-bearing investigation that happened AFTER
@@ -7627,6 +7860,82 @@ workspace — it did not.
     `part4_resolution_2026_09_07_followup` section and
     `docs/benchmarks.md`.
 
+12. **NEW (2026-09-11, Phase 32 code review) — `resolvePresenceAnchor`'s
+    (and, to a much smaller degree, `Engine.resolveCaret`'s) per-call
+    cost compounds with the disclosed Fugue O(N) sequential-typing chain
+    depth (Item 3), on a code path this project did NOT have before
+    Phase 32: `EditorView.tsx`'s `onRemoteOpsApplied` handler now calls
+    caret-resolution logic on EVERY remote batch, with no rate limit the
+    way Phase 31's own 20/s presence-SENDING path has.** Measured with a
+    new, permanent benchmark
+    (`packages/testkit/src/benchmark/caretResolution.ts`/
+    `.bench.test.ts`, `pnpm test:benchmark`), against a document built
+    via SEQUENTIAL typing — Fugue's own worst-case deep-chain shape,
+    `scaling.ts`'s same methodology — at 2,000/5,000/10,000/20,000
+    characters:
+
+    - **`Engine.resolveCaret` itself is NOT the dominant cost and is
+      NOT a new O(N) liability** — it walks only the ANCESTOR chain
+      (O(depth), the identical cost class `FugueTree.attach()`'s own
+      `updateSize` ancestor walk already pays on every insert, i.e. the
+      SAME per-operation cost Open Item 3 already prices in, not a
+      worse one). Measured at the DEEPEST possible anchor (the most-
+      recently-typed character): 0.13–0.55ms at N=2,000, 0.09–0.50ms at
+      N=20,000 across repeated clean runs — small, and NOT growing
+      linearly with N the way a true O(N) cost would (a real, if noisy,
+      empirical confirmation of the O(depth)-not-O(N) analysis in this
+      method's own doc comment).
+    - **The REAL cost is `resolvePresenceAnchor`'s own use of `Engine.
+      visible()`** — a FULL in-order traversal (`FugueTree.toArray()`),
+      genuinely O(N) in total node count, unrelated to `resolveCaret`'s
+      cheap ancestor-only walk. Measured: 0.5–1.2ms at N=2,000 growing to
+      2–4.5ms at N=20,000 per call (clean, isolated runs) — a real,
+      roughly-linear-with-N cost, exactly as its own O(N) nature
+      predicts. `captureCaret` (Phase 32's own new code) called this
+      TWICE per remote batch (once for anchor, once for focus) in its
+      FIRST version — found and fixed the same day, before this phase
+      was ever reported complete: `captureCaret` now calls `engine.
+      visible()` exactly ONCE and resolves both anchor and focus against
+      that one shared snapshot, halving this specific cost. See
+      `caretTracker.ts`'s own PERFORMANCE NOTE for the full account.
+    - **Sustained-editing simulation** (a peer appending one character
+      at a time, 300 times, starting from a 5,000/10,000/20,000-char
+      sequentially-typed document; the exact `capture`+`resolveCaret`×2
+      cost `EditorView.tsx` now pays per remote batch, measured
+      separately from the also-O(N) but PRE-EXISTING `domWriter.mount()`/
+      `engine.text()` remount cost, Phase 14, unchanged by this phase):
+      at N=20,000, **p50≈3.3–3.5ms, p95≈6.9–7.6ms, max≈14–17ms per
+      remote-batch-triggered capture+restore cycle**, roughly HALF the
+      pre-fix numbers at the identical size (p50≈7.2ms, p95≈9.7ms,
+      total 2,120ms over 300 appends, vs. ~1,230–1,290ms post-fix) —
+      confirming the one-call fix is a real, measured, non-trivial
+      improvement, not merely a theoretical one. One measurement run
+      landed markedly worse across the board (build 42.6s vs. an
+      isolated 12.5–16.4s at the same N, `engine.visible()` 18.6ms vs.
+      2–4ms) — confirmed, per this project's own established "isolate
+      before trusting a timing measurement" discipline (Phase 24's own
+      precedent), to be a concurrent-process contention artifact (a
+      `tasklist` check found other Node processes running during that
+      specific run) rather than a real regression; the numbers reported
+      above are from runs confirmed to have zero contending processes.
+    - **Honest assessment**: this IS a real, disclosed, currently-
+      UNRESOLVED compounding risk, not a false alarm — at documents
+      meaningfully larger than 20,000 characters (this project's own
+      already-disclosed Fugue O(N²) scaling means such a document is
+      ALREADY expensive to build/edit for reasons unrelated to this
+      phase), the SAME `capture`/`restore` cycle would cost more, per
+      remote batch, purely for caret tracking, on top of an
+      already-growing base cost. The one-call fix shipped this session
+      is a real, measured, non-regressive improvement — but it HALVES an
+      O(N) cost, it does not eliminate the O(N) class itself. A genuine
+      fix (an incrementally-maintained visible-sequence view, or
+      reusing whatever balanced-storage redesign Item 3 eventually
+      produces, so a caret-position lookup no longer needs a full tree
+      traversal at all) is explicitly NOT attempted here — it is a
+      real, separately-scoped redesign, not a same-day patch, and is
+      tracked as its own follow-up rather than silently left for a
+      future load-testing session to rediscover.
+
 Items 2-11 are genuinely separable follow-up work, each with its own clear
 scope; item 1 was the one that blocked everything else in this project
 (including item 2) and has now been resolved. Items 3, 6, and 9 remain
@@ -7636,12 +7945,60 @@ see item 9's own text; Item 11's own step-4 comparison is now a concrete
 data point in favor of prioritizing 9 sooner rather than later, since
 the elevated R0012 rate turns out NOT to be an artifact of this soak's
 own aggressive tuning); item 7 is a flaky-test investigation to revisit
-once item 3 lands; items 10 and 11 are both now resolved — there is no
-single remaining concrete blocker to Phase 25's own closeout as of this
-entry (see the Phase 25 final report, same date, for the complete DoD
-status and v0.2.0-m2 tag readiness determination).
+once item 3 lands; items 10 and 11 are both now resolved. Item 12 is a
+NEW, real compounding risk found by this session's own code review, with
+its most costly half already mitigated (halved, not eliminated) the same
+day — its own genuine fix (an incremental visible-sequence view) remains
+open, tracked separately from Item 3 the same way Item 9 already is.
+There is no single remaining concrete blocker to Phase 25's own closeout
+as of the entry above (see the Phase 25 final report, same date, for the
+complete DoD status and v0.2.0-m2 tag readiness determination) — Item 12
+is a Phase 32 finding, unrelated to Phase 25's own tag readiness.
 
 ## Current phase in progress
+
+**Phase 32 (resolveCaret and cursor/selection transformation) — COMPLETE
+as of 2026-09-11.** Each user's own caret and selection now stays
+anchored to the CHARACTERS they placed it on — including through a
+remote insert or delete before it, and including when the anchor
+character itself is deleted by someone else — closing Test Plan
+blocker B19. `Engine.resolveCaret(id: Identifier | null): number` (new,
+`FugueTree.visibleIndexRightOf`'s single augmented-size walk underneath
+it) reinterprets API Spec §7.5.3's pre-Fugue, flat-array design intent
+correctly for a tree, per the phase's own explicit correction: rather
+than a separate "walk left looking for a survivor" traversal, the SAME
+`visibleSize` aggregate `nodeAtVisible` already relies on turns out to
+already equal the answer for BOTH a live and a tombstoned anchor, with
+no extra step — see the "Phase 32" bullet in the Completed Phases list
+above for the full derivation. Client-side, `CaretTracker`
+(`captureCaret`/`restoreCaret`, `packages/client/src/editor/
+caretTracker.ts`) replaces Phase 14's own numeric-visible-index
+stand-in in `EditorView.tsx`'s remote-ops-applied handler, resolving
+anchor AND focus independently (CUR-03) via `resolvePresenceAnchor`
+(Phase 31, reused directly) and `Engine.resolveCaret`. All five DoD
+test scenarios (CUR-01..05, including CUR-04's three-independent-
+replica determinism proof and CUR-05's 600-sample zero-anchor-drift
+proof) pass, at both the engine level (no DOM) and the client level
+(real `Engine` + real `DomWriter` + real jsdom `Selection`, no network
+needed). A same-day code review asked two real questions and found two
+real things: (1) does `resolveCaret` compound with the disclosed Fugue
+O(N) chain-depth cost (Open Item 3) under sustained editing? Measured —
+`resolveCaret` itself is fine (O(depth), not O(N)), but its capture-
+direction sibling `resolvePresenceAnchor` (`engine.visible()`, genuinely
+O(N)) was being called TWICE per remote batch; fixed to call it once
+(roughly halves the cost), with the remaining O(N) class tracked as new
+Open Item 12, not silently left for a future load-testing session; (2)
+did CUR-05's own 600-sample test ever actually exercise a peer deleting
+the tracked anchor mid-run? It did not — fixed by adding a second CUR-05
+test that deletes the anchor at a scripted point and proves exactly one
+re-anchor followed by renewed stability. See the "Phase 32 code review"
+entry under the Completed Phases list for the full account. No open
+item from this phase BLOCKS anything (Item 12 is a disclosed, tracked
+performance risk, not a correctness gap) — the next phase to pick up is
+whichever one builds a UI affordance for RENDERING a peer's own resolved
+cursor position as a visible marker in the DOM (Phase 31 already relays
+the wire data; this phase already resolves it back to a live index;
+nothing yet paints it).
 
 **Phase 31 (Presence protocol and channel separation) — COMPLETE as of
 2026-09-11.** Cursors and selections now travel on their own PRESENCE
@@ -7663,11 +8020,7 @@ PRESENCE_ROSTER frame became part of every handshake — most notably
 call would have silently consumed the wrong frame without this fix. All
 DoD items (PRES-01/04/05, M5-b/c) verified against a real WebSocket
 wire; the two touched DB-gated test files re-run clean against a real,
-migrated Postgres instance. No open item from this phase blocks
-anything — the next phase to pick up is whichever one builds cursor
-transformation under concurrent remote edits (Phase 32), which is what
-would finally make a peer's own relayed anchor/focus identifiers
-actually renderable as a live, correctly-tracking cursor in the DOM.
+migrated Postgres instance.
 
 **Phase 30 (Rate limiting, circuit breaker, and the security suite) —
 COMPLETE as of 2026-09-11 (empirically verified, not just unit-tested).
@@ -7952,10 +8305,17 @@ CONTROL, and — as of Phase 31 — PRESENCE channels all now flow end to
 end: PRESENCE_UPDATE/JOIN/LEAVE/ROSTER are real, structurally isolated
 from the engine/persistence layer, and a stale session's presence is
 now actually removed (not merely logged/marked) via the same 8-second
-timer heartbeat.ts has carried since Phase 9. Cursor TRANSFORMATION
-under concurrent remote edits (adjusting a peer's reported anchor as
-the document changes underneath it) remains unbuilt — Phase 32's own
-job, per Phase 31's own explicit scoping.
+timer heartbeat.ts has carried since Phase 9. Cursor/selection
+TRANSFORMATION under concurrent remote edits is now BUILT as of Phase
+32 — `Engine.resolveCaret` resolves a caret/selection anchor identifier
+back to a live visible index (correctly, even through a remote edit
+that shifted or deleted the anchored character), and `CaretTracker`
+wires this into `EditorView.tsx`'s own remote-ops-applied re-render.
+What remains unbuilt is specifically the UI half: nothing yet renders
+ANOTHER user's own resolved cursor position as a visible marker in the
+DOM — Phase 31 already relays a peer's `anchor`/`focus` identifiers
+over the wire, and Phase 32 already resolves them back to a live index,
+but no component paints them.
 Reconnection catch-up (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.8) is now
 BUILT as of Phase 23 — a reconnecting client with a still-resident engine
 (a socket drop, not a full page reload) receives a delta over
@@ -8082,10 +8442,12 @@ later phases and unaffected by this milestone: **persistence** (a
 coordinator restart loses all content, Phases 15-17), **auth** (any
 client can join any document as EDITOR by guessing its id, Phases
 26-29), and **rendered presence** — the real PRESENCE protocol/room/
-coalescing machinery is now BUILT as of Phase 31, but no UI renders
-another user's cursor, selection, or avatar yet, and cursor positions
-are never adjusted (transformed) as concurrent remote edits land under
-them (Phase 32's own job).
+coalescing machinery is BUILT as of Phase 31, and cursor/selection
+positions are now correctly TRANSFORMED (tracked to the same character)
+as concurrent remote edits land under them as of Phase 32, but no UI
+yet renders another user's own resolved cursor, selection, or avatar as
+a visible marker in the DOM — this session's OWN caret is transformed
+correctly; painting a PEER's remains unbuilt.
 **Offline editing is now BUILT as of Phase 22** — API Spec §7.9's durable
 IndexedDB queue, a relaxed `requireEngine()`/input-pipeline gate that
 allows minting edits while `reconnecting`/`offline`, and

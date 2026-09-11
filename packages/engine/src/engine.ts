@@ -416,6 +416,43 @@ export class Engine {
   }
 
   /**
+   * Phase 32 (API Spec §7.5.3, Engine Spec §11.3 change request, Test Plan blocker B19) — resolves
+   * a caret/selection ANCHOR (the identifier of the node immediately left of a cursor position,
+   * `null` meaning document start — the SAME convention `InsertOperation.parent`/
+   * `FugueTree.decidePlacement`/Phase 31's presence protocol already use) back into the CURRENT
+   * visible index immediately to its right, tracking it correctly even if that node has since been
+   * deleted by someone else.
+   *
+   * CORRECTED FOR THE FUGUE ENGINE, not a literal implementation of the pre-Phase-25 design intent
+   * (recorded here because the original text is stale and must not be re-implemented literally):
+   * the original API Spec §7.5.3 text describes "walking LEFT through the sequence" — a flat-array
+   * operation with no meaning against a TREE. The corrected contract keeps the exact same GOAL
+   * (find the nearest surviving node in visible DOCUMENT ORDER at or before `id`, and return the
+   * index immediately right of it) but the MECHANISM is `FugueTree.visibleIndexRightOf`'s single
+   * augmented-size walk, not an explicit "look leftward" traversal — see that method's own doc
+   * comment for exactly why a separate predecessor-search step turns out to be unnecessary: the
+   * SAME arithmetic that answers "where is a live node" also, for a tombstoned node, already
+   * equals "where is its nearest live predecessor," with no extra step.
+   *
+   * Contract (unchanged from the original design intent, Test Plan CUR-01..05):
+   *   - `id === null` → 0 (document start).
+   *   - `id` resolves to a LIVE node → that node's own visible index, plus one.
+   *   - `id` resolves to a TOMBSTONED node → the nearest surviving node's visible index (in
+   *     document/in-order sense) plus one; 0 if nothing survives before it.
+   *   - `id` unknown (including a since-GC'd identifier, Phase 21) → 0, the same "nothing
+   *     resolvable before it" answer as an entirely-tombstoned prefix (a disclosed graceful
+   *     degradation, not a distinguished error case — the caller has no way to tell these apart
+   *     from the wire either, and API Spec §7.5.3 names no separate error path).
+   *   - Deterministic and IDENTICAL on every replica that has applied the same operations — this
+   *     holds for the WHOLE tree structure under Fugue, not merely its visible text (see
+   *     `FugueTree`'s own header comment), which is what makes this safe to call independently on
+   *     three unrelated replicas and always get back the same answer (Test Plan CUR-04).
+   */
+  resolveCaret(id: Identifier | null): number {
+    return this.tree.visibleIndexRightOf(id);
+  }
+
+  /**
    * Mints and applies a local insert, returning the operation to broadcast
    * (API Spec §1.4). `parent`/`side` are decided here via
    * {@link FugueTree.decidePlacement} — Fugue's own `createBetween` rule,
