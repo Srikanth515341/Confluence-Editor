@@ -12,6 +12,29 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 31 — Presence protocol and channel separation.** Cursors and
+selections now travel on their own PRESENCE channel — PRESENCE_UPDATE,
+PRESENCE_JOIN, PRESENCE_LEAVE, PRESENCE_ROSTER — structurally incapable
+of delaying an operation or ever touching document state (no import
+from the engine or persistence layer in the presence code at all).
+Positions are identifiers, resolved against the CURRENT Fugue-based
+engine's own real API (`engine.visible()`), not the stale YATA-era
+`originLeft`/`originRight` convention the phase's own reference text
+mistakenly still named. Three independent enforcement points bound the
+20/s cap — client-side 50ms trailing-edge coalescing, a client-side hard
+cap, and a server-side ceiling that drops rather than queues excess —
+verified with a real 500/s flood that never touches a concurrent
+typer's own operation latency, and a real 200-frame presence backlog
+that a single operation still jumps ahead of, proving Phase 8's
+three-queue design end to end for the first time. Presence is removed
+immediately on a clean LEAVE, and within seconds of an abrupt
+disconnect or an 8-second silence — kept structurally separate from
+GC's unrelated 10-minute eviction window, the exact conflation this
+project has already found and fixed once before. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 31 entry for the full account,
+including four existing test helpers found to need updating once a
+real PRESENCE_ROSTER frame joined the standard handshake sequence.
+
 **Phase 30 — Rate limiting, circuit breaker, and the security suite
 (Milestone M3, tag `v0.3.0-m3`).** Defends against the metadata-
 exhaustion attack this project's own CRDT choice specifically creates:

@@ -215,6 +215,7 @@ async function connectWithTicket(
   }
   await frames.next(); // SNAPSHOT
   await frames.next(); // ALREADY_HAVE
+  await frames.next(); // PRESENCE_ROSTER (Phase 31, API Spec §3.8) — always the 4th and last handshake frame; drained here so it never misaligns a later `frames.next()` call expecting a real OPS/CONTROL frame.
   return { ws, welcome, frames };
 }
 

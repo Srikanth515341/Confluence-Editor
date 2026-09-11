@@ -6069,6 +6069,259 @@ check:purity` was ALSO silently broken by two comments (one in
   fields already carry (Phase 26) and every other piece of this project's
   in-memory server-side state shares.
 
+- **Phase 31 — Presence protocol and channel separation** (API Spec §3.8,
+  §9.1, §9.3-§9.5; RFC §9; PRD FR-PR-1/4/5/8). Transmits cursor and
+  selection state on its own PRESENCE channel — structurally incapable
+  of delaying an operation or ever touching document state. Dependencies:
+  Phases 8 (the three-queue send design, built but never exercised by
+  real presence traffic until now) and 29 (real per-document
+  authorization at connect time — presence room membership reuses that
+  SAME check rather than inventing a second one).
+
+  **The critical correction, resolved before any design work began, per
+  the user's own explicit instruction**: the phase's own reference text
+  said cursor positions should use "the same convention as originLeft" —
+  stale since Phase 25's Fugue migration, which retired
+  `originLeft`/`originRight` entirely in favor of `parent`/`side`.
+  Investigated directly against `engine.ts`/`fugueTree.ts` before writing
+  any code: the CURRENT engine's own public `visible()` method (Phase
+  1/3, "the visible sequence, in order," already used by `text()`/
+  `stats()`) is exactly what a visible-offset cursor position is defined
+  against — `resolvePresenceAnchor(engine, visibleIndex)` (in
+  `packages/client/src/sync/syncClient.ts`, exported standalone) resolves
+  "the identifier of the node immediately LEFT of the anchor" as
+  `engine.visible()[visibleIndex - 1]?.id ?? null`, the same `null`-means-
+  document-start convention `InsertOperation.parent`/`decidePlacement`
+  already use. No `resolveCaret`-shaped method exists yet on `Engine` —
+  full caret-anchor resolution under REMOTE concurrent edits (adjusting a
+  peer's reported anchor as the document changes underneath it) remains
+  explicitly Phase 32's own job, flagged here rather than attempted under
+  this phase's own schedule; this phase only needed presence positions to
+  reference a real, stable node identifier, which they now do.
+
+  **Wire protocol** (`packages/protocol/src/presenceMessages.ts`/
+  `presenceCodec.ts`, mirroring `controlMessages.ts`/`controlCodec.ts`'s
+  own established shape): four message types, namespaced within
+  `Channel.PRESENCE` (0x02, reserved since Phase 8, never previously
+  built on) — `PRESENCE_UPDATE` (bidirectional; a flags byte for
+  anchor/focus presence and collapsed/caret, then the optional
+  identifier stamps; `replicaId` is a varint present ONLY on the
+  server→client direction, genuinely OMITTED from the wire on a
+  client-sent frame, not merely zero-valued — verified with a dedicated
+  byte-length test), `PRESENCE_JOIN`/`PRESENCE_LEAVE`/`PRESENCE_ROSTER`
+  (all server-only). `PresenceLeaveReason` (`CLEAN = 0`, `STALE = 1`)
+  values taken verbatim from the spec text. Round-trip tested at 2,000
+  generated cases per message type (`presenceCodec.test.ts`), plus the
+  same malformed-frame discipline established for OPS/CONTROL (reserved
+  bits, unknown enum values, wrong channel, trailing bytes, truncation,
+  and — the presence-specific case — a server-only type arriving with
+  `direction: "clientOrigin"`).
+
+  **Structural isolation** (Scope-IN: "the presence code has no import
+  from the engine or persistence layer") is enforced by construction, not
+  merely by convention: `packages/server/src/presenceManager.ts`
+  (`PresenceRoom`) imports only from `@collab-editor/protocol`, its own
+  local `InMemoryRateLimiter`, and `logger.ts` — no `@collab-editor/engine`,
+  no `./documentCoordinator.js`, no `./db/*.js` anywhere in the file. It
+  never even holds a `CoordinatorSession`/`DocumentCoordinator` reference:
+  `PresenceRoom.join(participant, send)` takes a plain identity record
+  (`sessionId`/`replicaId`/`userId`/`displayName`/`role`) and a bare
+  `(frame: Uint8Array) => void` send callback, supplied by `gateway.ts`
+  as a closure over that session's own `queues.enqueue("presence", ...)`
+  — the SAME decoupling `sendQueues.ts` itself already established
+  ("deliberately payload-agnostic"), one layer up. `packages/client/src/
+  sync/presence.ts` (`PresenceUpdateCoalescer`) is equally isolated —
+  it operates on an opaque `PresencePosition` (`anchor`/`focus`: `unknown
+  | null`) and never imports `@collab-editor/engine` either; only
+  `syncClient.ts` (which already depends on `Engine` for unrelated
+  reasons) ever resolves a real `Identifier` before handing it to the
+  coalescer.
+
+  **Three independent enforcement points for the 20/s cap** (§9.3-9.5),
+  verified separately, not just asserted:
+  1. **Client-side 50ms trailing-edge coalescing** (`PresenceUpdateCoalescer.
+     update()`): REPLACES the pending position, never queues — a
+     sustained stream of local cursor moves sends on a steady ~50ms
+     cadence regardless of how many calls arrive in between (verified: a
+     100-call stream over 500ms produces 8-11 sends, never anywhere near
+     100).
+  2. **Client-side hard cap at 20/s**, independent of the coalescer's own
+     cadence (verified with a decoupled fake clock: 25 attempts inside
+     one second sends exactly 20, and capacity genuinely frees up as
+     old sends slide out of the trailing window).
+  3. **Server-side ceiling that drops excess, never queues**
+     (`PresenceRoom.handleUpdate`, reusing `InMemoryRateLimiter` under a
+     `presence:<sessionId>` key) — verified directly at the unit level
+     (30 attempts in one instant admit exactly 20) and end to end over a
+     real wire (M5-b, below).
+
+  **Server-side presence-room wiring** (`gateway.ts`): a `presenceRooms:
+  Map<string, PresenceRoom>`, structurally SEPARATE from `coordinators`
+  (never imported into `documentCoordinator.ts`) — `getOrCreatePresenceRoom`
+  mirrors `getOrCreateCoordinator`'s own lazy-create/never-delete shape,
+  for the identical reason (no persisted counter here to reset, but an
+  empty room costs nothing to keep alive either). Presence room
+  membership is gated by the SAME authorization that already admitted
+  the session to the document's coordinator — `PresenceRoom.join` is
+  called immediately after `coordinator.join(session)`, using the exact
+  `role`/`userId`/`displayName` that authorization step already computed,
+  so there is no separate presence-only admission path an unauthorized
+  caller could reach instead (this is also SEC-11j's own real closure —
+  see the Phase 30 entry above for why that item was deferred to this
+  phase; it is satisfied structurally, not by a new check). PRESENCE_ROSTER
+  is sent as the LAST step of the handshake-completion sequence (after
+  WELCOME/state-sync/ALREADY_HAVE/any RC-32 PERMISSION_CHANGED), routed
+  through the presence queue itself — proving even the roster frame can
+  never jump ahead of a still-draining OPS/CONTROL backlog.
+
+  **Removal has three trigger points, deliberately not merged**, mirroring
+  the SAME "don't conflate the 8-second presence timer with GC's unrelated
+  10-minute eviction" discipline this project has already learned once
+  (`heartbeat.ts`'s own standing comment):
+  1. An explicit CONTROL-channel `LeaveMessage` (Phase 9's pre-existing
+     "client announces a clean departure" frame, now dual-purposed as the
+     `reason: CLEAN` trigger) removes presence IMMEDIATELY, in
+     `handleControlMessage`'s own `"leave"` case — before the socket even
+     closes (PRES-05).
+  2. An abrupt `ws.on("close", ...)` with no prior LEAVE removes presence
+     immediately too, with `reason: STALE` (the semantic category — "no
+     clean goodbye happened" — not literally "detected via the 8-second
+     timer": the OS closing the TCP connection is itself an immediate,
+     reliable signal, comfortably within PRES-04's 10-second bound).
+  3. `heartbeat.ts`'s existing 8-second presence-stale timer
+     (`armPresenceStaleTimer`/`markPresenceStale`, built Phase 9, then
+     only logging/marking) now ALSO removes presence via a new optional
+     `CoordinatorSession.onPresenceStale` closure — the same
+     optional-callback pattern `disconnectForRevocation`/
+     `disconnectForRateLimit` already established (Phases 27/30) — for
+     the one case neither trigger 1 nor 2 can cover: a socket that stays
+     open but simply stops PINGing (a frozen tab, or packets silently
+     dropped with no TCP close ever propagating).
+  `PresenceRoom.leave()` is idempotent — whichever trigger fires first
+  wins; a later call for an already-removed session is a documented,
+  tested no-op — so all three can be wired unconditionally without a
+  session ever double-counting a departure or racing between triggers.
+
+  **Test Plan verification, all against a real WebSocket wire** (new
+  `packages/server/src/presenceGateway.test.ts`, 5 tests; new
+  `packages/server/src/presenceManager.test.ts`, 8 unit tests; new
+  `packages/client/src/sync/presence.test.ts`, 6 coalescer unit tests;
+  new `packages/client/src/sync/presenceIntegration.test.ts`, 3 tests
+  against a real `SyncClient` pair): **PRES-05** (a clean LEAVE removes
+  presence in well under 1s, nowhere near the 8s timer). **PRES-04** (an
+  abrupt `ws.terminate()` — standing in for a SIGKILLed browser process,
+  the closest a Node test can get without a real separate browser
+  process — removes presence with `reason: stale` in well under the 10s
+  bound; the durable `sessions` row / GC-frontier participation half of
+  PRES-04's own claim is untouched by this phase's own code at all,
+  since `PresenceRoom` never touches `coordinator.leave()` or any
+  persistence — see this bullet's own disclosed-scope note below).
+  **PRES-01** (4 real clients exchanging 100 presence-only frames each
+  with zero edits: `coordinator.engine.text()` stays `""`,
+  `totalElements` stays `0`, `currentSeq` stays `0n` — document state
+  provably untouched). **M5-c** (a 200-frame presence burst plus one real
+  operation, all enqueued in the same synchronous tick: the operation
+  arrives at an observer after at most a handful of already-in-flight
+  presence frames, never anywhere near the full 200-frame backlog —
+  proving Phase 8's three genuinely separate physical queues end to end
+  for the first time with real presence traffic, not just the
+  no-network unit tests Phase 8 itself shipped with). **M5-b** (a real
+  ~500/s presence flood from one client, concurrent with a real typer
+  sending 20 real operations: all 20 arrive with p95 well under the
+  generous 500ms bound, the observer sees fewer than 60 presence frames
+  total despite the flood attempting 250+, and the flooding client's own
+  socket stays open throughout).
+
+  **Real bugs found while building this phase's own verification, not by
+  review — the same discipline this project has followed since Phase
+  5/7**: (1) the very first draft of the M5-c test had its own logic
+  bug — it `break`-ed out of its search loop the instant it saw ANY
+  non-join presence frame before the operation, which is not actually a
+  failure condition (one already-in-flight frame legitimately CAN precede
+  a preempting higher-priority frame — no priority queue can cancel a
+  send already in progress); fixed by counting presence frames seen
+  before the op and asserting that count stays small, not zero. (2) the
+  first drafts of PRES-04/PRES-05/M5-b all wrongly assumed a
+  later-joining client would receive a PRESENCE_JOIN broadcast for a
+  peer that connected BEFORE it — it does not (that peer is already in
+  the roster the late joiner receives instead, so no separate broadcast
+  is ever sent for it) — this produced real test hangs (PRES-05 timed
+  out) and a misdirected read (PRES-04's own first assertion read an
+  8-second-later STALE leave instead of the intended immediate one),
+  caught only by actually running the tests, not by inspecting the
+  helper code. (3) actually running this project's own FULL default test
+  suite (not just this phase's new files) surfaced FOUR existing test
+  helpers that decode every incoming WebSocket message as CONTROL
+  unconditionally, with no channel check — each one broke the instant a
+  real PRESENCE_ROSTER frame (now unconditionally part of every
+  handshake) arrived and was fed to `decodeControlFrame`, throwing
+  `WRONG_CHANNEL` as an unhandled exception inside a `ws.on("message",
+  ...)` listener: `gateway.test.ts`'s own `connectAndHandshake` (fixed to
+  consume the roster as the handshake's genuine 4th/last frame, tolerant
+  of an interleaved RC-32 `PERMISSION_CHANGED` via a new `extraControl`
+  array on its return value); `httpApp.test.ts`'s `bufferedControlReader`
+  (fixed to skip any non-CONTROL frame via `peekChannel` before
+  decoding); `db/documents.db.test.ts`'s own second, ad hoc GOODBYE
+  listener (same `peekChannel` guard added); and `db/tickets.db.test.ts`'s
+  `connectWithTicket` (fixed to drain the roster as a 4th frame — without
+  this, a LATER `frames.next()` call in the SEC-04 test would have
+  silently consumed the wrong frame, an alignment bug that would have
+  gone undetected by that test's own assertions failing for the wrong
+  reason rather than an outright crash). None of these four are new
+  design flaws in the phase's own protocol/server code — they are exactly
+  the "an existing helper needs updating once a new frame joins a fixed
+  sequence" class of ripple this project has hit and fixed on nearly
+  every wire-protocol-extending phase since Phase 23's own ALREADY_HAVE
+  addition.
+
+  **DoD verification**: `pnpm -r exec tsc --noEmit` and `eslint` clean on
+  every file this phase touched or added. The full default `pnpm test`
+  suite passes with the four fixes above applied — no unhandled
+  exceptions, no regressions in any pre-existing file. `pnpm --filter
+  @collab-editor/client run test:reconnection` (36/36, including RC-27's
+  own p95 timing test) re-confirmed clean, since `SyncClient.onMessage`'s
+  new `Channel.PRESENCE` branch is a pure addition alongside the
+  pre-existing OPS/CONTROL branches. The two DB-gated test files this
+  phase touched (`db/documents.db.test.ts`, `db/tickets.db.test.ts`) were
+  run against a real, migrated Postgres instance (Docker Desktop started
+  manually, same recurring precedent as several earlier phases) — both
+  pass in full (9/9 and 9/9 respectively), including the exact two tests
+  (DELETE's real GOODBYE-over-the-wire check, and SEC-04's real
+  PERMISSION_CHANGED-then-OP_REJECT sequence) whose own `frames.next()`
+  call ordering the roster frame could have silently misaligned. The
+  four most directly-adjacent `db/*.db.test.ts` files (`schema`,
+  `permissions` — including its own real 50-concurrent-request SEC-07
+  burst, `durability`, `auth`) were also re-run for regression confidence
+  and all pass (32/32 combined), confirming none of this phase's
+  shared-file changes (`gateway.ts`, `documentCoordinator.ts`,
+  `heartbeat.ts`) introduced a regression elsewhere.
+
+  **What is deliberately NOT built this phase**: cursor transformation
+  under concurrent remote edits (Phase 32's own job, per the phase
+  brief's own explicit correction — a peer's reported anchor is relayed
+  and stored exactly as received, never adjusted as the document changes
+  underneath it); any UI rendering another user's cursor/selection/avatar
+  (`EditorView.tsx`/`ConnectionIndicator.tsx` untouched — this phase
+  builds the real `SyncClient.onPresenceEvent`/`sendPresenceUpdate`
+  capability, the same "build the capability now, a future UI phase
+  wires it up" precedent this project has followed since Phase 24's
+  `offlineWindowStatus`); presence's own rate/timing constants
+  (50ms/20-per-second/8s) as CONFIGURATION rather than hardcoded
+  constants — unlike `GcConfig`/`OfflineWindowConfig`/`RateLimitConfig`,
+  these are literal numbers taken verbatim from the spec text itself,
+  the same "plain constant, not a tunable" treatment `heartbeat.ts`'s
+  own `PING_INTERVAL_MS`/`PRESENCE_STALE_MS` already receive, not a new
+  inconsistency; PRES-04's own durable-session-row/GC-frontier claim is
+  untouched BY DESIGN (presence removal never calls `coordinator.leave()`
+  or touches any persistence — Phase 21's own mechanism for that claim
+  is unaffected either way, so no new test was added for it here);
+  `resolvePresenceAnchor`'s own O(N) cost (`engine.visible()` scans the
+  whole structure) is accepted as-is, the same category of cost this
+  project already accepts for `text()`/`stats()` reads, and is bounded
+  in practice by the SAME 50ms coalescing/20-per-second caps that bound
+  how often a cursor move ever reaches this function at all — not a
+  hot per-keystroke document-mutation path.
+
 ## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
 
 This entry documents a real, load-bearing investigation that happened AFTER
@@ -7390,6 +7643,32 @@ status and v0.2.0-m2 tag readiness determination).
 
 ## Current phase in progress
 
+**Phase 31 (Presence protocol and channel separation) — COMPLETE as of
+2026-09-11.** Cursors and selections now travel on their own PRESENCE
+channel end to end — real wire messages (PRESENCE_UPDATE/JOIN/LEAVE/
+ROSTER), a structurally-isolated server-side `PresenceRoom` (zero
+import from the engine or persistence layer, verified by literally
+reading the file's own import list, not just by convention), and a
+client-side `PresenceUpdateCoalescer` enforcing two of the three 20/s
+enforcement points. See the "Phase 31" bullet in the Completed Phases
+list above for the full account, including the critical correction
+this phase started with (cursor positions resolve via the CURRENT
+Fugue engine's own `engine.visible()`, never the retired YATA-era
+`originLeft`/`originRight` convention the phase's own reference text
+mistakenly still named), the real M5-c/PRES-04/PRES-05 test-design bugs
+found and fixed by actually running the tests (not by inspection), and
+the four PRE-EXISTING test helpers found and fixed once a real
+PRESENCE_ROSTER frame became part of every handshake — most notably
+`db/tickets.db.test.ts`'s own SEC-04 test, whose later `frames.next()`
+call would have silently consumed the wrong frame without this fix. All
+DoD items (PRES-01/04/05, M5-b/c) verified against a real WebSocket
+wire; the two touched DB-gated test files re-run clean against a real,
+migrated Postgres instance. No open item from this phase blocks
+anything — the next phase to pick up is whichever one builds cursor
+transformation under concurrent remote edits (Phase 32), which is what
+would finally make a peer's own relayed anchor/focus identifiers
+actually renderable as a live, correctly-tracking cursor in the DOM.
+
 **Phase 30 (Rate limiting, circuit breaker, and the security suite) —
 COMPLETE as of 2026-09-11 (empirically verified, not just unit-tested).
 Milestone M3, tag `v0.3.0-m3` on merge.** See the "✅ PHASE 30 UPDATE
@@ -7668,10 +7947,15 @@ snapshot rows). Block run-length
 encoding is now BUILT (Phase 20, Engine Spec §7.5) — SNAPSHOT's
 structure-form body serialization (`packages/protocol/src/snapshotBody.ts`)
 is a real block-encoded wire format, no longer the Phase 9 one-record-
-per-node placeholder. The OPS and
-CONTROL channels both now flow end to end (Phases 7-9); PRESENCE message
-types and any presence broadcast do not exist yet (Phase 31) — a stale
-session is only logged/marked, never actually removed from anything.
+per-node placeholder. The OPS,
+CONTROL, and — as of Phase 31 — PRESENCE channels all now flow end to
+end: PRESENCE_UPDATE/JOIN/LEAVE/ROSTER are real, structurally isolated
+from the engine/persistence layer, and a stale session's presence is
+now actually removed (not merely logged/marked) via the same 8-second
+timer heartbeat.ts has carried since Phase 9. Cursor TRANSFORMATION
+under concurrent remote edits (adjusting a peer's reported anchor as
+the document changes underneath it) remains unbuilt — Phase 32's own
+job, per Phase 31's own explicit scoping.
 Reconnection catch-up (CATCHUP/ALREADY_HAVE, API Spec §3.6.4-§3.6.8) is now
 BUILT as of Phase 23 — a reconnecting client with a still-resident engine
 (a socket drop, not a full page reload) receives a delta over
@@ -7797,7 +8081,11 @@ with nothing lost — is proven. Still missing, all previously-scoped to
 later phases and unaffected by this milestone: **persistence** (a
 coordinator restart loses all content, Phases 15-17), **auth** (any
 client can join any document as EDITOR by guessing its id, Phases
-26-29), and **presence** (no cursors/avatars for other users, Phase 31).
+26-29), and **rendered presence** — the real PRESENCE protocol/room/
+coalescing machinery is now BUILT as of Phase 31, but no UI renders
+another user's cursor, selection, or avatar yet, and cursor positions
+are never adjusted (transformed) as concurrent remote edits land under
+them (Phase 32's own job).
 **Offline editing is now BUILT as of Phase 22** — API Spec §7.9's durable
 IndexedDB queue, a relaxed `requireEngine()`/input-pipeline gate that
 allows minting edits while `reconnecting`/`offline`, and

@@ -17,14 +17,19 @@ import {
   SyncMode,
   decodeControlFrame,
   decodeFrame,
+  decodePresenceFrame,
   decodeStructureSnapshotBody,
   encodeControlFrame,
   encodeFrame,
+  encodePresenceFrame,
   peekChannel,
+  PresenceLeaveReason,
   replaySnapshotNodesInto,
   seedEngineFromSnapshot,
   type ControlMessage,
   type OpsMessage,
+  type PresenceMessage,
+  type PresenceRosterEntry,
 } from "@collab-editor/protocol";
 import { Backoff, BACKOFF_RESET_AFTER_MS } from "./backoff.js";
 import { ObservableValue, type ConnectionState, type Observable } from "./connectionState.js";
@@ -35,6 +40,7 @@ import {
   OfflineWindowTracker,
   type OfflineWindowStatus,
 } from "./offlineWindow.js";
+import { PresenceUpdateCoalescer } from "./presence.js";
 import { buildCleanCatchupBase, reconcileOfflineQueue } from "./reconcileOfflineQueue.js";
 import { UnackedQueue } from "./unackedQueue.js";
 import {
@@ -45,6 +51,48 @@ import {
 } from "./wireHelpers.js";
 
 export { OfflineWindowExceededError, type OfflineWindowStatus } from "./offlineWindow.js";
+export type { PresencePosition } from "./presence.js";
+export { PresenceLeaveReason } from "@collab-editor/protocol";
+
+/**
+ * Phase 31 (API Spec §3.8) — a decoded, already-dispatched PRESENCE event, surfaced via
+ * {@link SyncClient.onPresenceEvent}. `identifier`-shaped fields (`anchor`/`focus`) are passed
+ * through exactly as received — this file has no reason to interpret them; a future editor-
+ * binding phase resolving a peer's cursor back into a DOM position is what would actually read
+ * them, using the CURRENT Fugue engine's own visible-position/node-identifier mechanism
+ * (`FugueTree.nodeAtVisible`), the same one `resolvePresencePosition` below uses to PRODUCE this
+ * client's own outgoing updates.
+ */
+export type PresenceClientEvent =
+  | { readonly kind: "join"; readonly replicaId: number; readonly userId: string; readonly displayName: string; readonly role: SessionRole }
+  | { readonly kind: "leave"; readonly replicaId: number; readonly reason: PresenceLeaveReason }
+  | {
+      readonly kind: "update";
+      readonly replicaId: number;
+      readonly anchor: Identifier | null;
+      readonly focus: Identifier | null;
+      readonly collapsed: boolean;
+    }
+  | { readonly kind: "roster"; readonly participants: readonly PresenceRosterEntry[] };
+
+/**
+ * Resolves a VISIBLE-offset cursor position into the identifier of the node immediately LEFT of
+ * it (API Spec §3.8: "positions are identifiers, never indices") — the CURRENT, Fugue-based
+ * engine's own real mechanism for this, per this phase's own explicit correction: the retired
+ * YATA-era `originLeft`/`originRight` convention no longer exists. `visibleIndex === 0` (nothing
+ * to the left) resolves to `null`, the same `null`-means-document-start convention
+ * `InsertOperation.parent`/`FugueTree.decidePlacement` already use. Exported standalone
+ * (not a private method) so a future editor-binding phase can call it directly wherever it
+ * already has a live `visibleIndex` and `engine` in hand, without needing a full `SyncClient`.
+ */
+export function resolvePresenceAnchor(engine: Engine, visibleIndex: number): Identifier | null {
+  if (visibleIndex <= 0) {
+    return null;
+  }
+  // `Engine.visible()` (public since Phase 1/3) is the CURRENT engine's own real mechanism for
+  // "the visible sequence, in order" — the exact thing a visible-offset index is defined against.
+  return engine.visible()[visibleIndex - 1]?.id ?? null;
+}
 
 /**
  * Phase 29 (API Spec §4.7/§4.8/§5.4, RC-32's own "Client on downgrade: stop sending" Scope-IN
@@ -634,6 +682,7 @@ export class SyncClient {
   disconnect(): void {
     this.explicitlyOffline = true;
     this.clearAllTimers();
+    this.presenceCoalescer.dispose();
     this.setState("offline");
     this.ws?.close();
     this.ws = null;
@@ -821,6 +870,95 @@ export class SyncClient {
   }
 
   /**
+   * Phase 31 (API Spec §9.3 points 1-2) — the two CLIENT-side enforcement points for the 20/s
+   * PRESENCE cap; the third (a server-side ceiling) lives entirely in
+   * `packages/server/src/presenceManager.ts`. `PresenceUpdateCoalescer` is deliberately generic
+   * over an opaque `PresencePosition` (no import from `@collab-editor/engine`, see presence.ts's
+   * own header comment) — this callback is the ONLY place a coalesced position is actually turned
+   * into a wire frame, and it no-ops exactly like `sendFrame` already does while no socket exists
+   * (a cursor move while offline/reconnecting is simply never sent — there is no offline queue for
+   * presence, unlike operations, since Scope-IN never asks for one and a stale cursor position is
+   * never worth preserving across a reconnect the way an edit is).
+   */
+  private readonly presenceCoalescer = new PresenceUpdateCoalescer((position) => {
+    this.sendFrame(
+      encodePresenceFrame(
+        {
+          kind: "presenceUpdate",
+          replicaId: 0, // omitted on the wire for a client-origin frame — see presenceCodec.ts
+          anchor: (position.anchor as Identifier | null) ?? null,
+          focus: (position.focus as Identifier | null) ?? null,
+          collapsed: position.collapsed,
+        },
+        { direction: "clientOrigin" },
+      ),
+    );
+  });
+
+  /**
+   * Sends this client's own cursor/selection state (API Spec §3.8), coalesced to a 50ms trailing
+   * edge and hard-capped at 20/s (`presence.ts`). `anchor`/`focus` are identifiers of the node
+   * immediately LEFT of each position — resolve a visible-offset caret position via
+   * {@link resolvePresenceAnchor} before calling this, never pass a raw index. A no-op call
+   * (nothing currently connected) simply never reaches the wire, exactly like `sendFrame`'s own
+   * existing null-socket guard for every other frame type.
+   */
+  sendPresenceUpdate(anchor: Identifier | null, focus: Identifier | null, collapsed: boolean): void {
+    this.presenceCoalescer.update({ anchor, focus, collapsed });
+  }
+
+  private readonly presenceListeners = new Set<(event: PresenceClientEvent) => void>();
+
+  /**
+   * Subscribes to incoming PRESENCE_JOIN/PRESENCE_LEAVE/PRESENCE_UPDATE/PRESENCE_ROSTER events
+   * (API Spec §3.8) from every OTHER participant. Never fires for this client's OWN outgoing
+   * updates — those are sent, never echoed back (`presenceManager.ts`'s `PresenceRoom` never
+   * broadcasts to the sender itself). Returns an unsubscribe function, mirroring
+   * {@link onRemoteOpsApplied}/{@link onLocalInsertReverted}'s own established shape.
+   */
+  onPresenceEvent(listener: (event: PresenceClientEvent) => void): () => void {
+    this.presenceListeners.add(listener);
+    return () => {
+      this.presenceListeners.delete(listener);
+    };
+  }
+
+  private notifyPresenceEvent(event: PresenceClientEvent): void {
+    for (const listener of this.presenceListeners) {
+      listener(event);
+    }
+  }
+
+  private handlePresenceMessage(msg: PresenceMessage): void {
+    switch (msg.kind) {
+      case "presenceJoin":
+        this.notifyPresenceEvent({
+          kind: "join",
+          replicaId: msg.replicaId,
+          userId: msg.userId,
+          displayName: msg.displayName,
+          role: msg.role,
+        });
+        break;
+      case "presenceLeave":
+        this.notifyPresenceEvent({ kind: "leave", replicaId: msg.replicaId, reason: msg.reason });
+        break;
+      case "presenceUpdate":
+        this.notifyPresenceEvent({
+          kind: "update",
+          replicaId: msg.replicaId,
+          anchor: msg.anchor,
+          focus: msg.focus,
+          collapsed: msg.collapsed,
+        });
+        break;
+      case "presenceRoster":
+        this.notifyPresenceEvent({ kind: "roster", participants: msg.participants });
+        break;
+    }
+  }
+
+  /**
    * Phase 29 — the single entry point every internal caller uses to actually open a socket
    * (fresh connect, reconnect, or backoff-scheduled retry). When {@link fetchTicketFn} is
    * configured, this fetches a fresh ticket FIRST — a ticket is single-use (API Spec §4.10), so
@@ -931,6 +1069,14 @@ export class SyncClient {
         return; // a malformed frame from a trusted server is ignored, not fatal, this phase
       }
       this.handleControl(msg);
+    } else if (channel === Channel.PRESENCE) {
+      let msg: PresenceMessage;
+      try {
+        msg = decodePresenceFrame(bytes, { direction: "serverOrigin" });
+      } catch {
+        return; // a malformed frame from a trusted server is ignored, not fatal, this phase
+      }
+      this.handlePresenceMessage(msg);
     }
   }
 

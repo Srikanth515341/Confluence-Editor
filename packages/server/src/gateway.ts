@@ -10,11 +10,13 @@ import {
   SyncMode,
   decodeControlFrame,
   decodeFrame,
+  decodePresenceFrame,
   encodeControlFrame,
   encodeFrame,
   peekChannel,
   type ControlMessage,
   type OpsMessage,
+  type PresenceMessage,
 } from "@collab-editor/protocol";
 import { AckBatcher } from "./ackBatcher.js";
 import type { OperationStore } from "./db/operationStore.js";
@@ -22,6 +24,7 @@ import type { DbPool } from "./db/pool.js";
 import { getUserRole, type DocumentRole } from "./db/documentStore.js";
 import { DocumentCoordinator, type CoordinatorSession } from "./documentCoordinator.js";
 import { armPresenceStaleTimer, disarmPresenceStaleTimer, onPingReceived } from "./heartbeat.js";
+import { PresenceLeaveReason, PresenceRoom } from "./presenceManager.js";
 import {
   buildAlreadyHaveMessage,
   buildCatchupMessages,
@@ -57,6 +60,8 @@ const BACKPRESSURE_THRESHOLD_BYTES = 1 << 20; // 1 MiB
 export interface Gateway {
   readonly wss: WebSocketServer;
   readonly coordinators: ReadonlyMap<string, DocumentCoordinator>;
+  /** Phase 31 (API Spec §3.8) — one `PresenceRoom` per open document, structurally SEPARATE from `coordinators` above (never imports `@collab-editor/engine` or any persistence module — see presenceManager.ts's own header comment). Exposed read-only for tests/diagnostics, the same pattern as `coordinators`. */
+  readonly presenceRooms: ReadonlyMap<string, PresenceRoom>;
   close(): void;
 }
 
@@ -98,6 +103,27 @@ function getOrCreateCoordinator(
   return coordinator;
 }
 
+/**
+ * Phase 31 — one `PresenceRoom` per document, lazily created on first join, mirroring
+ * `getOrCreateCoordinator`'s own shape but deliberately independent of it: a presence room never
+ * needs the `OperationStore`/`DbPool`/rate-limit config a `DocumentCoordinator` does, and is never
+ * removed once created (the same "replica ids/coordinators live for the process's whole lifetime"
+ * reasoning `gateway.ts`'s own `ws.on("close", ...)` comment already gives for `coordinators` — an
+ * empty presence room costs nothing to keep around, and there is no persisted counter here that
+ * recreating it could reset).
+ */
+function getOrCreatePresenceRoom(
+  presenceRooms: Map<string, PresenceRoom>,
+  documentId: string,
+): PresenceRoom {
+  let room = presenceRooms.get(documentId);
+  if (!room) {
+    room = new PresenceRoom();
+    presenceRooms.set(documentId, room);
+  }
+  return room;
+}
+
 export interface CreateGatewayDeps {
   readonly operationStore: OperationStore;
   /**
@@ -135,6 +161,9 @@ export interface CreateGatewayDeps {
 export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): Gateway {
   const { operationStore, auth, rateLimit, circuitBreaker, connectionRateLimit } = deps;
   const coordinators = new Map<string, DocumentCoordinator>();
+  // Phase 31 (API Spec §3.8) — structurally separate from `coordinators`; see `Gateway.
+  // presenceRooms`'s own doc comment and presenceManager.ts's header comment for why.
+  const presenceRooms = new Map<string, PresenceRoom>();
   // Phase 30 (RFC §8.8) — ONE shared limiter for this whole gateway's lifetime, keyed
   // `ip:<addr>`/`account:<userId>` so the two scopes never collide in the same map.
   const connectionLimiter = new InMemoryRateLimiter();
@@ -172,7 +201,11 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
     // exactly one document at handshake time and never rebinds" — this is that binding).
     // Before that, the socket exists but belongs to no document and no coordinator.
     let bound:
-      | { readonly coordinator: DocumentCoordinator; readonly session: CoordinatorSession }
+      | {
+          readonly coordinator: DocumentCoordinator;
+          readonly session: CoordinatorSession;
+          readonly presenceRoom: PresenceRoom;
+        }
       | undefined;
 
     const queues = new ConnectionSendQueues(
@@ -404,9 +437,23 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
             ws.close(4002, "sustained rate limit violation");
           });
         },
+        // `onPresenceStale` (Phase 31, API Spec §3.8) is set just below, once `presenceRoom`
+        // exists — omitted here (not assigned `undefined`) since `exactOptionalPropertyTypes`
+        // treats an explicit `undefined` differently from an omitted optional field, and this
+        // field is genuinely mutable, unlike `disconnectForRevocation`/`disconnectForRateLimit`
+        // above (both fixed at construction time since they close over `ws` directly).
       };
       coordinator.join(session);
-      bound = { coordinator, session };
+      // Phase 31 — the SAME authorization that just admitted this session to the document's
+      // coordinator (role/userId/displayName, computed above) is what gates its presence room
+      // membership too (Scope-IN: "presence room membership gated by the Phase 28 authorization
+      // layer") — no separate check is performed here, since there is nothing left to check.
+      const presenceRoom = getOrCreatePresenceRoom(presenceRooms, ctrlMsg.documentId);
+      presenceRoom.join({ sessionId, replicaId, userId, displayName, role }, (frame) => {
+        queues.enqueue("presence", frame);
+      });
+      session.onPresenceStale = () => presenceRoom.leave(sessionId, PresenceLeaveReason.STALE);
+      bound = { coordinator, session, presenceRoom };
       armPresenceStaleTimer(session);
       logger.info("ws.connect", { documentId: ctrlMsg.documentId, sessionId, replicaId });
 
@@ -481,6 +528,15 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           }),
         );
       }
+
+      // Phase 31 (API Spec §3.8): "PRESENCE_ROSTER... sent once after sync completes" — sent as
+      // the LAST step of this same handshake-completion sequence (after WELCOME/state-sync/
+      // ALREADY_HAVE/PERMISSION_CHANGED), on the PRESENCE channel/queue itself, never CONTROL —
+      // routing it through `queues.enqueue("presence", ...)` (via `sendRoster`) is what proves
+      // this frame can never jump ahead of a still-draining OPS/CONTROL backlog (§3.3's own
+      // three-queue priority order), the same guarantee M5-c's own test exists to prove for
+      // PRESENCE_UPDATE.
+      presenceRoom.sendRoster(sessionId);
     }
 
     /** PING/SYNC_COMPLETE/LEAVE — the only CONTROL types a client may legally send after handshake (§3.6). */
@@ -488,7 +544,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       if (!bound) {
         return;
       }
-      const { coordinator, session } = bound;
+      const { coordinator, session, presenceRoom } = bound;
       switch (ctrlMsg.kind) {
         case "ping": {
           onPingReceived(session);
@@ -538,6 +594,12 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
             sessionId,
             lastAppliedSeq: ctrlMsg.lastAppliedSeq,
           });
+          // Phase 31, Test Plan PRES-05: "clean LEAVE removes presence immediately, without
+          // waiting 8s" — removed right here, at the moment the advisory LEAVE frame itself
+          // arrives, not deferred until the socket's own later 'close' event. `PresenceRoom.leave`
+          // is idempotent, so the SECOND call this same session's eventual socket close makes
+          // (below) is simply a no-op.
+          presenceRoom.leave(sessionId, PresenceLeaveReason.CLEAN);
           break;
         default:
           // HELLO again, or a server-only type somehow past decodeControlFrame's direction
@@ -594,8 +656,24 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
             return;
           }
           handleControlMessage(ctrlMsg);
+        } else if (channel === Channel.PRESENCE) {
+          // Phase 31 (API Spec §3.8, §9.1) — routed through its OWN physical queue
+          // (`queues.enqueue("presence", ...)`, Phase 8's three-queue design) end to end, never
+          // through OPS or CONTROL, so a presence flood can never delay an operation (M5-b/c).
+          let presenceMsg: PresenceMessage;
+          try {
+            presenceMsg = decodePresenceFrame(bytes, { direction: "clientOrigin" });
+          } catch (err) {
+            closeMalformed(err instanceof ProtocolDecodeError ? err.reason : "DECODE_ERROR");
+            return;
+          }
+          if (presenceMsg.kind === "presenceUpdate") {
+            bound.presenceRoom.handleUpdate(sessionId, presenceMsg);
+          }
+          // No other PresenceMessage kind can decode successfully with `direction:
+          // "clientOrigin"` — decodePresenceFrame already rejects JOIN/LEAVE/ROSTER from a client
+          // (server-only, §3.8) before returning.
         } else {
-          // PRESENCE (0x02) isn't built yet (Phase 31); anything else is not a valid channel.
           closeMalformed(`unsupported channel ${channel}`);
         }
       })().catch((err: unknown) => {
@@ -611,6 +689,17 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
       queues.close();
       if (bound) {
         disarmPresenceStaleTimer(bound.session);
+        // Phase 31, Test Plan PRES-04: an abrupt close with no prior clean LEAVE (e.g. a SIGKILLed
+        // browser process) removes presence IMMEDIATELY here, with reason STALE — "stale" names
+        // the SEMANTIC category (no clean goodbye happened), not literally "detected via the 8s
+        // timer": the OS closing the TCP connection is itself a strong, immediate signal, well
+        // within PRES-04's 10s bound. `PresenceRoom.leave` is idempotent, so this is a safe no-op
+        // if an explicit LEAVE control frame already removed it moments earlier (PRES-05). The
+        // 8-second `onPresenceStale` timer (heartbeat.ts) remains the ONLY removal path for the
+        // separate case this close handler can never cover: a socket that stays open but stops
+        // PINGing (e.g. a frozen tab, or a NAT silently dropping packets with no TCP close ever
+        // propagating) — see documentCoordinator.ts's own `onPresenceStale` field doc comment.
+        bound.presenceRoom.leave(sessionId, PresenceLeaveReason.STALE);
         bound.session.ackBatcher.close();
         bound.coordinator.leave(sessionId);
         logger.info("ws.disconnect", { documentId: bound.coordinator.documentId, sessionId, code });
@@ -638,6 +727,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
   return {
     wss,
     coordinators,
+    presenceRooms,
     close: () => {
       // `wss.close()` alone only stops accepting NEW connections — it does not touch already-open
       // sockets, so `httpServer.close(cb)` (server.ts) would hang forever waiting for them to end

@@ -47,13 +47,23 @@ export function disarmPresenceStaleTimer(session: CoordinatorSession): void {
 
 function markPresenceStale(session: CoordinatorSession): void {
   session.presenceStale = true;
-  // No presence system exists yet (Phase 31) — this phase's whole
-  // obligation is exactly this: log/mark stale, nothing more.
   logger.warn("presence.stale", {
     sessionId: session.sessionId,
     replicaId: session.replicaId,
     thresholdMs: PRESENCE_STALE_MS,
   });
+  // Phase 31 — this timer is now what actually REMOVES a session's presence (PRESENCE_LEAVE
+  // {reason: stale}, API Spec §3.8), not merely a log line. `onPresenceStale` is an OPTIONAL
+  // closure (the same pattern as `CoordinatorSession.disconnectForRevocation`/
+  // `disconnectForRateLimit`, Phases 27/30) set only by gateway.ts's own real session
+  // construction — a dozen pre-existing test fixtures across this codebase construct a
+  // `CoordinatorSession` literal directly with no presence room to remove from, so this stays
+  // optional rather than forcing every one of them to supply a no-op. Deliberately does NOT
+  // import anything from presenceManager.ts here — heartbeat.ts stays exactly as decoupled from
+  // presence internals as it already was from every other connection-lifecycle concern
+  // (`disconnectForRevocation`/`disconnectForRateLimit` are the same "session carries its own
+  // callback" shape, not a new pattern introduced for this phase).
+  session.onPresenceStale?.();
 }
 
 /** Updates a session's last-seen timestamp and clears staleness on a received PING (§3.6.11), then re-arms the stale timer. */

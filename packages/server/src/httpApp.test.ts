@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import {
+  Channel,
   decodeControlFrame,
   encodeControlFrame,
   encodeFrame,
   operationToOpInsert,
+  peekChannel,
   type ControlMessage,
   type SnapshotMessage,
   type WelcomeMessage,
@@ -40,7 +42,7 @@ function waitForOpen(ws: WebSocket): Promise<void> {
   });
 }
 
-/** Buffers control frames so a test can `await next()` without racing WELCOME/SNAPSHOT arriving back-to-back — same pattern as gateway.test.ts. Only used for the handshake: the listener is removed once both control frames arrive, since this test verifies convergence via the HTTP replay endpoint, not by decoding the OPS relay frames a real second client also receives on this same socket afterward. */
+/** Buffers control frames so a test can `await next()` without racing WELCOME/SNAPSHOT arriving back-to-back — same pattern as gateway.test.ts. Only used for the handshake: the listener is removed once both control frames arrive, since this test verifies convergence via the HTTP replay endpoint, not by decoding the OPS relay frames a real second client also receives on this same socket afterward. Non-CONTROL frames (Phase 31: a PRESENCE_ROSTER always follows ALREADY_HAVE as part of the same handshake-completion sequence, and can arrive — already buffered by the underlying socket — before this test's own `detach()` call runs) are silently skipped rather than decoded as CONTROL, since this reader only ever cares about the handshake's own two CONTROL frames. */
 function bufferedControlReader(ws: WebSocket): {
   next: () => Promise<ControlMessage>;
   detach: () => void;
@@ -48,7 +50,11 @@ function bufferedControlReader(ws: WebSocket): {
   const queue: ControlMessage[] = [];
   const waiters: Array<(msg: ControlMessage) => void> = [];
   const listener = (data: Buffer): void => {
-    const msg = decodeControlFrame(new Uint8Array(data), { direction: "serverOrigin" });
+    const bytes = new Uint8Array(data);
+    if (peekChannel(bytes) !== Channel.CONTROL) {
+      return;
+    }
+    const msg = decodeControlFrame(bytes, { direction: "serverOrigin" });
     const waiter = waiters.shift();
     if (waiter) {
       waiter(msg);
