@@ -23,6 +23,25 @@ export interface HarnessIdentifier {
   readonly r: number;
 }
 
+export interface HarnessNode {
+  readonly id: HarnessIdentifier;
+  readonly value: number;
+  readonly parent: HarnessIdentifier | null;
+  readonly side: "L" | "R";
+  readonly bind: boolean;
+  readonly deleted: boolean;
+  readonly deletedBy: HarnessIdentifier | null;
+}
+
+export interface HarnessInsertOperation {
+  readonly kind: "insert";
+  readonly id: HarnessIdentifier;
+  readonly value: number;
+  readonly parent: HarnessIdentifier | null;
+  readonly side: "L" | "R";
+  readonly bind: boolean;
+}
+
 export interface HarnessEngine {
   text(): string;
   stats(): {
@@ -35,6 +54,9 @@ export interface HarnessEngine {
   visible(): readonly { readonly id: HarnessIdentifier }[];
   /** Phase 32 (API Spec §7.5.3) — resolves an anchor identifier back to a live visible index. */
   resolveCaret(id: HarnessIdentifier | null): number;
+  /** Phase 34's own IME-02/03 fixtures — full node list (in document order), for seeding a second, independent engine to the same starting content, and for relaying a real remote operation directly (no wire encoding needed, the same "two simulated clients, no real network" technique this project's own DUR-01/audit tests use). */
+  readonly nodes: readonly HarnessNode[];
+  applyRemote(op: HarnessInsertOperation): unknown;
 }
 
 export interface HarnessSyncClient {
@@ -42,8 +64,23 @@ export interface HarnessSyncClient {
   readonly state: { readonly value: string };
   /** TEST-ONLY (SyncClient's own doc comment) — sets `engine` AND flips `state` to "synced" together, bypassing a real handshake. */
   seedForTesting(engine: HarnessEngine): void;
-  localInsertText(visibleIndex: number, text: string): unknown;
+  localInsertText(visibleIndex: number, text: string): readonly HarnessInsertOperation[];
   localDelete(visibleIndex: number, count: number): unknown;
+}
+
+export interface HarnessCaretSnapshot {
+  readonly anchor: HarnessIdentifier | null;
+  readonly focus: HarnessIdentifier | null;
+}
+
+export interface HarnessCompositionController {
+  readonly isComposing: boolean;
+  readonly bufferedRemoteOpsCount: number;
+  noteRemoteOpsApplied(): boolean;
+  handleCompositionStart(): void;
+  handleCompositionUpdate(ev: CompositionEvent): void;
+  handleCompositionEnd(ev: CompositionEvent): void;
+  dispose(): void;
 }
 
 export interface HarnessSentinelMetrics {
@@ -115,6 +152,22 @@ declare global {
         getDomWriterIndex: () => readonly HarnessRenderRun[];
         getEngine: () => HarnessEngine | null;
       }) => HarnessPresenceOverlay;
+      /** Phase 34 — see compositionController.ts's own doc comment. */
+      CompositionController: new (deps: {
+        domWriter: HarnessDomWriter;
+        sync: HarnessSyncClient;
+        sentinel: HarnessMutationSentinel;
+        root: Element;
+        watchdogMs?: number;
+      }) => HarnessCompositionController;
+      attachCompositionHandlers: (root: Element, controller: HarnessCompositionController) => () => void;
+      captureCaret: (index: readonly HarnessRenderRun[], engine: HarnessEngine) => HarnessCaretSnapshot | null;
+      restoreCaret: (
+        snapshot: HarnessCaretSnapshot,
+        root: Element,
+        index: readonly HarnessRenderRun[],
+        engine: HarnessEngine,
+      ) => void;
     };
   }
 }

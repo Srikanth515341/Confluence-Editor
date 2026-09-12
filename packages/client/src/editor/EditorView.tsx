@@ -44,11 +44,25 @@
 // `onApplyPatches` hook (ANY document mutation, local or remote — typing
 // before a peer's cursor shifts where it visually sits too, even though
 // that peer sent nothing new).
+//
+// Phase 34 (API Spec §7.4.2/§7.6, Test Plan IME-01..06) adds
+// `CompositionController` (compositionController.ts), attached to the SAME
+// contenteditable root as `attachInputPipeline`: while a real (or
+// synthetic, for testing — see that file's own header comment) IME
+// composition is in progress, no operation is ever minted and the
+// remote-ops-applied reaction above is DEFERRED (`composition.
+// noteRemoteOpsApplied()`) rather than remounting mid-composition, which
+// would abort the browser's own live composition UI. Composition mutates
+// the engine exactly once, at `compositionend`, as one `OP_INSERT_RUN`.
 
 import { useEffect, useRef } from "react";
 import type { Engine } from "@collab-editor/engine";
 import { DomWriter } from "../binding/index.js";
-import { attachInputPipeline } from "../input/index.js";
+import {
+  attachCompositionHandlers,
+  attachInputPipeline,
+  CompositionController,
+} from "../input/index.js";
 import { PresenceOverlay } from "../presence/index.js";
 import { MutationSentinel } from "../sentinel/index.js";
 import type { SyncClient } from "../sync/syncClient.js";
@@ -106,10 +120,19 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
       }
     });
 
+    const composition = new CompositionController({ domWriter, sync, sentinel, root });
+
     const unsubscribeRemoteOps = sync.onRemoteOpsApplied(() => {
       const engine = sync.engine;
       if (!engine || engine !== mountedEngineRef.current) {
         return; // a SNAPSHOT re-mount (mountIfNewEngine) already covers a brand-new engine
+      }
+      // Phase 34 (Test Plan IME-02/IME-03): while A is actively composing, remounting the whole
+      // subtree here would destroy the browser's own live composition UI and abort it —
+      // `noteRemoteOpsApplied()` defers this reaction; the composition's own eventual
+      // `compositionend` remount reads `engine.text()` fresh and so already reflects this batch.
+      if (composition.noteRemoteOpsApplied()) {
+        return;
       }
       // capture() BEFORE the mutation (Scope-IN's own ordering) -- the live selection's DOM
       // node/offset only means something relative to the CURRENT, pre-mutation render index.
@@ -122,12 +145,15 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
     });
 
     const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });
+    const detachComposition = attachCompositionHandlers(root, composition);
 
     return () => {
       unsubscribe();
       unsubscribeRemoteOps();
       unsubscribePresence();
       detachInput();
+      detachComposition();
+      composition.dispose();
       sentinel.stop();
       presenceOverlay.stop();
       domWriterRef.current = null;

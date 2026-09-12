@@ -10,7 +10,15 @@ export { Engine } from "@collab-editor/engine";
 export { DomWriter, visToDom, domToVis } from "../../src/binding/index.js";
 export { SyncClient } from "../../src/sync/syncClient.js";
 export { attachInputPipeline } from "../../src/input/inputPipeline.js";
+export {
+  attachCompositionHandlers,
+  CompositionController,
+} from "../../src/input/compositionController.js";
 export { MutationSentinel } from "../../src/sentinel/mutationSentinel.js";
+// Phase 34 (Test Plan IME-02/IME-03) — the real-browser IME suite wires the SAME
+// capture/mount/restore reaction `EditorView.tsx`'s own `onRemoteOpsApplied` handler uses
+// (minus React), needing these two directly.
+export { captureCaret, restoreCaret } from "../../src/editor/caretTracker.js";
 // Phase 33 (Test Plan PRES-02/PRES-07) — the real-browser half of presence rendering needs REAL
 // text layout (`getClientRects()` genuinely wrapping across multiple lines, a real `scroll`/
 // `resize`-triggered reflow), which jsdom cannot provide (see `presenceOverlay.test.ts`'s own
