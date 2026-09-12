@@ -42,6 +42,15 @@ export interface HarnessInsertOperation {
   readonly bind: boolean;
 }
 
+/** Phase 35's GRA-02 relay needs delete operations too (a whole-cluster backspace), not just inserts. */
+export interface HarnessDeleteOperation {
+  readonly kind: "delete";
+  readonly id: HarnessIdentifier;
+  readonly target: HarnessIdentifier;
+}
+
+export type HarnessOperation = HarnessInsertOperation | HarnessDeleteOperation;
+
 export interface HarnessEngine {
   text(): string;
   stats(): {
@@ -54,9 +63,9 @@ export interface HarnessEngine {
   visible(): readonly { readonly id: HarnessIdentifier }[];
   /** Phase 32 (API Spec §7.5.3) — resolves an anchor identifier back to a live visible index. */
   resolveCaret(id: HarnessIdentifier | null): number;
-  /** Phase 34's own IME-02/03 fixtures — full node list (in document order), for seeding a second, independent engine to the same starting content, and for relaying a real remote operation directly (no wire encoding needed, the same "two simulated clients, no real network" technique this project's own DUR-01/audit tests use). */
+  /** Phase 34's own IME-02/03 fixtures — full node list (in document order), for seeding a second, independent engine to the same starting content, and for relaying a real remote operation directly (no wire encoding needed, the same "two simulated clients, no real network" technique this project's own DUR-01/audit tests use). Phase 35's GRA-01/02 suite also diffs this list before/after a real `beforeinput` dispatch to recover exactly which operation(s) a real keystroke minted, since a real dispatch's own return value is swallowed inside `inputPipeline.ts`. */
   readonly nodes: readonly HarnessNode[];
-  applyRemote(op: HarnessInsertOperation): unknown;
+  applyRemote(op: HarnessOperation): unknown;
 }
 
 export interface HarnessSyncClient {

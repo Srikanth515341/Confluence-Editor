@@ -5,10 +5,11 @@
 // parsing (urlParams.ts), connecting (`SyncClient`, Phase 10), rendering
 // (`EditorView`, Phases 11-13). No new editing logic lives here.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ConnectionState } from "../sync/connectionState.js";
 import { SyncClient } from "../sync/syncClient.js";
 import { EditorView } from "../editor/index.js";
+import type { MutationSentinel } from "../sentinel/index.js";
 import { ConnectionIndicator } from "./ConnectionIndicator.js";
 import { getOrCreateDocumentId, getServerUrl } from "./urlParams.js";
 
@@ -29,6 +30,18 @@ export function App(): React.JSX.Element {
   const [sync] = useState(createClient);
   const [state, setState] = useState<ConnectionState>(sync.state.value);
   const [unsyncedCount, setUnsyncedCount] = useState<number>(sync.unsyncedCount.value);
+  // Phase 35 — see EditorView's own `onSentinelReady` doc comment. Read through a ref (never a
+  // closed-over value) specifically so `getSentinelMetrics` below always reflects whichever
+  // sentinel instance is CURRENTLY live, not a stale one captured at the time this effect ran.
+  const sentinelRef = useRef<MutationSentinel | null>(null);
+  // Stable identity across every App re-render (state/unsyncedCount both change often) —
+  // EditorView's own effect depends on this callback, so a fresh function object every render
+  // would tear down and rebuild the ENTIRE editor mount (DomWriter, sentinel, listeners) on
+  // every connection-state tick. `useCallback` with an empty dependency array keeps it constant
+  // for the component's whole lifetime, since it only ever writes to a ref.
+  const handleSentinelReady = useCallback((sentinel: MutationSentinel | null) => {
+    sentinelRef.current = sentinel;
+  }, []);
 
   useEffect(() => {
     const unsubscribe = sync.state.subscribe(setState);
@@ -80,6 +93,15 @@ export function App(): React.JSX.Element {
       // verification work). `engine` is preserved (Phase 14's "last known state"), so editing
       // after this call still works via Phase 22's relaxed requireEngine().
       forceDisconnect: () => sync.disconnect(),
+      // Phase 35 (Test Plan MUT-01/MUT-04) — exposes the live MutationSentinel's own
+      // `reconciliation`/`desync_error` counters (API Spec §7.7) so a manual tester on real
+      // Safari hardware (no Playwright/e2e harness available there) can check the SAME signal
+      // MUT-01's own automated autocorrect test already asserts on: a nonzero `reconciliation`
+      // here means the sentinel silently reverted a real DOM mutation the input pipeline should
+      // have handled itself, which a text-only convergence check can't distinguish from a
+      // genuinely correct result that merely LOOKS right. Returns `undefined` before the
+      // component has mounted (or after it unmounts) rather than throwing.
+      getSentinelMetrics: () => sentinelRef.current?.metrics,
     };
     return () => {
       unsubscribe();
@@ -113,7 +135,7 @@ export function App(): React.JSX.Element {
           durableQueueUnavailable={sync.durableQueueUnavailable}
         />
       </header>
-      <EditorView sync={sync} className="editor-root" />
+      <EditorView sync={sync} className="editor-root" onSentinelReady={handleSentinelReady} />
     </div>
   );
 }

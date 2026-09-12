@@ -31,7 +31,7 @@ interface HarnessState {
 
 declare global {
   interface Window {
-    __harness?: HarnessState;
+    __imeHarness?: HarnessState;
   }
 }
 
@@ -61,28 +61,28 @@ async function setupHarness(page: Page, initialText = "", watchdogMs?: number): 
           : { domWriter, sync, sentinel, root: editor, watchdogMs: watchdog },
       );
       window.InputHarness.attachCompositionHandlers(editor, composition);
-      window.__harness = { editor, domWriter, sync, sentinel, composition };
+      window.__imeHarness = { editor, domWriter, sync, sentinel, composition };
     },
     { text: initialText, watchdog: watchdogMs },
   );
 }
 
 async function engineText(page: Page): Promise<string> {
-  return page.evaluate(() => window.__harness!.sync.engine!.text());
+  return page.evaluate(() => window.__imeHarness!.sync.engine!.text());
 }
 
 async function domText(page: Page): Promise<string> {
-  return page.evaluate(() => window.__harness!.domWriter.materializedText());
+  return page.evaluate(() => window.__imeHarness!.domWriter.materializedText());
 }
 
 async function isComposing(page: Page): Promise<boolean> {
-  return page.evaluate(() => window.__harness!.composition.isComposing);
+  return page.evaluate(() => window.__imeHarness!.composition.isComposing);
 }
 
 /** Collapses the caret at visible (scalar) index `v` — ASCII-only fixtures here, so scalar === UTF-16 offset. */
 async function placeCaret(page: Page, v: number): Promise<void> {
   await page.evaluate((visIndex) => {
-    const { domWriter, editor } = window.__harness!;
+    const { domWriter, editor } = window.__imeHarness!;
     const runs = domWriter.index;
     let node: Node = editor;
     let offset = 0;
@@ -106,7 +106,7 @@ async function placeCaret(page: Page, v: number): Promise<void> {
 async function selectRange(page: Page, start: number, end: number): Promise<void> {
   await page.evaluate(
     ({ start: s, end: e }) => {
-      const { domWriter, editor } = window.__harness!;
+      const { domWriter, editor } = window.__imeHarness!;
       const runs = domWriter.index;
       function locate(v: number): { node: Node; offset: number } {
         for (const run of runs) {
@@ -137,7 +137,9 @@ async function fireComposition(
 ): Promise<void> {
   await page.evaluate(
     ({ t, d }) => {
-      window.__harness!.editor.dispatchEvent(new CompositionEvent(t, { data: d, bubbles: true }));
+      window.__imeHarness!.editor.dispatchEvent(
+        new CompositionEvent(t, { data: d, bubbles: true }),
+      );
     },
     { t: type, d: data },
   );
@@ -154,12 +156,12 @@ test.describe("IME-01 — no operations during composition, exactly one commit",
     expect(await isComposing(page)).toBe(true);
 
     const beforeCount = await page.evaluate(
-      () => window.__harness!.sync.engine!.stats().totalElements,
+      () => window.__imeHarness!.sync.engine!.stats().totalElements,
     );
     for (const data of ["k", "ka", "kan", "kanj", "kanji", "かんじ", "漢字", "感じ"]) {
       await fireComposition(page, "compositionupdate", data);
     }
-    expect(await page.evaluate(() => window.__harness!.sync.engine!.stats().totalElements)).toBe(
+    expect(await page.evaluate(() => window.__imeHarness!.sync.engine!.stats().totalElements)).toBe(
       beforeCount,
     );
     expect(await engineText(page)).toBe(""); // nothing minted yet
@@ -169,7 +171,7 @@ test.describe("IME-01 — no operations during composition, exactly one commit",
     expect(await engineText(page)).toBe("感じ");
     expect(await domText(page)).toBe("感じ");
     const afterCount = await page.evaluate(
-      () => window.__harness!.sync.engine!.stats().totalElements,
+      () => window.__imeHarness!.sync.engine!.stats().totalElements,
     );
     expect(afterCount - beforeCount).toBe(2); // "感じ" — one commit, 2 characters
   });
@@ -204,7 +206,7 @@ test.describe("IME-02/03 — a remote operation arriving mid-composition", () =>
   ): Promise<void> {
     await page.evaluate(
       ({ at, t }) => {
-        const h = window.__harness!;
+        const h = window.__imeHarness!;
         const peer = new window.InputHarness.SyncClient({ url: "ws://unused", documentId: "doc" });
         const peerEngine = new window.InputHarness.Engine(2);
         peer.seedForTesting(peerEngine);
@@ -230,7 +232,7 @@ test.describe("IME-02/03 — a remote operation arriving mid-composition", () =>
   /** Mirrors EditorView.tsx's own `onRemoteOpsApplied` handler (capture/composition-gate/mount/restore) — there is no React component in this harness to wire it through automatically. */
   async function reactToRemoteOps(page: Page): Promise<void> {
     await page.evaluate(() => {
-      const h = window.__harness!;
+      const h = window.__imeHarness!;
       const engine = h.sync.engine!;
       if (h.composition.noteRemoteOpsApplied()) {
         return;
@@ -259,7 +261,7 @@ test.describe("IME-02/03 — a remote operation arriving mid-composition", () =>
     expect(await domText(page)).toBe("hello world"); // peer's text not yet rendered
     expect(await engineText(page)).toContain("PEER-TWENTY-CHARS!!!"); // already in the engine
     const buffered = await page.evaluate(
-      () => window.__harness!.composition.bufferedRemoteOpsCount,
+      () => window.__imeHarness!.composition.bufferedRemoteOpsCount,
     );
     expect(buffered).toBeGreaterThan(0);
 
