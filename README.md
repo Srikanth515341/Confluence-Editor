@@ -12,6 +12,28 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 33 — Presence rendering (Milestone M4, tag `v0.4.0-m4`).** Other
+participants' carets and selections now render, with stable per-user
+colours and graceful degradation as the room fills up. Colour is a pure
+FNV-1a-plus-golden-angle function of the REAL, stable authenticated user
+id — traced end to end through the real login → ticket → session chain
+before writing any code, per this phase's own explicit instruction, so a
+colour never changes across a reconnect the way one derived from
+`replicaId` (which is deliberately never reused, Engine Spec I1) would.
+Verified honestly, not just asserted: the first candidate 8-user hue set
+tried was real RFC 4122 example UUIDs, and it genuinely failed the
+DoD's own >25° separation bound (14.00°) — a small deterministic search
+found a real UUID set that passes (36.49°), disclosed as exactly that,
+not silently swapped in. The critical correctness claim — colour
+identical across a REAL disconnect + reconnect with a genuinely new
+replica id — is proven with a real Postgres-backed test, not a
+same-session shortcut. Selections render one rectangle per real visual
+line (never one enclosing box) and carets/selections correctly
+recompute on real scroll and resize, verified across real Chromium,
+Firefox, AND WebKit (9/9). See [`CLAUDE.md`](./CLAUDE.md)'s Phase 33
+entry for the full account, including the identity-chain trace and one
+confirmed pre-existing, unrelated regression-sweep finding.
+
 **Phase 32 — resolveCaret and cursor/selection transformation.** Each
 user's own caret and selection now stays anchored to the CHARACTERS
 they placed it on, not a numeric position — through a remote insert or
@@ -602,8 +624,9 @@ runs this at full scale on a schedule.
 | Permissions (grant/revoke/transfer)        | ✅ **Phase 28** (PUT/DELETE .../permissions/{userId}, POST .../owner; per-operation authorization with a ≤2s decision cache; SEC-07 atomicity proven with 50 real concurrent transfer requests) |
 | WS gateway authorization (real ticket-based identity) | ✅ **Phase 29** (POST .../rt-ticket, single-use/30s/scoped; HELLO's ticket field now genuinely validated; live PERMISSION_CHANGED push with effectiveAtSeq; client-side write-blocking on downgrade/revocation) |
 | Rate limiting + circuit breaker (metadata-exhaustion defense) | ✅ **Phase 30 — Milestone M3** (per-session/per-document op rate limiting, always-on self-healing structure-size circuit breaker, per-IP/per-account connection limits, size-bounded causal buffer; SEC-09's block-encoding non-mitigation measured at a real 1.00x ratio) |
-| Presence (cursors/avatars for other users) | ✅ **Phase 31** (PRESENCE_UPDATE/JOIN/LEAVE/ROSTER, structurally isolated from the engine/persistence layer; 20/s cap enforced 3 independent ways) — no UI renders a peer's position yet |
+| Presence (cursors/avatars for other users) | ✅ **Phase 31** (PRESENCE_UPDATE/JOIN/LEAVE/ROSTER, structurally isolated from the engine/persistence layer; 20/s cap enforced 3 independent ways) |
 | Cursor transform under remote edits        | ✅ **Phase 32** (`Engine.resolveCaret`, corrected for the Fugue tree engine; CaretTracker; CUR-01..05 all passing, incl. 3-replica determinism and a 600-sample zero-drift proof) — closes Test Plan blocker B19 |
+| Presence rendering (Milestone M4)          | ✅ **Phase 33** (real overlay layer, stable per-user colour via a pure function of the real authenticated user id, 3 density tiers; PRES-02/03/06/07 all passing, incl. a real-Postgres reconnect proof and 9/9 across real Chromium/Firefox/WebKit) |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

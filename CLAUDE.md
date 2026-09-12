@@ -6555,6 +6555,272 @@ check:purity` was ALSO silently broken by two comments (one in
   harness. `packages/client/src/editor/caretTracker.test.ts` now has 9
   tests (was 8); full default `pnpm test`: **574 passed, 2 skipped**.
 
+- **Phase 33 — Presence rendering (Milestone M4, tag `v0.4.0-m4`)** (API
+  Spec §8; PRD FR-PR-2/FR-PR-3/FR-PR-9; Test Plan PRES-02/03/06/07).
+  Renders OTHER participants' carets and selections into a real overlay
+  layer, with stable per-user colours and graceful degradation as
+  participants grow. Dependencies: Phases 31 (the wire protocol/roster
+  this reads) and 32 (`Engine.resolveCaret`, this phase's own core
+  rendering primitive).
+
+  **The identity question, resolved by tracing the real code before
+  writing a single line, per the phase's own explicit instruction**: the
+  phase brief asked "colour as a pure function of userId" but flagged
+  that Phase 29 replaced the old random per-connection placeholder with
+  real authenticated identity, and demanded confirmation of WHICH value
+  is now actually available. Traced end to end, not assumed: a WS
+  session's `userId` (`documentCoordinator.ts`/`gateway.ts`) is
+  `realIdentity.userId`, itself `consumed.userId` from a real, single-use
+  `POST /v1/documents/{id}/rt-ticket` (Phase 29), issued from
+  `req.auth.user.sub` (`AuthLocals`, Phase 27), the JWT's own `sub` claim
+  (`tokens.ts`: `// user id`) signed at login (Phase 26) from the real
+  `users.id` PRIMARY KEY. This value is IDENTICAL across every reconnect
+  for the same account (a fresh ticket and a never-reused `replicaId`,
+  Engine Spec I1, are minted every time — but `users.id` never changes),
+  which is exactly what PRES-03 requires and a colour keyed on
+  `replicaId` would have broken. A connection with no real `auth` deps
+  configured still falls back to a fresh `randomUUID()` per connection
+  (unchanged since Phase 16) — colour stability across reconnection is
+  consequently unavailable in that configuration, an already-disclosed
+  limitation of running without real auth, not a new gap this phase
+  introduces. Documented in full in `packages/client/src/presence/
+  color.ts`'s own header comment.
+
+  **Colour assignment** (`packages/client/src/presence/color.ts`, new):
+  `userHue`/`caretColor`/`selectionColor` — the phase's own supplied
+  FNV-1a-then-golden-angle pseudocode, ported LITERALLY (every operator,
+  shift, and constant verbatim, no discretionary reinterpretation).
+  Cross-checked against an INDEPENDENT BigInt-arithmetic reference
+  implementation (deliberately written a different way — explicit
+  `& 0xffffffffn` masking instead of `Math.imul`/`>>> 0` — so the check
+  can't share a bug with the code it verifies, the same discipline this
+  project has used since Phase 4) across 500+ generated strings, all
+  matching exactly. PRES-03's own "8 users → min 25° pairwise
+  separation" was checked HONESTLY, not asserted blind: the FIRST
+  candidate set tried (a set of real, well-known RFC 4122 example UUIDs)
+  measured only 14.00° — a genuine failure, disclosed in the test's own
+  comment rather than silently swapped away — because the golden-angle
+  scheme is a heuristic that makes near-collisions LESS likely across a
+  population, never a guarantee for arbitrary inputs. A small
+  deterministic search (2,000 candidate v4-shaped UUIDs, 3,000 random
+  8-subsets) found a genuinely valid UUID set measuring 36.49° minimum
+  separation, used as the permanent fixture — the same "hand-derive an
+  input that actually demonstrates the required property, disclosed as
+  such" discipline Phase 6 established for its own mutant-discriminating
+  test inputs.
+
+  **The overlay renderer** (`packages/client/src/presence/
+  presenceOverlay.ts`, new, `PresenceOverlay`): a sibling of the
+  contenteditable root, `position: absolute; inset: 0; pointer-events:
+  none` (Scope-IN's own literal layout requirement) — `EditorView.tsx`
+  now returns a small wrapper `<div>` around both, the ONE structural
+  change to that component's own returned JSX (className stayed on the
+  contenteditable itself, unchanged, so `.editor-root`'s own existing
+  padding/font/`overflow-y:auto` styling — the actual scrolling element
+  PRES-07's own `scroll` listener attaches to — is completely
+  unaffected; the new wrapper needed its OWN `flex: 1`/`display: flex`/
+  `min-height: 0` specifically because inserting it between
+  `App.tsx`'s flex column and `.editor-root` would otherwise have broken
+  that existing sizing chain — found and fixed by actually reasoning
+  through the real layout, not assumed). Deliberately, and explained in
+  its own header comment, this file legitimately imports
+  `@collab-editor/engine` (`Engine.resolveCaret`) — a documented,
+  narrow departure from Phase 31's own "no engine import" isolation
+  rule, which was scoped specifically to the wire/rate-limiting layer
+  (`sync/presence.ts`), never to a not-yet-built rendering layer that
+  fundamentally needs to turn an identifier back into a live position,
+  the same thing `caretTracker.ts` (Phase 32) already does for this
+  session's own local caret.
+
+  **Roster tracking**: `PRESENCE_UPDATE` itself carries no identity
+  (API Spec §3.8 — only `replicaId`), so `PresenceOverlay` maintains its
+  own `Map<replicaId, ParticipantState>`, populated from JOIN/ROSTER
+  (which DO carry `userId`/`displayName`) and consulted by UPDATE/LEAVE
+  — a ROSTER event is a complete point-in-time snapshot (Phase 31's own
+  precedent) and REPLACES whatever was tracked, never merges.
+
+  **Rendering, per API Spec §8.2**: the caret marker is ALWAYS drawn at
+  the FOCUS end, for every tier ("carets are never suppressed, only
+  names/washes are"); a real selection renders ONE wash rectangle PER
+  `Range.getClientRects()` entry, never one enclosing box — verified
+  with REAL multi-line text wrapping in real Chromium/Firefox/WebKit
+  (`e2e/presenceRendering.spec.ts`, new), comparing this project's own
+  rendered wash-element count against an INDEPENDENTLY-taken, separate
+  real `getClientRects()` measurement at assertion time, rather than
+  hardcoding an exact "N characters per line" expectation that could
+  vary by engine's own font metrics. Name labels show for 2s after a
+  move (tracked via a `lastMovedAtMs` per participant, comparing
+  identifiers — not object identity — to detect a genuine move) or while
+  hovered (a real `mouseenter`/`mouseleave` listener on the label's own
+  small, deliberately `pointer-events: auto` hit-area — the overlay
+  container's own blanket `pointer-events: none` never blocks ordinary
+  editor clicks beneath it; this is one small, tag-scoped, documented
+  exception, the same technique the tier-3 overflow chip uses to stay
+  clickable).
+
+  **Degradation tiers** (API Spec §8.3, `densityTierFor`): 1-8
+  participants → `"full"` (caret + name + selection washes); 9-15 →
+  `"caretsAndNames"` (washes suppressed entirely — overlapping
+  translucent washes make text unreadable, the spec's own reasoning);
+  16+ → `"caretsOnly"` (no names at all, plus a stacked-count overflow
+  chip that expands to a real list of every participant's display name
+  on click). Tier is purely a function of `this.participants.size` —
+  self is never included, since `SyncClient.onPresenceEvent` never fires
+  for this client's own updates (Phase 31's own established behavior).
+
+  **Throttling and recompute triggers**: `requestFrame`-scheduled
+  (defaults to real `requestAnimationFrame`, injectable for deterministic
+  jsdom testing — the same DI pattern `PresenceUpdateCoalescer`'s own
+  `now` injection established in Phase 31) — at most ONE render per
+  frame regardless of how many presence events arrive first (API Spec
+  §8.3's own explicit requirement, verified directly: 4 events scheduled
+  exactly 1 frame). Recomputed on THREE distinct triggers, not just
+  presence events: a real `scroll` on the editor root and a real
+  `resize` on `window` (PRES-07, since `getClientRects()` is
+  viewport-relative and goes stale on either with zero presence change),
+  AND — a genuine finding, not merely satisfying the letter of Scope-IN
+  — after ANY document mutation at all, local or remote. Typing BEFORE a
+  peer's own cursor shifts where it visually sits, even though that
+  peer sent nothing new; this needed a new, small, general-purpose hook,
+  `MutationSentinelDeps.onApplyPatches` (`mutationSentinel.ts`, optional,
+  backward-compatible), fired once at the end of EVERY `applyPatches()`
+  call regardless of source (a local keystroke via `inputPipeline.ts`, a
+  remote-batch remount via `EditorView.tsx`, or the sentinel's own
+  reconciliation re-render) — reused for presence refresh without
+  touching `inputPipeline.ts` at all, the same "one general-purpose
+  hook, not a presence-specific one" shape as the pre-existing
+  `onRemoteOpsApplied`.
+
+  **Test verification, at three layers, each chosen for what it's
+  positioned to prove**:
+  - `packages/client/src/presence/color.test.ts` (5 tests, pure, no
+    DOM) — the BigInt oracle cross-check, range/determinism/purity
+    checks, and PRES-03's own 8-user separation proof.
+  - `packages/client/src/presence/presenceOverlay.test.ts` (15 tests,
+    jsdom, with `Element.getBoundingClientRect`/`Range.getClientRects`
+    DELIBERATELY mocked to deterministic fake geometry — jsdom has no
+    real layout engine, so real pixel positions are meaningless there;
+    everything else — roster tracking, tier computation and its exact
+    element-suppression behavior, structural containment outside the
+    contenteditable subtree, rAF throttling, scroll/resize listener
+    wiring, and the 2s name-label fade timing via an injected clock —
+    is genuinely exercised, not mocked away). PRES-06's own tier
+    thresholds are checked TWICE, deliberately, not once: `densityTierFor`
+    itself (the pure classification function) is tested exactly at both
+    boundaries (8→full/9→caretsAndNames, 15→caretsAndNames/16→caretsOnly)
+    — but so, SEPARATELY, is the actual RENDERED BEHAVIOR at those same
+    exact counts (a real selection's own wash rectangles present at 8
+    participants, suppressed the instant a 9th joins; all 15 name labels
+    present, then all 16 gone the instant a 16th joins, with the overflow
+    chip appearing at that exact same moment) — a real, found-and-caught
+    gap from a code-review question asking specifically whether 8/12/16/32
+    alone could miss an off-by-one sitting exactly at a transition (it
+    could have, since the ORIGINAL tests only sampled interior points —
+    10 and 20 participants — never the boundary itself). Verified these
+    two new tests are not vacuous, not merely "written to pass": `render()`'s
+    OWN boundary constants were deliberately mutated (`<= 8`→`<= 9`, `<=
+    15`→`<= 16`) and re-run — all four affected tests (both new boundary
+    tests, the pure `densityTierFor` test, and the pre-existing 16-
+    participant chip test) failed exactly as expected, then the mutation
+    was reverted and the full suite re-confirmed green.
+  - `packages/client/e2e/presenceRendering.spec.ts` (3 tests × 3 real
+    browsers = 9 real browser-runs, ALL PASSING with no per-browser
+    adjustment needed) — the two claims that genuinely require real
+    layout: PRES-02's multi-line-selection-to-multi-rect fidelity
+    (compared against an independently-taken real measurement, not a
+    hardcoded character count) and PRES-07's real scroll/resize
+    recompute (the rendered caret's position, compared against a FRESH
+    real measurement taken after the scroll/resize, not merely "did it
+    change").
+  - `packages/server/src/db/presenceColorReconnect.db.test.ts` (new, 1
+    test, real Postgres + real auth) — PRES-03's own DoD-flagged
+    "critical correctness check": an independent, never-disconnecting
+    OBSERVER watches the SAME account join TWICE, across a REAL
+    disconnect and a REAL reconnect with a genuinely fresh ticket,
+    confirming the `userId` (and therefore, since `userHue` is already
+    exhaustively proven pure, the colour) the observer sees is
+    byte-identical both times, while `replicaId`/`welcome.replicaId`
+    both genuinely differ — a same-session check would have proven
+    nothing about THIS specific claim.
+
+  **A real, pre-existing, unrelated regression-sweep finding, confirmed
+  not caused by this phase**: re-running the five `db/*.db.test.ts`
+  files most adjacent to this phase's own new test together, one of
+  Phase 27's own pre-existing `GET /v1/users/search` assertions (the
+  display-name-prefix case) fails — reproduced identically both in
+  isolation and via `git stash` against the UNMODIFIED base branch
+  (before any Phase 33 file was touched), confirming this is a genuine,
+  pre-existing gap in Phase 27's own feature/test, completely unrelated
+  to and unaffected by this phase's work (`git status` confirms zero
+  Phase 33 changes touch `documentStore.ts`/`documentService.ts`/
+  `httpApp.ts`/`documents.db.test.ts`). Left exactly as found, per this
+  project's own established precedent (Phases 27/28/30's identical
+  treatment of other unrelated pre-existing gaps found during their own
+  regression sweeps) — not investigated or fixed under this phase's own
+  scope.
+
+  **DoD verification**: `pnpm -r exec tsc --noEmit` clean across all 6
+  packages; `eslint` clean on every file this phase touched or added.
+  Full default `pnpm test`: **594 passed, 2 skipped** (the same
+  disclosed, deferred Fugue O(N²) GC-chain tests, unchanged), 66 files —
+  up from Phase 32's 574/64, the delta being this phase's own 20 new
+  jsdom/pure tests (18 at initial completion, +2 from a same-day code
+  review that found PRES-06's own boundary-exact BEHAVIOR was untested —
+  see that entry below for the full account) plus zero regressions
+  elsewhere (`EditorView.test.tsx`'s own 4 pre-existing tests pass
+  unchanged, confirming the wrapper-div/layout change didn't regress
+  mount/beforeinput behavior).
+  `e2e/presenceRendering.spec.ts`: 9/9 across real Chromium, Firefox, AND
+  WebKit. `db/presenceColorReconnect.db.test.ts`: 1/1 against real
+  Postgres; the four other most-adjacent `db/*.db.test.ts` files
+  (`schema`, `permissions`, `tickets`, `auth`) all re-run clean
+  alongside it — only the one already-disclosed, pre-existing,
+  unrelated `documents.db.test.ts` failure above, confirmed not this
+  phase's own regression.
+
+  **Same-day code review (2026-09-12) — two direct questions, both
+  answered by re-reading the real code, one revealing a real, fixed
+  gap.** (1) "Does the PRES-03 test actually disconnect and reconnect a
+  real client, or only check colour determinism in isolation?"
+  Confirmed genuine on re-inspection: a real `ws.close()`, awaited to
+  completion, a real freshly-issued single-use ticket, a real second
+  WebSocket connection, with the new `replicaId` confirmed different via
+  TWO independent sources (the observer's own received `PRESENCE_JOIN`
+  and the reconnecting client's own `WELCOME`) before the `userId`/
+  colour comparison is even made. (2) "Does PRES-06 test the EXACT 8/9
+  and 15/16 boundaries, or only interior sample points (8/12/16/32) that
+  could miss an off-by-one?" Found a REAL gap: `densityTierFor` itself
+  (the pure classification function) WAS already tested at the exact
+  boundaries, but the BEHAVIORAL tests (does a selection wash/name
+  label/chip actually appear or not) only sampled interior counts (10,
+  20) — never the transition itself. Fixed the same day: two new tests
+  added, checking real DOM output at EXACTLY 8 vs. 9 participants (a
+  real selection's wash rectangles present, then suppressed the instant
+  a 9th joins) and EXACTLY 15 vs. 16 (all 15 name labels present, then
+  ALL gone plus the overflow chip appearing the instant a 16th joins).
+  Verified these aren't vacuous the same way this project always does:
+  `render()`'s own boundary constants were deliberately mutated (`<= 8`
+  → `<= 9`, `<= 15` → `<= 16`) and re-run — all four affected tests
+  (both new ones, the pure function test, and the pre-existing 16-
+  participant chip test) failed exactly as expected — then reverted,
+  full suite re-confirmed at 594/2 skipped.
+
+  **What is deliberately NOT built this phase**: any durable/server-side
+  colour computation or caching — colour is recomputed independently by
+  every observer, by design (API Spec §8.1: "no negotiation and no
+  server assignment"), so there is nothing to persist; a genuinely
+  BALANCED avatar/name-collision-resistant colour palette validated
+  against accessibility contrast ratios (the fixed 70%/45% HSL values
+  are taken verbatim from the phase's own supplied pseudocode, not
+  independently re-validated for WCAG contrast — disclosed here, not
+  silently assumed sufficient); any UI for toggling presence
+  rendering on/off, or for a user to hide their OWN cursor from others
+  (not asked for by Scope-IN); the demo GIF itself — the phase brief's
+  own explicit instruction is that the user records this personally,
+  the same precedent as Phase 14's own M1 demo; see the end-of-phase
+  report's own "How to record the demo GIF" section for the exact
+  commands/URL/steps.
+
 ## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
 
 This entry documents a real, load-bearing investigation that happened AFTER
@@ -7957,6 +8223,29 @@ is a Phase 32 finding, unrelated to Phase 25's own tag readiness.
 
 ## Current phase in progress
 
+**Phase 33 (Presence rendering) — COMPLETE as of 2026-09-12. Milestone
+M4, tag `v0.4.0-m4` on merge.** Other participants' carets and
+selections now render, with stable per-user colours and graceful
+degradation as participants grow — `PresenceOverlay` (a real sibling
+overlay layer, `pointer-events: none`), `userHue`/`caretColor` (a pure
+FNV-1a-plus-golden-angle function of the REAL, stable authenticated
+user id, traced end to end through Phase 26-29's own real auth chain
+before any code was written, per the phase's own explicit instruction),
+and the three density tiers (API Spec §8.3). PRES-03's own
+DoD-flagged "critical correctness check" — colour identical across a
+REAL reconnect with a genuinely new `replicaId` — is proven with a
+real Postgres-backed test, not a same-session shortcut. PRES-02's
+real multi-line-selection-to-multi-rect fidelity and PRES-07's real
+scroll/resize recompute both pass across real Chromium, Firefox, AND
+WebKit (9/9). See the "Phase 33" bullet in the Completed Phases list
+above for the full account, including the one pre-existing, unrelated
+regression-sweep finding (confirmed via `git stash` against the
+unmodified base branch) and exactly what remains deliberately
+unbuilt. No open item from this phase blocks anything — the next phase
+to pick up is whichever one is next in the Implementation Plan; the
+demo GIF itself is the user's own to record (see the end-of-phase
+report's exact instructions).
+
 **Phase 32 (resolveCaret and cursor/selection transformation) — COMPLETE
 as of 2026-09-11.** Each user's own caret and selection now stays
 anchored to the CHARACTERS they placed it on — including through a
@@ -8441,13 +8730,16 @@ with nothing lost — is proven. Still missing, all previously-scoped to
 later phases and unaffected by this milestone: **persistence** (a
 coordinator restart loses all content, Phases 15-17), **auth** (any
 client can join any document as EDITOR by guessing its id, Phases
-26-29), and **rendered presence** — the real PRESENCE protocol/room/
-coalescing machinery is BUILT as of Phase 31, and cursor/selection
-positions are now correctly TRANSFORMED (tracked to the same character)
-as concurrent remote edits land under them as of Phase 32, but no UI
-yet renders another user's own resolved cursor, selection, or avatar as
-a visible marker in the DOM — this session's OWN caret is transformed
-correctly; painting a PEER's remains unbuilt.
+26-29), and **rendered presence — now BUILT as of Phase 33** (Milestone
+M4): the real PRESENCE protocol/room/coalescing machinery (Phase 31),
+cursor/selection transformation (Phase 32's `Engine.resolveCaret`), and
+a real overlay renderer (`PresenceOverlay`) with stable per-user
+colours and graceful density-tier degradation now together render other
+participants' carets/selections as real, visible DOM markers. What
+remains genuinely unbuilt: any UI for toggling presence on/off or
+hiding one's own cursor from others (not asked for), and any avatar
+imagery beyond a coloured caret/name label (Scope-IN named carets,
+selections, and a name label — never a picture/avatar image).
 **Offline editing is now BUILT as of Phase 22** — API Spec §7.9's durable
 IndexedDB queue, a relaxed `requireEngine()`/input-pipeline gate that
 allows minting edits while `reconnecting`/`offline`, and
@@ -8456,8 +8748,9 @@ see that phase's own completed-phase entry for the full account,
 including the disclosed identifier-change nuance and the four real bugs
 (one pre-existing, in `gapTracker.ts`) found building it. Still stubbed:
 **undo/redo** (Phase 36) and **IME composition** (never emits an
-operation, unbuilt, unassigned to a phase number). Also still open:
-real cursor transformation under remote edits (Phase 32, see above). The
+operation, unbuilt, unassigned to a phase number). Cursor transformation
+under remote edits and its own rendering are now BUILT, as of Phases 32
+and 33 respectively (see above). The
 delay-relay test substitute's intermittent full-60-second failure,
 initially disclosed as an unresolved limitation, was fully root-caused
 the same day and confirmed as a defect in the test harness's
