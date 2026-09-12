@@ -85,8 +85,8 @@ function targetRange(ev: InputEvent, deps: InputPipelineDeps): VisRange | null {
   return a <= b ? { start: a, end: b } : { start: b, end: a };
 }
 
-/** Reads the LIVE `window.getSelection()` range, mapped to visible indices. Collapsed (`start === end`) at position 0 if there is no selection at all. */
-function liveSelectionRange(deps: InputPipelineDeps): VisRange {
+/** Reads the LIVE `window.getSelection()` range, mapped to visible indices. Collapsed (`start === end`) at position 0 if there is no selection at all. Exported for {@link CompositionController} (Phase 34) — IME-04's own "the selection deletion is emitted as an ordinary operation BEFORE the IME takes the region" reuses this exact reader rather than a second copy. */
+export function liveSelectionRange(deps: InputPipelineDeps): VisRange {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0) {
     return { start: 0, end: 0 };
@@ -121,8 +121,11 @@ function textForInputType(ev: InputEvent): string {
  * would keep reporting the SAME stale caret position, corrupting typing order entirely (caught by
  * this phase's own e2e suite: typing "hello" landed as "olleh" — every character re-inserted at
  * the position the caret was left at by the PREVIOUS insert, i.e. the very start, before this fix).
+ *
+ * Exported for {@link CompositionController} (Phase 34), which places the caret after the
+ * committed composition text at `compositionend`, the same way an ordinary insert does.
  */
-function placeCaretAt(deps: InputPipelineDeps, visIndex: number): void {
+export function placeCaretAt(deps: InputPipelineDeps, visIndex: number): void {
   const root = deps.domWriter.rootElement;
   const sel = window.getSelection();
   if (!root || !sel) {
@@ -160,7 +163,8 @@ function insertTextAt(deps: InputPipelineDeps, at: number, text: string): void {
   placeCaretAt(deps, at + Array.from(text).length); // Array.from: scalar count, not UTF-16 length
 }
 
-function deleteRangeAt(deps: InputPipelineDeps, at: number, count: number): void {
+/** Exported for {@link CompositionController} (Phase 34) — IME-04's "the selection deletion is emitted as an ordinary operation BEFORE the IME takes the region." */
+export function deleteRangeAt(deps: InputPipelineDeps, at: number, count: number): void {
   if (count <= 0) {
     return;
   }
@@ -271,11 +275,30 @@ function deleteLineBackward(ev: InputEvent, deps: InputPipelineDeps): void {
 /**
  * The full API Spec §7.4.2 dispatch table. Called from a `beforeinput`
  * listener — `event.preventDefault()` happens FIRST, unconditionally, for
- * every event this function sees (Scope-IN: "without exception"), before
- * any dispatch logic runs, so a throw further down can never leave the
- * browser free to mutate the DOM itself.
+ * every event this function sees EXCEPT the two IME composition types
+ * (Scope-IN: "without exception" — read against Phase 34's own real spec
+ * text, §7.4.2's table itself marks `insertCompositionText`/
+ * `deleteCompositionText` as the ONE pair of rows this rule doesn't apply
+ * to, since there is no way for `DomWriter` to render an in-progress,
+ * uncommitted IME candidate string itself; the browser's own native
+ * composition rendering is the only thing that can). For every OTHER
+ * event, preventDefault happens before any dispatch logic runs, so a
+ * throw further down can never leave the browser free to mutate the DOM
+ * itself.
  */
 export function handleBeforeInput(ev: InputEvent, deps: InputPipelineDeps): void {
+  if (ev.inputType === "insertCompositionText" || ev.inputType === "deleteCompositionText") {
+    // Phase 34 (API Spec §7.4.2/§7.6) — deliberately NOT prevented, and deliberately a bare
+    // return with no dispatch: this project's `CompositionController`
+    // (compositionController.ts) owns the ENTIRE composition lifecycle via its own
+    // `compositionstart`/`compositionupdate`/`compositionend` listeners on this same root, never
+    // via `beforeinput`. No operation is ever emitted from this inputType — composition mutates
+    // the engine exactly ONCE, at `compositionend`, as one `OP_INSERT_RUN` (Test Plan IME-01).
+    // `MutationSentinel` is suspended for the whole composition (`CompositionController`'s own
+    // `compositionstart` handler), so the browser's native composition-preview DOM writes this
+    // leaves in place are never mistaken for a foreign mutation and reverted.
+    return;
+  }
   ev.preventDefault();
 
   if (!deps.sync.engine) {
@@ -324,9 +347,8 @@ export function handleBeforeInput(ev: InputEvent, deps: InputPipelineDeps): void
     case "deleteHardLineBackward":
       deleteLineBackward(ev, deps);
       break;
-    case "insertCompositionText":
-    case "deleteCompositionText":
-      break; // never emits an operation (API Spec §7.4.2) — IME composition is Phase 13's sentinel
+    // "insertCompositionText"/"deleteCompositionText" never reach this switch at all — see the
+    // early return at the top of this function (Phase 34).
     case "historyUndo":
     case "historyRedo":
       // TODO(Phase 36): engine.undo()/engine.redo() (Engine Spec §9). Stubbed per API Spec

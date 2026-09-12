@@ -5,6 +5,11 @@
 
 export { attachInputPipeline, handleBeforeInput, type InputPipelineDeps } from "./inputPipeline.js";
 export {
+  attachCompositionHandlers,
+  CompositionController,
+  type CompositionControllerDeps,
+} from "./compositionController.js";
+export {
   clusterAfter,
   clusterBefore,
   lineStartBefore,

@@ -97,8 +97,8 @@ function fireBeforeInput(
   return event;
 }
 
-describe("inputPipeline — every beforeinput is preventDefaulted, without exception (Scope-IN)", () => {
-  it("defaultPrevented is true for 20 distinct inputTypes, including one not in the dispatch table", () => {
+describe("inputPipeline — every beforeinput is preventDefaulted, without exception EXCEPT the two IME composition types (Scope-IN, corrected by Phase 34's own real spec text)", () => {
+  it("defaultPrevented is true for 18 distinct inputTypes, including one not in the dispatch table", () => {
     const h = makeHarness("hello");
     setCaret(h, 5);
     const inputTypes = [
@@ -116,18 +116,37 @@ describe("inputPipeline — every beforeinput is preventDefaulted, without excep
       "deleteSoftLineBackward",
       "deleteHardLineBackward",
       "deleteByCut",
-      "insertCompositionText",
-      "deleteCompositionText",
       "historyUndo",
       "historyRedo",
       "insertFromYank", // unlisted — must still be prevented
       "formatBold", // unlisted — must still be prevented
     ];
-    expect(inputTypes).toHaveLength(20);
+    expect(inputTypes).toHaveLength(18);
     for (const inputType of inputTypes) {
       const event = fireBeforeInput(h, inputType, { data: "x" });
       expect(event.defaultPrevented, `inputType ${inputType}`).toBe(true);
     }
+    h.detach();
+  });
+
+  /**
+   * Phase 34 (API Spec §7.4.2/§7.6) — the ONE deliberate carve-out from the rule above.
+   * `insertCompositionText`/`deleteCompositionText` must NOT be prevented: the browser's own
+   * native rendering is the only thing that can display an in-progress, uncommitted IME
+   * candidate string, and `CompositionController` (not `beforeinput`) owns the entire
+   * composition lifecycle via `compositionstart`/`compositionupdate`/`compositionend` instead.
+   * No operation is ever emitted from either inputType, regardless.
+   */
+  it("insertCompositionText/deleteCompositionText are NOT preventDefaulted and never mutate the engine", () => {
+    const h = makeHarness("hello");
+    setCaret(h, 5);
+    const before = h.sync.engine!.stats().totalElements;
+    for (const inputType of ["insertCompositionText", "deleteCompositionText"]) {
+      const event = fireBeforeInput(h, inputType, { data: "x" });
+      expect(event.defaultPrevented, `inputType ${inputType}`).toBe(false);
+    }
+    expect(h.sync.engine!.stats().totalElements).toBe(before);
+    expect(h.domWriter.materializedText()).toBe("hello");
     h.detach();
   });
 
