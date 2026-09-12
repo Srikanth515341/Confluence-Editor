@@ -32,6 +32,17 @@ export interface MutationSentinelDeps {
   readonly domWriter: DomWriter;
   /** Reads the CURRENT authoritative document text. `undefined` before the client has ever synced — reconciliation has nothing to reconcile against yet. */
   readonly getEngineText: () => string | undefined;
+  /**
+   * Optional (Phase 33): called once at the end of EVERY {@link applyPatches} call, whatever the
+   * source — a local keystroke (`inputPipeline.ts`), a remote-batch remount (`EditorView.tsx`), or
+   * this sentinel's own reconciliation re-render. Exists so a caller can know "some document
+   * mutation just completed" without needing its own copy of this same wrapping, the same
+   * "one general-purpose hook, not a presence-specific one" shape as {@link onRemoteOpsApplied}. A
+   * peer's own rendered cursor position (`PresenceOverlay`, `packages/client/src/presence/`) needs
+   * to be recomputed after ANY document mutation, not only a remote batch — typing BEFORE a peer's
+   * cursor shifts where their cursor visually sits too, even though they sent nothing new.
+   */
+  readonly onApplyPatches?: () => void;
 }
 
 /**
@@ -94,6 +105,7 @@ export class MutationSentinel {
       fn();
     } finally {
       this.observer.takeRecords();
+      this.deps.onApplyPatches?.();
     }
   }
 

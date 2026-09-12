@@ -18,6 +18,11 @@ export interface HarnessDomWriter {
   readonly rootElement: Element | null;
 }
 
+export interface HarnessIdentifier {
+  readonly c: number;
+  readonly r: number;
+}
+
 export interface HarnessEngine {
   text(): string;
   stats(): {
@@ -25,6 +30,11 @@ export interface HarnessEngine {
     readonly tombstones: number;
     readonly visibleLength: number;
   };
+  localInsert(visibleIndex: number, codePoint: number): { readonly id: HarnessIdentifier };
+  /** Phase 32 — the visible sequence, in order; `.id` is what a presence anchor/focus identifier is. */
+  visible(): readonly { readonly id: HarnessIdentifier }[];
+  /** Phase 32 (API Spec §7.5.3) — resolves an anchor identifier back to a live visible index. */
+  resolveCaret(id: HarnessIdentifier | null): number;
 }
 
 export interface HarnessSyncClient {
@@ -48,6 +58,36 @@ export interface HarnessMutationSentinel {
   applyPatches(fn: () => void): void;
 }
 
+/** Phase 33 — the same `PresenceClientEvent` union `SyncClient.onPresenceEvent` delivers (`sync/syncClient.ts`), loosely typed here since the harness only needs to construct and pass these, never inspect their real shape further. */
+export type HarnessPresenceEvent =
+  | { readonly kind: "join"; readonly replicaId: number; readonly userId: string; readonly displayName: string; readonly role: number }
+  | { readonly kind: "leave"; readonly replicaId: number; readonly reason: number }
+  | {
+      readonly kind: "update";
+      readonly replicaId: number;
+      readonly anchor: HarnessIdentifier | null;
+      readonly focus: HarnessIdentifier | null;
+      readonly collapsed: boolean;
+    }
+  | {
+      readonly kind: "roster";
+      readonly participants: readonly {
+        readonly replicaId: number;
+        readonly userId: string;
+        readonly displayName: string;
+        readonly role: number;
+      }[];
+    };
+
+export interface HarnessPresenceOverlay {
+  handlePresenceEvent(event: HarnessPresenceEvent): void;
+  refresh(): void;
+  start(): void;
+  stop(): void;
+  readonly currentTier: string;
+  readonly participantCount: number;
+}
+
 declare global {
   interface Window {
     InputHarness: {
@@ -67,6 +107,14 @@ declare global {
           sentinel: HarnessMutationSentinel;
         },
       ) => () => void;
+      visToDom: (index: readonly HarnessRenderRun[], root: Element, v: number) => { node: Node; offset: number };
+      domToVis: (index: readonly HarnessRenderRun[], node: Node, offset: number) => number;
+      PresenceOverlay: new (deps: {
+        editorRoot: Element;
+        overlayContainer: HTMLElement;
+        getDomWriterIndex: () => readonly HarnessRenderRun[];
+        getEngine: () => HarnessEngine | null;
+      }) => HarnessPresenceOverlay;
     };
   }
 }
