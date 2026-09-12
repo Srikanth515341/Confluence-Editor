@@ -170,6 +170,18 @@ test("MUT-01: typing real keystrokes emits operations and renders correctly", as
   expect(editorText).toBe("hello");
 });
 
+/**
+ * Phase 35 hardening of MUT-01's autocorrect row (verification, not new build — API Spec
+ * §7.4.2/Test Plan MUT-01): the original version of both tests below asserted only
+ * `engineText()`. That alone cannot distinguish a CORRECTLY HANDLED case (the pipeline's
+ * `insertReplacementText` handler processes the delete+insert itself) from one where the
+ * sentinel is silently absorbing/reverting the browser's own autocorrect DOM mutation and only
+ * COINCIDENTALLY producing the right-looking end state — if `binding.reconciliation` had
+ * incremented even once, that would mean the sentinel did cleanup work that should have been
+ * unnecessary. Both assertions now added: `domText()` (the correction genuinely STICKS in the
+ * rendered DOM, not merely the engine) and `sentinel.metrics.reconciliation === 0` (no revert
+ * ever happened).
+ */
 test("MUT-01: autocorrect fires (insertReplacementText) — delete + insert emitted", async ({
   page,
 }) => {
@@ -177,6 +189,8 @@ test("MUT-01: autocorrect fires (insertReplacementText) — delete + insert emit
   await selectRange(page, 0, 3); // "teh" — what a real autocorrect targetRange/selection covers
   await dispatchBeforeInput(page, "insertReplacementText", { data: "the" });
   expect(await engineText(page)).toBe("the cat");
+  expect(await domText(page)).toBe("the cat"); // the correction STICKS in the DOM, not just the engine
+  expect(await page.evaluate(() => window.__harness!.sentinel.metrics.reconciliation)).toBe(0);
 });
 
 test("MUT-01: spellcheck replacement via context menu (insertReplacementText)", async ({
@@ -186,6 +200,8 @@ test("MUT-01: spellcheck replacement via context menu (insertReplacementText)", 
   await selectRange(page, 0, 7); // "recieve"
   await dispatchBeforeInput(page, "insertReplacementText", { data: "receive" });
   expect(await engineText(page)).toBe("receive soon");
+  expect(await domText(page)).toBe("receive soon");
+  expect(await page.evaluate(() => window.__harness!.sentinel.metrics.reconciliation)).toBe(0);
 });
 
 test("MUT-01: paste 2,000 characters — content lands correctly in one pipeline call", async ({
@@ -268,7 +284,19 @@ test("MUT-01: Ctrl+Backspace deletes a whole word via a real keystroke", async (
   expect(await engineText(page)).toBe("hello ");
 });
 
-test("every beforeinput is preventDefaulted for 20 distinct inputTypes (Scope-IN)", async ({
+/**
+ * Phase 35 regression fix: this real-browser counterpart of `inputPipeline.test.ts`'s own
+ * (already-corrected, Phase 34) jsdom test still hardcoded ALL 20 inputTypes as expected
+ * `defaultPrevented === true`, including the two composition types Phase 34 deliberately carved
+ * out (`insertCompositionText`/`deleteCompositionText` must NOT be prevented — the browser's own
+ * native composition rendering needs default behavior, `CompositionController` owns the whole
+ * lifecycle instead). This e2e file's own copy of the check was never updated when Phase 34
+ * changed `handleBeforeInput`, so it silently failed on every real browser the moment this
+ * phase's own full-suite regression sweep actually ran it (Phase 34's own closing verification
+ * only ever ran `ime.spec.ts` specifically, never re-ran this PRE-EXISTING file's full suite —
+ * a real, disclosed gap in that phase's own verification, found and fixed here).
+ */
+test("every beforeinput is preventDefaulted for 18 distinct inputTypes (Scope-IN, corrected by Phase 34's own real spec text)", async ({
   page,
 }) => {
   await setupHarness(page, "hello");
@@ -288,14 +316,12 @@ test("every beforeinput is preventDefaulted for 20 distinct inputTypes (Scope-IN
     "deleteSoftLineBackward",
     "deleteHardLineBackward",
     "deleteByCut",
-    "insertCompositionText",
-    "deleteCompositionText",
     "historyUndo",
     "historyRedo",
     "insertFromYank",
     "formatBold",
   ];
-  expect(inputTypes).toHaveLength(20);
+  expect(inputTypes).toHaveLength(18);
   const results = await page.evaluate((types) => {
     const { editor } = window.__harness!;
     return types.map((inputType) => {
@@ -305,4 +331,71 @@ test("every beforeinput is preventDefaulted for 20 distinct inputTypes (Scope-IN
     });
   }, inputTypes);
   expect(results).toEqual(inputTypes.map(() => true));
+});
+
+/**
+ * Phase 35 finding, disclosed rather than papered over: real Chromium's `InputEvent`
+ * CONSTRUCTOR does not recognize `"deleteCompositionText"` as a legal `inputType` value —
+ * confirmed via a standalone probe: `new InputEvent("beforeinput", {inputType:
+ * "deleteCompositionText"}).inputType` reads back as `""` (empty string) in real Chromium,
+ * while Firefox and WebKit both preserve it correctly. This is a genuine, browser-specific
+ * limitation of SYNTHETIC dispatch (real IME composition never goes through this constructor
+ * at all — a real deleteCompositionText beforeinput is only ever produced natively by the
+ * browser's own composition machinery, which this project's real-CDP-level composition tests
+ * in ime.spec.ts already exercise), not a product defect: once Chromium silently drops the
+ * inputType to `""`, `handleBeforeInput`'s own early-return check (`ev.inputType ===
+ * "insertCompositionText" || ev.inputType === "deleteCompositionText"`) correctly does NOT
+ * match `""`, so the event falls through to the ordinary dispatch table and gets
+ * preventDefault()'d like any other unrecognized inputType would — this is
+ * `handleBeforeInput` behaving exactly as designed against what Chromium actually delivers,
+ * not a bug in it. This mirrors Phase 12's own disclosed WebKit `DataTransfer` protected-mode
+ * finding: a real, per-browser synthetic-dispatch ceiling, not a pipeline defect, so the
+ * untestable-on-Chromium half is explicitly skipped there rather than silently accepted or
+ * hidden behind a non-native workaround (e.g. `Object.defineProperty`-forcing the property,
+ * which would prove nothing about what Chromium's real InputEvent constructor accepts).
+ */
+test("Phase 34: insertCompositionText is NOT preventDefaulted in a real browser either", async ({
+  page,
+}) => {
+  await setupHarness(page, "hello");
+  await placeCaret(page, 5);
+  const result = await page.evaluate(() => {
+    const { editor } = window.__harness!;
+    const event = new InputEvent("beforeinput", {
+      inputType: "insertCompositionText",
+      data: "x",
+      cancelable: true,
+    });
+    editor.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(result).toBe(false);
+  expect(await engineText(page)).toBe("hello"); // never mutates the engine
+});
+
+test("Phase 34: deleteCompositionText is NOT preventDefaulted in a real browser either (skipped on Chromium — see comment above)", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(
+    browserName === "chromium",
+    'Chromium\'s InputEvent constructor does not recognize "deleteCompositionText" as a legal ' +
+      'inputType — it silently reads back as "" — so this specific inputType cannot be ' +
+      "synthetically dispatched with its real value in Chromium at all. See this file's own " +
+      "header comment on the sibling test above for the full, empirically-confirmed finding.",
+  );
+  await setupHarness(page, "hello");
+  await placeCaret(page, 5);
+  const result = await page.evaluate(() => {
+    const { editor } = window.__harness!;
+    const event = new InputEvent("beforeinput", {
+      inputType: "deleteCompositionText",
+      data: "x",
+      cancelable: true,
+    });
+    editor.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(result).toBe(false);
+  expect(await engineText(page)).toBe("hello"); // never mutates the engine
 });

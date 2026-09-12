@@ -523,4 +523,95 @@ describe("Adversarial suite — Engine-derived group (ADV-14…ADV-22)", () => {
     // scope — see CLAUDE.md). The I0 counter-sequence check above (the sub-case's own actual
     // named invariant, "Engine Spec I0") is unaffected and still verified.
   });
+
+});
+
+/**
+ * Phase 35 (GRA-01, Test Plan §7.4) — the engine-level companion to
+ * `packages/client/e2e/graphemeHardening.spec.ts`'s browser-level GRA-01 suite. These are NOT
+ * official Test Plan §2.4 ADV-numbered cases (the real table only names ADV-17/18/19 for
+ * combining-mark/ZWJ scenarios) — deliberately not inventing new ADV numbers that don't exist in
+ * the approved Test Plan. They exist for the SAME reason ADV-17/19 do: proving, directly and
+ * cheaply at the engine level, that the identical "bind is checked BEFORE replica id" tie-break
+ * (Engine Spec §4.4 Definition 4.2, Invariant I8) holds for the three GRA-01 fixture types
+ * `isClusterContinuing` covers but no prior adversarial case exercised end to end
+ * (regional-indicator flag pairs, Devanagari matras, and variation selectors) — BEFORE trusting
+ * the full browser/binding-layer e2e suite to demonstrate the same property through the whole
+ * pipeline. All three follow ADV-17/19's own exact shape: a shared one-character seed, two
+ * replicas concurrently appending at the SAME window (one a cluster-continuation, one a plain
+ * character), delivered to each other, checked in BOTH replica-id orderings.
+ */
+describe("Phase 35 — GRA-01 engine-level support (Engine Spec I8): three more cluster-continuation types, both orderings", () => {
+  it("regional-indicator flag pair: a concurrent plain character never lands between the two halves of the flag", () => {
+    const US = 0x1f1fa; // regional indicator symbol letter U
+    const S = 0x1f1f8; // regional indicator symbol letter S — together, the US flag
+    forEachReplicaOrdering(2, ([flagReplicaId, charReplicaId]) => {
+      const seed = new Engine(100);
+      seed.localInsert(0, US);
+      const flagEngine = new Engine(flagReplicaId as number);
+      const charEngine = new Engine(charReplicaId as number);
+      syncFromSeed(seed, flagEngine, charEngine);
+
+      const flagOp = flagEngine.localInsert(1, S); // bind: true (isClusterContinuing — every regional indicator)
+      const charOp = charEngine.localInsert(1, cp("x")); // bind: false
+
+      flagEngine.applyRemote(charOp);
+      charEngine.applyRemote(flagOp);
+
+      const expected = String.fromCodePoint(US) + String.fromCodePoint(S) + "x";
+      expect(flagEngine.text()).toBe(expected);
+      expect(charEngine.text()).toBe(expected);
+      // The flag itself is genuinely one grapheme cluster, not split by 'x' landing inside it.
+      expect(
+        Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(expected)),
+      ).toHaveLength(2);
+    });
+  });
+
+  it("Devanagari consonant + matra: a concurrent plain character never lands between the consonant and its vowel sign", () => {
+    const KA = cp("क"); // Devanagari letter KA
+    const VOWEL_SIGN_I = 0x093f; // Devanagari vowel sign I (Mc, spacing combining mark)
+    forEachReplicaOrdering(2, ([matraReplicaId, charReplicaId]) => {
+      const seed = new Engine(100);
+      seed.localInsert(0, KA);
+      const matraEngine = new Engine(matraReplicaId as number);
+      const charEngine = new Engine(charReplicaId as number);
+      syncFromSeed(seed, matraEngine, charEngine);
+
+      const matraOp = matraEngine.localInsert(1, VOWEL_SIGN_I); // bind: true
+      const charOp = charEngine.localInsert(1, cp("x")); // bind: false
+
+      matraEngine.applyRemote(charOp);
+      charEngine.applyRemote(matraOp);
+
+      const expected = "क" + String.fromCodePoint(VOWEL_SIGN_I) + "x";
+      expect(matraEngine.text()).toBe(expected);
+      expect(charEngine.text()).toBe(expected);
+    });
+  });
+
+  it("variation selector: a concurrent plain character never lands between the base symbol and its presentation selector", () => {
+    const SMILING_FACE = cp("☺"); // U+263A, has both text and emoji presentations
+    const VS16 = 0xfe0f; // variation selector-16 (emoji presentation)
+    forEachReplicaOrdering(2, ([vsReplicaId, charReplicaId]) => {
+      const seed = new Engine(100);
+      seed.localInsert(0, SMILING_FACE);
+      const vsEngine = new Engine(vsReplicaId as number);
+      const charEngine = new Engine(charReplicaId as number);
+      syncFromSeed(seed, vsEngine, charEngine);
+
+      const vsOp = vsEngine.localInsert(1, VS16); // bind: true
+      const charOp = charEngine.localInsert(1, cp("x")); // bind: false
+
+      vsEngine.applyRemote(charOp);
+      charEngine.applyRemote(vsOp);
+
+      const expected = "☺" + String.fromCodePoint(VS16) + "x";
+      expect(vsEngine.text()).toBe(expected);
+      expect(charEngine.text()).toBe(expected);
+      expect(
+        Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(expected)),
+      ).toHaveLength(2);
+    });
+  });
 });

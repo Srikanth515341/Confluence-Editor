@@ -71,9 +71,25 @@ import { captureCaret, restoreCaret } from "./caretTracker.js";
 export interface EditorViewProps {
   readonly sync: SyncClient;
   readonly className?: string;
+  /**
+   * Phase 35 (MUT-04's manual macOS/iOS Safari verification steps) — the `MutationSentinel`
+   * instance is otherwise entirely private to this component's own `useEffect` closure; a real
+   * manual tester on real Safari hardware needs to read `sentinel.metrics.reconciliation`/
+   * `desync_error` (the same signal MUT-01's own automated autocorrect test already checks, per
+   * `binding.reconciliation` — API Spec §7.7) to distinguish "handled correctly" from "the
+   * sentinel silently reverted a real mutation and the input pipeline coincidentally reproduced
+   * the same end state." Called once with the live instance right after `sentinel.start()`, and
+   * again with `null` during this effect's own cleanup — never called with a STALE instance,
+   * since the caller (`App.tsx`) always reads through the ref rather than closing over a value.
+   */
+  readonly onSentinelReady?: (sentinel: MutationSentinel | null) => void;
 }
 
-export function EditorView({ sync, className }: EditorViewProps): React.JSX.Element {
+export function EditorView({
+  sync,
+  className,
+  onSentinelReady,
+}: EditorViewProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const domWriterRef = useRef<DomWriter | null>(null);
@@ -104,6 +120,7 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
       onApplyPatches: () => presenceOverlay.refresh(),
     });
     sentinel.start();
+    onSentinelReady?.(sentinel);
 
     const mountIfNewEngine = () => {
       const engine = sync.engine;
@@ -158,8 +175,9 @@ export function EditorView({ sync, className }: EditorViewProps): React.JSX.Elem
       presenceOverlay.stop();
       domWriterRef.current = null;
       mountedEngineRef.current = null;
+      onSentinelReady?.(null);
     };
-  }, [sync]);
+  }, [sync, onSentinelReady]);
 
   return (
     // The wrapper exists ONLY to give the overlay a `position: relative` positioning ancestor
