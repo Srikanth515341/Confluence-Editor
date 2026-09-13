@@ -13,7 +13,9 @@
     "test:properties": "vitest run --config vitest.properties.config.ts",
     "test:adversarial": "vitest run --config vitest.adversarial.config.ts",
     "test:mutation": "vitest run --config vitest.mutation.config.ts",
-    "test:benchmark": "vitest run --config vitest.benchmark.config.ts"
+    "test:benchmark": "vitest run --config vitest.benchmark.config.ts",
+    "test:load:smoke": "vitest run src/load/loadHarness.smoke.test.ts",
+    "load:sweep": "vitest run --config vitest.load.config.ts"
   },
   "dependencies": {
     "@collab-editor/engine": "workspace:*",
@@ -21,6 +23,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@collab-editor/server": "workspace:*",
     "@types/ws": "^8.5.12",
     "fast-check": "^4.9.0",
     "typescript": "^5.6.3"

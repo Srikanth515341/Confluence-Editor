@@ -54,6 +54,14 @@ export default defineConfig({
       // FaultRelay), deliberately injecting multi-second delays — gated the same way via
       // `pnpm test:adverseNetwork` (packages/client/vitest.adverseNetwork.config.ts).
       "**/adverseNetwork.test.ts",
+      // Phase 38's M7 load sweep (Test Plan §4.4 PERF-M7): real WebSocket connections at up
+      // to 32 concurrent editors + 96 viewers against a real 50,000-character document, run
+      // for minutes to hours depending on LOAD_LEVELS/LOAD_EDIT_DURATION_MS — gated the same
+      // way via `pnpm load:sweep` (packages/testkit/vitest.load.config.ts). The fast, small-
+      // scale smoke test proving the harness itself works (`loadHarness.smoke.test.ts`) stays
+      // in the default run, the same "fast enough not to need isolation" reasoning as the
+      // adversarial suite.
+      "**/runLoadSweep.script.test.ts",
     ],
     environment: "node",
     globals: false,

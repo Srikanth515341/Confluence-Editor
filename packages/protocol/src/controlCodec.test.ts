@@ -100,6 +100,7 @@ const pongArb: fc.Arbitrary<ControlMessage> = fc.record({
   kind: fc.constant("pong" as const),
   clientTimeMs: fc.nat({ max: Number.MAX_SAFE_INTEGER }),
   serverSeq: fc.nat({ max: 5_000_000 }),
+  serverTimeMs: fc.nat({ max: Number.MAX_SAFE_INTEGER }),
 });
 
 const leaveArb: fc.Arbitrary<ControlMessage> = fc.record({

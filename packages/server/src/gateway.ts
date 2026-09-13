@@ -652,6 +652,10 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
               kind: "pong",
               clientTimeMs: ctrlMsg.clientTimeMs,
               serverSeq: Number(coordinator.currentSeq),
+              // Phase 38 (Test Plan §4.2 PERF-M4) — see PongMessage's own doc comment for why a
+              // single timestamp, read HERE (synchronously, at PING-handling time, before this
+              // frame is even enqueued), stands in for the NTP algorithm's separate t1/t2.
+              serverTimeMs: Date.now(),
             }),
           );
           break;

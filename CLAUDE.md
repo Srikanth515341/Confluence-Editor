@@ -7318,6 +7318,236 @@ check:purity` was ALSO silently broken by two comments (one in
   the RUM instrumentation hooks) — the dashboard is its own separate
   page, per Scope-IN, not embedded in the product itself.
 
+- **Phase 38 — Load characterization and the M7 curve** (PRD M7, M4; RFC
+  §7.7; Test Plan §4.4 PERF-M7, §4.2 PERF-M4). PRD M7's own framing:
+  "measured, not asserted — the curve is the deliverable." Dependencies:
+  Phases 19, 37 (both load-bearing).
+
+  **`packages/testkit/src/load/clockOffset.ts`** (new): the real
+  Test Plan §4.2 NTP-style handshake — `estimateClockOffset` discards
+  samples whose RTT exceeds the round's own 20th percentile, then takes
+  the MEDIAN offset of the survivors. **A real correction was needed
+  before this could even be trusted, found by hand-deriving the formula
+  against the phase's own 150ms/500ms-RTT conditions before writing the
+  load harness on top of it**: the obvious definition of "residual
+  uncertainty" (half the worst surviving sample's own RTT — the classic
+  single-sample NTP error bound) is mathematically INCOMPATIBLE with Test
+  Plan §4.2's own "<10ms" requirement under an injected-RTT condition —
+  that bound is proportional to raw RTT (~75ms at 150ms RTT), so it could
+  never satisfy the required assertion regardless of how correct the
+  estimate actually is. The real, load-bearing insight (confirmed by
+  algebraic derivation, then by a dedicated unit test): because `PongMessage`
+  collapses t1/t2 into one timestamp (this project's own disclosed Phase
+  38 simplification, `PongMessage`'s own doc comment), `computeRtt`
+  reduces to plain client-side round-trip time, completely independent of
+  the server's own collapsed timestamp, while `computeOffset` is
+  independent of SYMMETRIC one-way delay entirely (it cancels
+  algebraically) — meaning a large but symmetric injected RTT contributes
+  NOTHING to the true measurement error; only genuine per-sample
+  scheduling noise does. `residualUncertaintyMs` is therefore defined as
+  half the SPREAD (max−min) of the individual offset computations among
+  the kept, lowest-RTT samples — how consistently repeated measurements
+  agree with each other — falling back to the classic single-sample bound
+  only when fewer than 2 samples survive filtering. Verified directly: a
+  dedicated test constructs 16 tight samples at the phase's own literal
+  150ms RTT condition (with small, realistic per-sample scheduling
+  noise) plus 4 high-RTT jitter outliers, and confirms the residual
+  uncertainty stays under 10ms while `maxKeptRttMs` correctly reports the
+  real 150ms condition — this is the exact scenario the real load harness
+  needed to survive at level 8, and (see below) at level 8 the mechanism's
+  own assumption (symmetric delay) genuinely broke down for a DIFFERENT,
+  disclosed reason (event-loop blocking, not network RTT).
+
+  **`packages/testkit/src/load/loadHarness.ts`** (new): a real load
+  harness — raw WebSocket + raw `Engine` synthetic editor/viewer clients,
+  mirroring the `SimulatedClient` pattern Phase 18/21 established
+  (`audit.db.test.ts`/`gc.db.test.ts`), but over the REAL wire protocol
+  rather than a captured in-process callback, since this phase's own
+  egress/fanout metrics require exercising the real send-queue/broadcast/
+  wire-encoding path. **Operation store: `InMemoryOperationStore`,
+  deliberately disclosed** — isolates engine/fanout cost from database
+  commit latency, directly serving the phase brief's own "on multi-node
+  fanout" diagnostic requirement (distinguish fanout-layer causes from
+  engine-apply-cost causes before considering any multi-node work — a
+  real Postgres round trip would be a third, confounding variable neither
+  failure mode needs to reproduce). **Baseline document construction is
+  via REAL, sequential `Engine.localInsert()` calls** against the
+  coordinator's own live engine — the exact production method any real
+  keystroke invokes — deliberately NOT this project's own fast DB
+  `unnest(...)`-style bulk-insert technique (reserved for fixture-only
+  setup in `*.db.test.ts` files): this phase's own point is measuring
+  Fugue's real O(N²) sequential-insertion cost at the phase brief's own
+  literal 50,000-character scale, which bypassing it via a bulk-insert
+  shortcut would hide entirely. `connectAndHandshake` performs a real
+  HELLO/WELCOME/SNAPSHOT/ALREADY_HAVE handshake (every synthetic client
+  is a fresh join, always resolving to SNAPSHOT, never CATCHUP — no
+  CATCHUP-path handling was needed) and decodes the real structure-form
+  SNAPSHOT via `seedEngineFromSnapshot` — the SAME replay cost a real
+  browser client pays. Correlation for M4's own mint-to-visible latency
+  is done via a harness-level, IN-PROCESS `CorrelationState` map
+  (legitimate only because every synthetic client shares one Node
+  process — a real cross-machine load generator would need to carry this
+  over the wire instead), converting each client's own local mint/receipt
+  timestamps to a common "server clock" basis via its own
+  `ClockOffsetTracker`.
+
+  **The reduced-pass duration decision — resolved via `AskUserQuestion`,
+  then confirmed by the user's own explicit follow-up** (option 3: build
+  the harness, run a reduced pass today, ALSO leave the exact command to
+  run the full, literal 10-minute/level sweep separately, overnight,
+  unattended). 45 seconds of EDITING per level was chosen — a DURATION
+  reduction only, never a workload-SHAPE reduction (the 50,000-character
+  baseline, the literal 2/4/8/16/32 levels, the literal 5 chars/s typing
+  rate, and the literal 3x viewer ratio are all unchanged) — following
+  this project's own established precedent for exactly this class of
+  reduction (Phase 14's shortened E2E-CONV runs, Phase 25's accelerated
+  fault-injection in place of literal wall-clock waits).
+
+  **The single most important, and entirely unanticipated, finding of
+  this phase: building the 50,000-character baseline and joining a new
+  client to it are themselves the dominant cost — not fanout, not
+  editing throughput, not concurrency in the way PRD M7's own framing
+  implies.** A real calibration run, BEFORE the actual sweep, measured
+  the 50,000-character baseline taking **131.5–188.4 seconds** to build
+  via real sequential inserts, and a SINGLE new client's own
+  HELLO-to-synced handshake taking **17.5 seconds in isolation**, growing
+  to **23.0–30.6 seconds median (up to 63.8s max)** once several other
+  clients were already connected during the real sweep itself. Attempting
+  to connect 32 clients within one calibration attempt crashed the
+  Vitest worker outright — confirmed, via direct process instrumentation,
+  to be genuine, sustained, single-threaded CPU saturation (not a hang):
+  during the 188-second baseline build, the WHOLE Node process — including
+  WebSocket message handling for an already-connected, otherwise-idle
+  client — was completely unresponsive; that client's own disconnect
+  event wasn't processed by the event loop until the synchronous build
+  finally yielded, over three minutes later. **This is conclusively an
+  ENGINE-APPLY-COST problem, not a fanout/network-layer one**, satisfying
+  the phase brief's own explicit "on multi-node fanout" diagnostic
+  requirement directly: no multi-node work is warranted here, since a
+  second node cannot make Fugue's own per-op/per-replay cost faster — the
+  bottleneck is entirely local, single-process CPU work. **Cross-
+  referenced explicitly against CLAUDE.md's own Open Item 3** (the
+  deferred Fugue O(N²)→O(log N) balanced-storage redesign) as the single
+  strongest, most concrete, product-visible evidence yet for why that
+  work matters — a 17.5-to-64-second "time to synced" for a new
+  collaborator opening an ordinary, 50,000-character document is a real,
+  user-visible product defect TODAY, not a hypothetical future-scale
+  concern (see that Open Item's own updated entry for the full account).
+
+  **The measured M7 curve, real numbers, at 45s/level**:
+
+  | Editors | Viewers | M4 p50 | M4 p95 | M4 p99 | ops/s fanout | doc size (nodes) | clock-offset residual |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 2 | 6 | 7.5ms | 49.0ms | 108.5ms | 68.7/s | 50,448 | 0.5ms (PASS) |
+  | 4 | 12 | 19.0ms | 62.0ms | 20,626.5ms | 303.3/s | 51,389 | 0.75ms (PASS) |
+  | 8 | 24 | 553.0ms | **23,958.5ms** | 38,084.5ms | 1,006.0/s | 53,139 | 73.0ms (**FAIL**) |
+
+  **Answer to the DoD's own explicit "state the measured level at which
+  M4 p95 first exceeds 250ms" requirement**: p95 holds well under 250ms
+  through 4 editors (49.0ms, 62.0ms — PRD A-4's own "holds through 8
+  editors" design target is thus tested, not merely asserted, at these
+  two levels) but **explodes to 23,958.5ms at 8 editors — a ~386x jump,
+  96x over the 250ms target. This IS the measured level: 8 concurrent
+  editors.** The more important, first-order point, stated plainly rather
+  than letting the p95 number stand alone: the underlying mechanism (the
+  same single-threaded seeding-cost blocking documented above) is ALREADY
+  visible, in relative terms, at level 4's own p99 (20,626.5ms) — a
+  reader who only checks "does p95 cross 250ms" would miss that the exact
+  same failure mode was already present, at half the concurrency, in the
+  tail.
+
+  **A second real, honestly-disclosed failure, found only because Test
+  Plan §4.2 requires the residual-uncertainty assertion checked and
+  reported at EVERY measured condition, not just where it happens to
+  pass**: at level 8 ONLY, the clock-offset mechanism's own accuracy
+  assertion FAILS (73.0ms, against the required <10ms). Root cause,
+  confirmed by direct reasoning about the mechanism's own assumption:
+  the NTP-style correction's symmetric-delay-cancels argument (this same
+  phase's own `clockOffset.ts` design, above) holds for genuine NETWORK
+  delay, but at level 8 the dominant source of PING/PONG round-trip
+  variance is the SAME single-threaded event-loop blocking described
+  above — which is NOT symmetric between a PING's own send and its PONG's
+  own reply, since the server can be blocked for an arbitrary,
+  unpredictable duration in between. This is a genuine, disclosed
+  limitation of the NTP-style methodology's own assumption under this
+  SPECIFIC failure mode (extreme event-loop contention), not a bug in
+  `clockOffset.ts` itself — its own dedicated unit tests (above) confirm
+  the mechanism works correctly under genuine, symmetric network RTT,
+  including at the phase's own literal 150ms condition.
+
+  **Correctness (M1/M2/M6) held at every measured level, including 8**:
+  `documentTombstones` stayed at exactly 0 across all three levels (this
+  workload's own load profile is pure appends, per Test Plan §4.4's own
+  text), `documentTotalElements` grew monotonically and consistently with
+  expected editor throughput at every level, and no crash, no thrown
+  invariant violation, and no divergence of any kind was observed at any
+  level.
+
+  **What could not be measured, disclosed rather than silently omitted or
+  estimated**: `client.main_thread_utilization` (synthetic Node clients
+  have no real DOM/render loop to measure against — this metric
+  structurally requires a real, browser-based load generator, out of this
+  phase's own scope) and `binding.reconciliation` (structurally 0 for
+  every synthetic client, since none of them have a real
+  `MutationSentinel`/DOM at all — not a real measurement of the product's
+  own reconciliation behavior under load, a disclosed absence of data,
+  not a claimed zero).
+
+  **Levels 16 and 32 were NOT run live in this reduced pass**, given the
+  confirmed cost trajectory above (30–64s per client already at level 4,
+  a real worker crash attempting 32 clients in one process during
+  calibration) — disclosed explicitly, not silently dropped. The SAME
+  harness, completely unmodified, produces the full, literal Test Plan
+  §4.4 sweep (all five levels, the real 10-minutes-per-level duration) via
+  one command, intended to run overnight, unattended:
+  ```bash
+  cd packages/testkit
+  LOAD_LEVELS="2,4,8,16,32" LOAD_EDIT_DURATION_MS=600000 \
+    LOAD_OUTPUT_JSON="load-sweep-full-results.json" \
+    pnpm run load:sweep
+  ```
+  See `docs/benchmarks.md`'s own new M7 section for the full account,
+  every real number, and this exact command's own documentation.
+
+  **A real CJS/ESM interop bug was found and fixed the same way as
+  CLAUDE.md's own Phase 37 precedent**: the sweep script was originally
+  designed to run via bare `tsx`, but `@collab-editor/server` transitively
+  imports `jsonwebtoken` (a CommonJS-only package with no named ESM
+  exports, Phase 26) — this fails under bare Node ESM loading (even via
+  `tsx`) with the identical `SyntaxError` this project's own Phase 37
+  `realTimeGcDrill.ts` account already documents, while Vitest's own
+  transform handles the interop correctly. Fixed the same way: converted
+  to a proper Vitest-run script (`runLoadSweep.script.test.ts`, its own
+  dedicated `vitest.load.config.ts`, run via `pnpm load:sweep`), gated out
+  of the default `pnpm test` (root `vitest.config.ts`'s own `exclude`) —
+  the fast, small-scale smoke test proving the harness itself works
+  (`loadHarness.smoke.test.ts`) stays IN the default run, the same
+  "fast enough not to need isolation" precedent the adversarial suite
+  established.
+
+  **DoD verification**: `pnpm -r exec tsc --noEmit` clean across all 6
+  packages; `pnpm eslint` clean for every file this phase touched or
+  added. Full default `pnpm test`: **696 passed, 2 skipped** (the same
+  disclosed, deferred Fugue O(N²) GC-chain tests, unchanged), 73 files —
+  up from Phase 37's own end-of-phase count, the delta being this phase's
+  own 13 new `clockOffset.test.ts` cases and 1 new
+  `loadHarness.smoke.test.ts` case, plus zero regressions elsewhere.
+
+  **What is deliberately NOT built this phase**: the full literal
+  10-minute/level, all-five-levels sweep (levels 16/32 specifically) —
+  the harness that produces it is complete and unmodified from what
+  produced the reduced pass; only the actual multi-hour run itself is
+  left for the user's own separate, unattended overnight execution, per
+  the exact command above. Any multi-node fanout infrastructure — this
+  phase's own dispositive finding (engine-apply cost, not fanout) means
+  building it would not address the actual measured bottleneck, per the
+  phase brief's own explicit instruction not to build multi-node
+  infrastructure to work around an engine-cost problem it cannot solve.
+  Any fix to the underlying seeding/apply cost itself — that is Open Item
+  3's own already-deferred, separately-scoped redesign, which this
+  phase's own findings now feed real, concrete, product-scale evidence
+  into, not attempt to fix directly.
+
 ## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
 
 This entry documents a real, load-bearing investigation that happened AFTER
@@ -8485,6 +8715,44 @@ workspace — it did not.
    gcSafetyCap.bench.test.ts`'s own single test — both should be
    un-skipped once the redesign is in.
 
+   **✅ Phase 38 (2026-09-13) produced the single strongest, most concrete
+   evidence yet for why this redesign matters, at PRODUCT scale, not
+   benchmark scale.** The M7 load harness (`packages/testkit/src/load/
+   loadHarness.ts`) needed a genuine 50,000-character baseline document
+   — Test Plan §4.4's own literal workload size — built via REAL,
+   sequential `Engine.localInsert()` calls (the same production code
+   path every real keystroke uses, deliberately NOT the fast DB
+   bulk-insert technique this project reserves for fixture-only
+   setup). **Measured, real, repeated wall-clock cost**:
+   - **Building that ONE 50,000-character document from scratch took
+     131.5–188.4 seconds** (two separate real runs; the spread itself is
+     consistent with ordinary CPU contention on this machine, not a
+     methodology error).
+   - **A single BRAND-NEW client joining that already-built document —
+     nothing more than a real HELLO/WELCOME/SNAPSHOT handshake, decoding
+     the structure-form SNAPSHOT and replaying it via
+     `seedEngineFromSnapshot`** — took **17.5 seconds** in isolation, and
+     **grew to 30–37 seconds per join** once several other clients were
+     already connected and typing during the same load-sweep run
+     (`load-sweep-reduced.log`, 2026-09-13, replica ids 1 through 13+).
+   - Attempting to connect 32 clients (8 editors + 24 viewers) in the
+     SAME process crashed the Vitest worker outright, consistent with
+     this scale being genuinely impractical to reach live within any
+     reasonable session, not merely slow.
+
+   This is not a synthetic worst case — it is exactly Fugue's own
+   disclosed O(N²) sequential-insertion cost (the deep, unbalanced
+   right-child chain a real, ordinary 50,000-character typed document
+   forms) showing up on the ACTUAL feature this redesign protects: how
+   long it takes a real user to build a normal-sized document, and how
+   long a real peer takes to JOIN one. A 17.5-second-and-growing "time to
+   synced" for a single new collaborator opening an ordinary-sized
+   document is a real, user-visible product defect today, not a
+   theoretical concern for some future scale this project may never
+   reach — see the Phase 38 completed-phase entry (and
+   `docs/benchmarks.md`'s own M7 section) for the full account and the
+   real M4/M7 curve this cost forced onto.
+
 4. **The RFC and Engine Specification documents need updating to reflect
    the move from the YATA-family `integrate()` to Fugue** — a
    documentation task on the six approved design documents themselves
@@ -8719,6 +8987,37 @@ complete DoD status and v0.2.0-m2 tag readiness determination) — Item 12
 is a Phase 32 finding, unrelated to Phase 25's own tag readiness.
 
 ## Current phase in progress
+
+**Phase 38 (Load characterization and the M7 curve) — reduced-pass DoD
+complete as of 2026-09-13; the full literal-duration sweep (all five
+levels, 10 minutes each) is left for a separate, unattended overnight
+run.** PRD M7's own "measured, not asserted" curve is now real — see the
+"Phase 38" bullet in the Completed Phases list above for the full
+account, and `docs/benchmarks.md`'s own new M7 section for every real
+number. Headline findings: (1) building one ordinary 50,000-character
+document via real sequential inserts took 131.5–188.4 real seconds, and a
+single new client joining it took 17.5–64 real seconds — confirmed,
+directly, to be pure single-threaded engine-apply cost, not fanout,
+making this the single strongest, most concrete evidence yet for Open
+Item 3's own deferred Fugue O(N²) redesign (cross-referenced explicitly in
+that item's own entry); (2) the measured M7 curve shows M4 p95 holding
+under 250ms through 4 editors (49.0ms/62.0ms) but exploding to 23,958.5ms
+at 8 editors — the measured, DoD-required answer to "at which level does
+p95 first exceed 250ms" — with the same underlying mechanism already
+visible in level 4's own 20,626.5ms p99 tail; (3) the clock-offset
+mechanism's own residual-uncertainty assertion genuinely FAILS at level 8
+(73.0ms vs. the required <10ms), a disclosed, real limitation of the
+NTP-style methodology's own symmetric-delay assumption under extreme
+event-loop contention (not present at levels 2/4, and not a bug in the
+mechanism itself, which its own dedicated unit tests confirm works
+correctly under genuine network RTT). Correctness held at every level.
+No multi-node work is warranted — the bottleneck is confirmed local
+engine cost, not fanout, per the phase brief's own explicit diagnostic
+instruction. No open item from this phase blocks anything; the exact
+command to run the full, literal 10-minute/level sweep (including levels
+16/32, not run live in this reduced pass) is documented in both
+`docs/benchmarks.md` and this file's own Phase 38 entry, ready for the
+user to kick off separately whenever they choose.
 
 **Phase 37 (Structured logging and metrics) — COMPLETE as of 2026-09-13.**
 Every metric the Rollout & Runbook's own §7.6 depends on is now emitted

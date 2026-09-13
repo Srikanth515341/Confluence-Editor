@@ -323,11 +323,27 @@ export interface PingMessage {
   readonly lastAppliedSeq: number;
 }
 
-/** §3.6.11, S→C — the server's reply to PING. */
+/**
+ * §3.6.11, S→C — the server's reply to PING. `clientTimeMs` is `PingMessage.clientTimeMs` echoed
+ * back unchanged (the NTP-style handshake's own `t0`).
+ *
+ * `serverTimeMs` (Phase 38, Test Plan §4.2 PERF-M4) is new as of this phase — `t1`/`t2` of the
+ * literal NTP-style algorithm ("t1 = server receive, t2 = server send") collapsed into ONE
+ * timestamp, read once at the moment this PONG is actually constructed in `gateway.ts`'s
+ * synchronous PING handler. This is a disclosed, deliberate simplification, not an oversight: the
+ * real gap between "received PING" and "wrote PONG to the socket" is this project's own
+ * synchronous control-channel handling plus whatever the CONTROL queue's own (highest-priority)
+ * drain delay happens to be — both effectively zero under ordinary load, and treating them as zero
+ * (t1 = t2) is standard practice for a simplified NTP client where the server's own processing
+ * time is negligible relative to network RTT, which is exactly the assumption this algorithm's own
+ * `offset`/`rtt` formulas already make implicitly. See `packages/testkit/src/load/clockOffset.ts`
+ * for where this is actually consumed.
+ */
 export interface PongMessage {
   readonly kind: "pong";
   readonly clientTimeMs: number;
   readonly serverSeq: number;
+  readonly serverTimeMs: number;
 }
 
 /** C→S, advisory: a client announcing a clean departure. */

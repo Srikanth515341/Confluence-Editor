@@ -34,3 +34,8 @@ blob-report/
 # next to the committed app/index.html, never itself committed.
 packages/client/app/main.js
 packages/client/app/main.js.map
+
+# Phase 38: raw JSON output of packages/testkit/src/load/runLoadSweep.ts —
+# real numbers are transcribed into docs/benchmarks.md, this raw file is
+# regenerated on every `pnpm load:sweep` run, never itself committed.
+packages/testkit/load-sweep-*.json

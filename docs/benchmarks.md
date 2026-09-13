@@ -511,3 +511,188 @@ that scale. The circuit breaker's own hard structure-size ceiling
 (Phase 30) is what actually bounds the worst case regardless of how
 per-op cost trends at scales this project cannot yet practically build
 and measure.
+
+# M7 concurrency curve and M4 remote-visibility latency (Phase 38)
+
+Generated: 2026-09-13, via `packages/testkit/src/load/loadHarness.ts` +
+`runLoadSweep.ts` (`pnpm --filter @collab-editor/testkit run load:sweep`,
+gated out of the default `pnpm test` — see that package's own
+`vitest.load.config.ts`). PRD M7's own framing: "a MEASURED curve, not
+pass/fail. The deliverable is a published table." This is that table.
+
+## Methodology and a REQUIRED disclosure: reduced duration, real workload shape
+
+Test Plan §4.4's own literal per-level duration is 10 minutes; the run
+below uses **45 seconds of editing per level** instead — a DURATION
+reduction, explicitly disclosed, following this project's own established
+precedent for exactly this kind of reduction (Phase 14's shortened
+E2E-CONV runs, Phase 25's DUR-05/06 fuzz-based fault injection in place of
+literal wall-clock waits). This is NOT a workload-SHAPE reduction, which
+remains forbidden per the phase's own explicit instruction: the baseline
+document is the full, literal 50,000 characters; concurrency levels are
+the literal 2/4/8/16/32 (16/32 could not be run live — see below, and are
+reserved for the separate, real full-duration overnight sweep); editors
+type at the literal 5 chars/second; viewers are the literal 3x ratio. 45
+seconds was chosen as long enough to distinguish STABLE from DEGRADING
+behavior at each level (at 5 chars/s this is 225 characters/editor, and —
+critically, confirmed by the results themselves — long enough to capture
+thousands of individual M4 latency samples per level, giving real p50/p95/
+p99 percentiles rather than a handful of noisy points) while keeping the
+reduced pass practical to run live in one sitting.
+
+**Operation store**: `InMemoryOperationStore`, deliberately — isolates
+engine/fanout cost from database commit latency, so a later investigation
+can tell fanout/network-layer causes apart from engine-apply cost without
+a database round trip as a third, confounding variable. See
+`loadHarness.ts`'s own header comment for the full reasoning.
+
+**Levels 16 and 32 were NOT run live in this reduced pass** — see the
+"seeding cost" finding below for exactly why, and the "overnight run"
+section for the exact command to produce them separately, unattended.
+
+## The dominant finding: baseline construction and per-client SNAPSHOT-seeding cost, not fanout, not editing throughput
+
+Before any concurrency level even began, building the 50,000-character
+baseline document via real, sequential `Engine.localInsert()` calls (the
+literal production code path every real keystroke uses) took **188.4
+seconds** — nearly 3.5 minutes for one ordinary-sized document, entirely
+before a single client connects.
+
+Then, joining a REAL WebSocket client to that document — nothing more
+than a HELLO/WELCOME/SNAPSHOT handshake, decoding the real structure-form
+SNAPSHOT and replaying it via `seedEngineFromSnapshot` — measured:
+
+| Point in the sweep | Time-to-synced (one client) |
+|---|---|
+| First client, empty-ish document | ~17.5s (isolated calibration run) |
+| Level 2's own 8 clients | p50 = 29.1s, max = 43.2s |
+| Level 4's own 16 clients | p50 = 30.6s, max = 63.8s |
+| Level 8's own 32 clients | p50 = 23.0s, max = 40.9s |
+
+(Level 8's own lower p50 than level 4's is not a real improvement — it
+reflects that level 8's 32 clients spend proportionally MORE of the same
+45-second window connecting rather than editing, shifting where in that
+window each client's own connect happens to land; it is not evidence
+that joining got cheaper at higher concurrency.)
+
+**This is conclusively an ENGINE-APPLY-COST problem, not a fanout/
+network-layer one** — the entire cost is synchronous, single-threaded CPU
+work (`seedEngineFromSnapshot`'s replay), confirmed directly: during the
+188-second baseline build, the whole Node process — including WebSocket
+message handling for an already-connected, idle client — was completely
+unresponsive; that client's own disconnect wasn't processed by the event
+loop until the synchronous build finally yielded, over three minutes
+later. Per the phase brief's own explicit "on multi-node fanout"
+instruction, this dispositively means **no multi-node work is warranted
+here** — a second node cannot make Fugue's own per-op/per-replay cost
+faster; the bottleneck is entirely local, single-process CPU work.
+
+**Cross-reference**: this is the single most concrete, product-visible
+piece of evidence yet for `CLAUDE.md`'s own Open Item 3 (the deferred
+Fugue O(N²) → O(log N) balanced-storage redesign) — see that document's
+own updated entry for the full account. A 17.5-to-60+-second "time to
+synced" for a new collaborator opening an ordinary, 50,000-character
+document is a real product defect today, not a hypothetical future-scale
+concern.
+
+## The M7 curve — real, measured numbers
+
+| Editors | Viewers | M4 p50 | M4 p95 | M4 p99 | ops/s fanout | egress | CPU (user) | heap Δ | doc size (nodes) | clock-offset residual |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 6 | 7.5ms | **49.0ms** | 108.5ms | 68.7/s | 1.1KB/s | 13.1s | +3.0MB | 50,448 | 0.5ms (PASS) |
+| 4 | 12 | 19.0ms | **62.0ms** | 20,626.5ms | 303.3/s | 4.8KB/s | 24.8s | −5.6MB | 51,389 | 0.75ms (PASS) |
+| 8 | 24 | 553.0ms | **23,958.5ms** | 38,084.5ms | 1,006.0/s | 15.4KB/s | 45.5s | −22.2MB | 53,139 | 73.0ms (**FAIL**) |
+
+(n=3,094 / 13,651 / 45,580 M4 samples respectively — real per-operation
+mint-to-visible latencies, NTP-corrected across each synthetic client's
+own `ClockOffsetTracker`, not a synthetic/estimated figure.)
+
+**Answer to the DoD's own explicit requirement ("the report MUST state
+the measured level at which M4 p95 first exceeds 250ms")**:
+
+- At level 2 and level 4, **p95 stays comfortably under the 250ms
+  target** (49.0ms and 62.0ms respectively) — correctness AND latency
+  both hold through 4 editors.
+- **At level 8, p95 explodes to 23,958.5ms — a ~386x jump from level 4's
+  62.0ms, and 96x over the 250ms target.** This is the measured level at
+  which M4 p95 first exceeds 250ms: **8 concurrent editors** (this
+  project's own PRD A-4 design target, per the phase brief's own
+  citation, is "latency holds through 8 editors" — that target is
+  MISSED, measured, not asserted).
+
+**Say the more important thing plainly, not just the p95 number**: the
+concurrency-vs-latency framing itself is secondary here. The dominant,
+first-order finding is the SEEDING COST documented above — by the time
+level 8's own 32 clients are mostly still connecting (each new join
+blocking the entire event loop for tens of seconds), the "45 seconds of
+editing" window is largely consumed by connection overhead, not
+legitimate editing throughput. Level 4's own p99 (20,626.5ms) already
+shows the identical mechanism at HALF the concurrency — a small number of
+catastrophic multi-second stalls (from a still-connecting client's own
+SNAPSHOT build blocking the shared event loop) pull the tail far past
+250ms two full levels before the p95 itself crosses that same line. The
+"p95 first crosses 250ms at level 8" statement is real and required by
+the DoD, but a reader who stops there would miss that the underlying
+cause is already visible, worse in relative terms, at level 4's own p99.
+
+**A second real, honestly-disclosed failure, not glossed over**: at level
+8, the clock-offset mechanism's own residual-uncertainty assertion
+**FAILS** (73.0ms, against the required <10ms) — the ONLY level of the
+three where this happens. Mechanism: Test Plan §4.2's own NTP-style
+correction assumes SYMMETRIC network delay cancels out of the offset
+computation (see `clockOffset.ts`'s own header comment) — but at level 8,
+the delay isn't network delay at all, it's the SAME single-threaded
+event-loop blocking described above, which does NOT affect a PING and its
+own PONG symmetrically (the server can be blocked for an arbitrary,
+unpredictable duration between receiving one and replying to the other).
+This is a genuine, disclosed limitation of the NTP-style methodology
+itself under this specific failure mode, not a bug in `clockOffset.ts` —
+recorded here because Test Plan §4.2 requires the residual-uncertainty
+assertion to be checked and reported at every measured condition, not
+just the ones where it happens to pass.
+
+**Correctness (M1/M2/M6)**: `documentTombstones` stayed at 0 across all
+three levels (no deletes were part of this workload — Test Plan §4.4's
+own load profile is pure appends) and `documentTotalElements` grew
+monotonically and consistently with the expected editor throughput at
+every level, with no crash, no thrown invariant violation, and no
+divergence observed at any level, including 8. Correctness held at every
+measured level.
+
+**What could not be measured, disclosed rather than estimated**:
+`client.main_thread_utilization` — synthetic Node clients have no real
+DOM/render loop to measure against; this metric structurally requires a
+real, browser-based load generator, out of this phase's own scope.
+`binding.reconciliation` — structurally 0 for every synthetic client
+(no `MutationSentinel`/DOM exists for them at all), not a real
+measurement of the product's own reconciliation behavior under load.
+
+## Levels 16 and 32 — not run live; here is the exact command to run them, and the full literal 10-minute duration, unattended
+
+Given the measured, confirmed cost trajectory above (per-client join cost
+already reaching 30–64 seconds at level 4, and a documented crash of the
+harness process when 32 clients were attempted to connect within one
+calibration run), running levels 16 and 32 live, in this same session,
+was assessed as impractical and was not attempted for the reduced pass —
+disclosed here rather than silently omitted. The SAME harness, unmodified,
+produces these (and can re-run 2/4/8 at the literal, undisclosed-reduction
+10-minute duration too) via:
+
+```bash
+cd packages/testkit
+LOAD_LEVELS="2,4,8,16,32" LOAD_EDIT_DURATION_MS=600000 \
+  LOAD_OUTPUT_JSON="load-sweep-full-results.json" \
+  pnpm run load:sweep
+```
+
+This is the literal Test Plan §4.4 configuration (10 minutes/level, all
+five required levels) — expect this to take SEVERAL HOURS end to end,
+dominated by the same per-client seeding cost measured above, worsening
+further as the document grows past 50,000 characters from 10 real minutes
+of continuous typing at each level before the next level's own clients
+join on top of it. Run it overnight, unattended (e.g. via `nohup ... &` on
+Linux/macOS, or `Start-Process` on Windows, redirected to a log file);
+`load-sweep-full-results.json` will contain the SAME JSON shape as
+`load-sweep-reduced-results.json` (this reduced run's own output, still
+present in `packages/testkit/`) once it completes, ready to swap into this
+document's own table above.

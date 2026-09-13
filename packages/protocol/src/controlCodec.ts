@@ -301,12 +301,14 @@ function decodePingPayload(reader: ByteReader): PingMessage {
 function encodePongPayload(writer: ByteWriter, msg: PongMessage): void {
   writeVarint(writer, msg.clientTimeMs);
   writeVarint(writer, msg.serverSeq);
+  writeVarint(writer, msg.serverTimeMs);
 }
 
 function decodePongPayload(reader: ByteReader): PongMessage {
   const clientTimeMs = readVarint(reader);
   const serverSeq = readVarint(reader);
-  return { kind: "pong", clientTimeMs, serverSeq };
+  const serverTimeMs = readVarint(reader);
+  return { kind: "pong", clientTimeMs, serverSeq, serverTimeMs };
 }
 
 function encodeLeavePayload(writer: ByteWriter, msg: LeaveMessage): void {
