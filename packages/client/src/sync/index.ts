@@ -19,6 +19,7 @@ export {
   type HeadlessPair,
 } from "./headlessHarness.js";
 export { seedEngineFromSnapshot } from "@collab-editor/protocol";
+export type { UndoOutcome } from "@collab-editor/engine";
 export {
   PING_INTERVAL_MS,
   SyncClient,

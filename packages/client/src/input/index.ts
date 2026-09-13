@@ -17,3 +17,8 @@ export {
   wordBefore,
   type TextSpan,
 } from "./graphemeSegmentation.js";
+export {
+  attachUndoRedoKeydownFallback,
+  UndoRedoController,
+  type UndoRedoControllerDeps,
+} from "./undoRedoController.js";

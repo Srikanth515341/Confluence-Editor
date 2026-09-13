@@ -34,6 +34,7 @@ import {
   type CompositionControllerDeps,
 } from "./compositionController.js";
 import { attachInputPipeline } from "./inputPipeline.js";
+import { UndoRedoController } from "./undoRedoController.js";
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -75,11 +76,12 @@ function makeHarness(initialText = "", watchdogMs?: number): Harness {
     sync.localInsertText(0, initialText);
   }
   sentinel.applyPatches(() => domWriter.mount(root, initialText));
-  const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });
+  const undoRedo = new UndoRedoController({ sync });
+  const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo });
   const deps: CompositionControllerDeps =
     watchdogMs === undefined
-      ? { domWriter, sync, sentinel, root }
-      : { domWriter, sync, sentinel, root, watchdogMs };
+      ? { domWriter, sync, sentinel, root, undoRedo }
+      : { domWriter, sync, sentinel, root, undoRedo, watchdogMs };
   const composition = new CompositionController(deps);
   const detachComposition = attachCompositionHandlers(root, composition);
   const detach = (): void => {
@@ -176,8 +178,9 @@ async function makeConnectedHarness(): Promise<Harness & { readonly ws: FakeWebS
     getEngineText: () => sync.engine?.text(),
   });
   sentinel.start();
-  const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });
-  const composition = new CompositionController({ domWriter, sync, sentinel, root });
+  const undoRedo = new UndoRedoController({ sync });
+  const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo });
+  const composition = new CompositionController({ domWriter, sync, sentinel, root, undoRedo });
   const detachComposition = attachCompositionHandlers(root, composition);
 
   sync.connect();
@@ -488,7 +491,8 @@ describe("CompositionController — defensive/no-op paths", () => {
       domWriter,
       getEngineText: () => sync.engine?.text(),
     });
-    const composition = new CompositionController({ domWriter, sync, sentinel, root });
+    const undoRedo = new UndoRedoController({ sync });
+    const composition = new CompositionController({ domWriter, sync, sentinel, root, undoRedo });
     attachCompositionHandlers(root, composition);
     root.dispatchEvent(new CompositionEvent("compositionstart"));
     expect(composition.isComposing).toBe(false);

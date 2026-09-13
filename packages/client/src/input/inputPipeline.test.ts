@@ -18,6 +18,7 @@ import { DomWriter, visToDom } from "../binding/index.js";
 import { MutationSentinel } from "../sentinel/index.js";
 import { SyncClient } from "../sync/syncClient.js";
 import { attachInputPipeline } from "./inputPipeline.js";
+import { UndoRedoController } from "./undoRedoController.js";
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -28,6 +29,7 @@ interface Harness {
   readonly domWriter: DomWriter;
   readonly sync: SyncClient;
   readonly sentinel: MutationSentinel;
+  readonly undoRedo: UndoRedoController;
   readonly detach: () => void;
 }
 
@@ -48,8 +50,9 @@ function makeHarness(initialText = ""): Harness {
     sync.localInsertText(0, initialText);
   }
   sentinel.applyPatches(() => domWriter.mount(root, initialText));
-  const detach = attachInputPipeline(root, { domWriter, sync, sentinel });
-  return { root, domWriter, sync, sentinel, detach };
+  const undoRedo = new UndoRedoController({ sync });
+  const detach = attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo });
+  return { root, domWriter, sync, sentinel, undoRedo, detach };
 }
 
 /** Places a collapsed caret at visible (scalar) index `v`. */
@@ -161,7 +164,7 @@ describe("inputPipeline — every beforeinput is preventDefaulted, without excep
       domWriter,
       getEngineText: () => sync.engine?.text(),
     });
-    attachInputPipeline(root, { domWriter, sync, sentinel });
+    attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo: new UndoRedoController({ sync }) });
     const event = new InputEvent("beforeinput", {
       inputType: "insertText",
       data: "x",
@@ -351,14 +354,38 @@ describe("inputPipeline — composition and history stubs (API Spec §7.4.2)", (
     h.detach();
   });
 
-  it("historyUndo / historyRedo are stubbed — preventDefault only, no engine call", () => {
-    const h = makeHarness("ab");
+  it("historyUndo / historyRedo (Phase 36, Engine Spec §9): preventDefaulted AND dispatched to Engine.undo()/redo() via the shared microtask guard", async () => {
+    const h = makeHarness("a"); // mounted with one real local op already, so there's something to undo
     setCaret(h, 1);
+
     const undoEvent = fireBeforeInput(h, "historyUndo");
-    const redoEvent = fireBeforeInput(h, "historyRedo");
     expect(undoEvent.defaultPrevented).toBe(true);
+    expect(h.sync.engine!.text()).toBe("a"); // not yet -- deferred to a microtask (UWIRE-02)
+    await Promise.resolve();
+    expect(h.sync.engine!.text()).toBe(""); // the insert is undone
+
+    const redoEvent = fireBeforeInput(h, "historyRedo");
     expect(redoEvent.defaultPrevented).toBe(true);
-    expect(h.sync.engine!.text()).toBe("ab");
+    await Promise.resolve();
+    expect(h.sync.engine!.text()).toBe("a"); // redone
+
+    h.detach();
+  });
+
+  it("UWIRE-02: a beforeinput(historyUndo) AND a keydown(Ctrl+Z) for the SAME keystroke perform EXACTLY ONE undo", async () => {
+    const h = makeHarness("a");
+    setCaret(h, 1);
+    const undoSpy = vi.spyOn(h.sync, "undo");
+
+    // Simulates a browser that fires BOTH event sources for one physical Ctrl+Z — the shared
+    // UndoRedoController guard (attached to the SAME root as attachInputPipeline in the real
+    // EditorView wiring) must collapse them into exactly one undo.
+    fireBeforeInput(h, "historyUndo");
+    h.undoRedo.scheduleUndo(); // stands in for the keydown fallback's own trigger, same guard instance
+    await Promise.resolve();
+
+    expect(undoSpy).toHaveBeenCalledTimes(1);
+    expect(h.sync.engine!.text()).toBe("");
     h.detach();
   });
 });

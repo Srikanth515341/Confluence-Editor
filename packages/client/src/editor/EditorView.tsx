@@ -61,7 +61,9 @@ import { DomWriter } from "../binding/index.js";
 import {
   attachCompositionHandlers,
   attachInputPipeline,
+  attachUndoRedoKeydownFallback,
   CompositionController,
+  UndoRedoController,
 } from "../input/index.js";
 import { PresenceOverlay } from "../presence/index.js";
 import { MutationSentinel } from "../sentinel/index.js";
@@ -137,7 +139,8 @@ export function EditorView({
       }
     });
 
-    const composition = new CompositionController({ domWriter, sync, sentinel, root });
+    const undoRedo = new UndoRedoController({ sync });
+    const composition = new CompositionController({ domWriter, sync, sentinel, root, undoRedo });
 
     const unsubscribeRemoteOps = sync.onRemoteOpsApplied(() => {
       const engine = sync.engine;
@@ -161,8 +164,9 @@ export function EditorView({
       }
     });
 
-    const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel });
+    const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo });
     const detachComposition = attachCompositionHandlers(root, composition);
+    const detachUndoRedoKeydown = attachUndoRedoKeydownFallback(root, undoRedo);
 
     return () => {
       unsubscribe();
@@ -170,6 +174,7 @@ export function EditorView({
       unsubscribePresence();
       detachInput();
       detachComposition();
+      detachUndoRedoKeydown();
       composition.dispose();
       sentinel.stop();
       presenceOverlay.stop();

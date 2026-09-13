@@ -40,6 +40,7 @@ import { openDurableQueue } from "../sync/durableQueue.js";
 import { SyncClient, type WebSocketLike } from "../sync/syncClient.js";
 import { attachInputPipeline } from "./inputPipeline.js";
 import { attachCompositionHandlers, CompositionController } from "./compositionController.js";
+import { UndoRedoController } from "./undoRedoController.js";
 
 class FakeWebSocket implements WebSocketLike {
   binaryType = "arraybuffer";
@@ -168,8 +169,9 @@ describe("CompositionController + SyncClient durable queue — IME-06: compositi
     });
     sentinel.start();
     sentinel.applyPatches(() => domWriter.mount(root, ""));
-    attachInputPipeline(root, { domWriter, sync, sentinel });
-    const composition = new CompositionController({ domWriter, sync, sentinel, root });
+    const undoRedo = new UndoRedoController({ sync });
+    attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo });
+    const composition = new CompositionController({ domWriter, sync, sentinel, root, undoRedo });
     attachCompositionHandlers(root, composition);
 
     // Sever the connection — Phase 22's relaxed `requireEngine()` means minting (including a
