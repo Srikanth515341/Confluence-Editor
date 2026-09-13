@@ -85,12 +85,18 @@ export interface EditorViewProps {
    * since the caller (`App.tsx`) always reads through the ref rather than closing over a value.
    */
   readonly onSentinelReady?: (sentinel: MutationSentinel | null) => void;
+  /** Phase 37 (Runbook "Client (RUM beacon)": local-echo p50/p95/p99) — forwarded straight to `attachInputPipeline`'s own `InputPipelineDeps.onLocalEcho`. */
+  readonly onLocalEcho?: (ms: number) => void;
+  /** Phase 37 (Runbook "Client (RUM beacon)": `binding.composition_watchdog_fired`) — forwarded straight to `CompositionController`'s own `onWatchdogFired`. */
+  readonly onCompositionWatchdogFired?: () => void;
 }
 
 export function EditorView({
   sync,
   className,
   onSentinelReady,
+  onLocalEcho,
+  onCompositionWatchdogFired,
 }: EditorViewProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
@@ -140,7 +146,14 @@ export function EditorView({
     });
 
     const undoRedo = new UndoRedoController({ sync });
-    const composition = new CompositionController({ domWriter, sync, sentinel, root, undoRedo });
+    const composition = new CompositionController({
+      domWriter,
+      sync,
+      sentinel,
+      root,
+      undoRedo,
+      ...(onCompositionWatchdogFired ? { onWatchdogFired: onCompositionWatchdogFired } : {}),
+    });
 
     const unsubscribeRemoteOps = sync.onRemoteOpsApplied(() => {
       const engine = sync.engine;
@@ -164,7 +177,13 @@ export function EditorView({
       }
     });
 
-    const detachInput = attachInputPipeline(root, { domWriter, sync, sentinel, undoRedo });
+    const detachInput = attachInputPipeline(root, {
+      domWriter,
+      sync,
+      sentinel,
+      undoRedo,
+      ...(onLocalEcho ? { onLocalEcho } : {}),
+    });
     const detachComposition = attachCompositionHandlers(root, composition);
     const detachUndoRedoKeydown = attachUndoRedoKeydownFallback(root, undoRedo);
 
@@ -182,7 +201,7 @@ export function EditorView({
       mountedEngineRef.current = null;
       onSentinelReady?.(null);
     };
-  }, [sync, onSentinelReady]);
+  }, [sync, onSentinelReady, onLocalEcho, onCompositionWatchdogFired]);
 
   return (
     // The wrapper exists ONLY to give the overlay a `position: relative` positioning ancestor

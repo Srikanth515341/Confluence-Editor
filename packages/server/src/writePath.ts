@@ -85,6 +85,7 @@ import type {
 } from "./documentCoordinator.js";
 import { toOperations } from "./ingest.js";
 import { logger } from "./logger.js";
+import { metrics } from "./metrics.js";
 import { maybeScheduleSnapshot } from "./snapshotter.js";
 import { maybeCrash } from "./testOnlyCrashInjection.js";
 
@@ -134,6 +135,17 @@ export function sendOpReject(
   reason: RejectReason,
   detail: string,
 ): void {
+  // Runbook "Authz" metric group — ONE shared choke point for every rejection this module (and
+  // offlineWindowScheduler.ts, which calls this same exported function) ever sends, regardless
+  // of which of the five reasons fired. `identity_mismatch_count`/`offline_window_exceeded_count`
+  // are the two reasons the Runbook names specifically; every other reason still counts toward
+  // the general `op_rejected_count` total.
+  metrics.counter("authz.op_rejected_count").inc(ops.length);
+  if (reason === RejectReason.IDENTITY_MISMATCH) {
+    metrics.counter("authz.identity_mismatch_count").inc(ops.length);
+  } else if (reason === RejectReason.OFFLINE_WINDOW_EXCEEDED) {
+    metrics.counter("reconcile.offline_window_exceeded_count").inc(ops.length);
+  }
   const rejects: RejectEntry[] = ops.map((op) => ({ rejectedId: op.id, reason }));
   session.queues.enqueue("ops", encodeFrame({ kind: "opReject", rejects, detail }));
 }
@@ -150,6 +162,10 @@ export async function processIncomingOperation(
   hooks: WritePathTestHooks = {},
 ): Promise<void> {
   const { coordinator, session, msg } = deps;
+  // Runbook "Latency" metric group — `op.server_apply_p95`/`op.remote_visibility_p50/95/99`
+  // both measure elapsed time FROM this exact instant (the earliest point this function can
+  // observe — "frame receipt," the same reference point DUR-03 site (a) above already uses).
+  const receivedAtMs = Date.now();
 
   if (msg.kind === "opAck" || msg.kind === "opReject") {
     // Unreachable in practice: decodeFrame({ direction: "clientOrigin" }) already rejects both
@@ -314,6 +330,7 @@ export async function processIncomingOperation(
   // DUR-03 site (c) "after applyRemote, before sequence assignment": no seq has been assigned
   // yet in either path at this point.
   maybeCrash("afterApplyRemote");
+  metrics.histogram("op.server_apply").record(Date.now() - receivedAtMs);
 
   const stillPendingIds = new Set(coordinator.engine.pending.map((p) => serializeId(p.id)));
   const sideEffectResolved: Operation[] = [];
@@ -326,11 +343,11 @@ export async function processIncomingOperation(
   const allThisMessageReady = applyResults.every((r) => !r.buffered);
 
   if (allThisMessageReady && sideEffectResolved.length === 0) {
-    await runFastPath({ coordinator, session, msg, ops }, hooks);
+    await runFastPath({ coordinator, session, msg, ops, receivedAtMs }, hooks);
     return;
   }
 
-  await runSlowPath({ coordinator, session, applyResults, sideEffectResolved });
+  await runSlowPath({ coordinator, session, applyResults, sideEffectResolved, receivedAtMs });
 }
 
 /**
@@ -344,10 +361,11 @@ async function runFastPath(
     session: CoordinatorSession;
     msg: ClientOpsMessage;
     ops: readonly Operation[];
+    receivedAtMs: number;
   },
   hooks: WritePathTestHooks,
 ): Promise<void> {
-  const { coordinator, session, msg, ops } = deps;
+  const { coordinator, session, msg, ops, receivedAtMs } = deps;
 
   // Step 5/6, reordered relative to their numbering but not their EFFECT: `startSeq` is
   // computed (not yet committed to `coordinator.currentSeq`) here, and each operation's seq is
@@ -386,6 +404,11 @@ async function runFastPath(
   // needing an explicit per-document lock.
   const relay: ClientOpsMessage = { ...msg, seq: Number(startSeq) };
   const relayBytes = encodeFrame(relay);
+  // `op.remote_visibility_p50/95/99` (Runbook "Latency" group) — the furthest this SERVER can
+  // observe toward "a peer sees this edit": the instant the broadcast is handed to every other
+  // session's own send queue. A real round trip to a peer actually rendering it is not something
+  // the server can measure at all (that's `binding.reconciliation`-adjacent RUM territory).
+  metrics.histogram("op.remote_visibility").record(Date.now() - receivedAtMs);
   for (const other of coordinator.otherSessions(session.sessionId)) {
     other.queues.enqueue("ops", relayBytes);
   }
@@ -417,6 +440,7 @@ async function runFastPath(
   // the same document. See DocumentCoordinator.enqueueCommit's own doc comment for the full
   // hand-traced reasoning (two-author interleaving producing a permanently-skipped CATCHUP
   // row) this exists to close.
+  const commitEnqueuedAtMs = Date.now();
   const commitPromise = coordinator.enqueueCommit(coordinator.currentSeq, () =>
     coordinator.operationStore.commitOperations({
       documentId: coordinator.documentId,
@@ -429,8 +453,12 @@ async function runFastPath(
     }),
   );
   try {
-    // Resolves only once the transaction has actually committed.
+    // Resolves only once the transaction has actually committed. `op.commit_latency_p95`
+    // (Runbook "Latency" group) includes any per-document queueing wait (`enqueueCommit`'s own
+    // strict FIFO, Phase 25) as well as the real DB round trip — both are genuinely part of
+    // "how long did this client wait for durability" from the caller's own perspective.
     await commitPromise;
+    metrics.histogram("op.commit_latency").record(Date.now() - commitEnqueuedAtMs);
   } catch (err) {
     logger.error("writePath.commitFailed", {
       documentId: coordinator.documentId,
@@ -493,6 +521,15 @@ interface FinalizeItem {
   readonly op: Operation;
   readonly origin: PendingOpOrigin;
   seq: bigint;
+  /**
+   * When this item belongs to THIS message (`applyResults`, not `sideEffectResolved`), the
+   * receipt timestamp `op.remote_visibility`/`op.commit_latency` should measure from. A
+   * side-effect-resolved item belongs to some OTHER, earlier message whose own receipt time
+   * isn't tracked here — `undefined` for those, and both metrics are simply skipped for them
+   * rather than recording a misleading number (its TRUE latency is longer than anything
+   * measurable from this call, since it already sat in `engine.pending` for a while).
+   */
+  readonly receivedAtMs: number | undefined;
 }
 
 /**
@@ -507,8 +544,9 @@ async function runSlowPath(deps: {
   session: CoordinatorSession;
   applyResults: ReadonlyArray<{ op: Operation; buffered: boolean }>;
   sideEffectResolved: readonly Operation[];
+  receivedAtMs: number;
 }): Promise<void> {
-  const { coordinator, session, applyResults, sideEffectResolved } = deps;
+  const { coordinator, session, applyResults, sideEffectResolved, receivedAtMs } = deps;
 
   const toFinalize: Array<Omit<FinalizeItem, "seq">> = [];
   const thisMessageOrigin: PendingOpOrigin = {
@@ -519,7 +557,7 @@ async function runSlowPath(deps: {
   };
   for (const { op, buffered } of applyResults) {
     if (!buffered) {
-      toFinalize.push({ op, origin: thisMessageOrigin });
+      toFinalize.push({ op, origin: thisMessageOrigin, receivedAtMs });
     }
   }
   for (const op of sideEffectResolved) {
@@ -538,7 +576,10 @@ async function runSlowPath(deps: {
       });
       continue;
     }
-    toFinalize.push({ op, origin });
+    // A side-effect-resolved item belongs to a DIFFERENT, earlier message — this item's own
+    // FinalizeItem.receivedAtMs doc comment explains why that item's latency is deliberately
+    // left unmeasured here rather than mismeasured against this message's own receipt time.
+    toFinalize.push({ op, origin, receivedAtMs: undefined });
   }
 
   if (toFinalize.length === 0) {
@@ -566,6 +607,9 @@ async function runSlowPath(deps: {
   // compact run/batch wire shape left to relay (protocol/src/catchupOps.ts already established
   // this exact single-operation frame shape for CATCHUP_CHUNK; reused here).
   for (const item of finalized) {
+    if (item.receivedAtMs !== undefined) {
+      metrics.histogram("op.remote_visibility").record(Date.now() - item.receivedAtMs);
+    }
     const bytes = encodeFrame(toWireMessage(item.op, Number(item.seq)));
     for (const other of coordinator.otherSessions(item.origin.sessionId)) {
       other.queues.enqueue("ops", bytes);
@@ -583,6 +627,7 @@ async function runSlowPath(deps: {
   // existing "ack only after ITS OWN commit resolves" guarantee — it does not reintroduce the
   // ordering risk, since the actual DB writes are already pinned to the right order by the time
   // any of these awaits even begin.
+  const commitEnqueuedAtMs = Date.now();
   const commitPromises = finalized.map((item) =>
     coordinator.enqueueCommit(item.seq, () =>
       coordinator.operationStore.commitOperations({
@@ -601,6 +646,7 @@ async function runSlowPath(deps: {
     const item = finalized[i]!;
     try {
       await commitPromises[i];
+      metrics.histogram("op.commit_latency").record(Date.now() - commitEnqueuedAtMs);
     } catch (err) {
       logger.error("writePath.commitFailed", {
         documentId: coordinator.documentId,

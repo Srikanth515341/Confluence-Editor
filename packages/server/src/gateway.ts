@@ -33,6 +33,7 @@ import {
   decideSyncMode,
 } from "./handshake.js";
 import { logger } from "./logger.js";
+import { metrics } from "./metrics.js";
 import { InMemoryRateLimiter } from "./rateLimiter.js";
 import { ConnectionSendQueues } from "./sendQueues.js";
 import type { InMemoryTicketStore } from "./ticketStore.js";
@@ -168,14 +169,44 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
   // `ip:<addr>`/`account:<userId>` so the two scopes never collide in the same map.
   const connectionLimiter = new InMemoryRateLimiter();
 
+  // Phase 37 (Runbook "Connections" metric group) — plain, per-gateway bookkeeping backing the
+  // three RATE metrics below (ws.abnormal_disconnect_rate/ws.upgrade_rejection_rate, and
+  // reconcile.failure_rate further down). These are NOT metrics themselves — only the gauges
+  // they're recomputed into are — kept as plain counters here rather than as extra registry
+  // entries, since the phase's own instruction is to build EXACTLY the named metric list, no more.
+  let totalUpgradeAttempts = 0;
+  let rejectedUpgradeAttempts = 0;
+  let gracefulDisconnectCount = 0;
+  let abnormalDisconnectCount = 0;
+  let totalHandshakeAttempts = 0;
+  let failedHandshakeAttempts = 0;
+
   const wss = new WebSocketServer({
     server: httpServer,
     path: WS_PATH,
-    handleProtocols: (protocols) => (protocols.has(WS_SUBPROTOCOL) ? WS_SUBPROTOCOL : false),
+    handleProtocols: (protocols) => {
+      totalUpgradeAttempts += 1;
+      const accepted = protocols.has(WS_SUBPROTOCOL);
+      if (!accepted) {
+        rejectedUpgradeAttempts += 1;
+      }
+      metrics.gauge("ws.upgrade_rejection_rate").set(rejectedUpgradeAttempts / totalUpgradeAttempts);
+      return accepted ? WS_SUBPROTOCOL : false;
+    },
   });
 
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const sessionId = randomUUID();
+    // Runbook "Connections" metric group.
+    metrics.gauge("ws.active_connections").inc();
+    metrics.counter("ws.connection_churn").inc();
+    // Set true the instant a CLEAN departure is known — an explicit client LEAVE, or a
+    // server-initiated GOODBYE (revocation/rate-limit eviction) — so ws.on("close") below can
+    // tell "the socket just died" (ws.abnormal_disconnect_rate) apart from an ordinary,
+    // accounted-for departure. See this project's own Phase 37 context: "track this distinctly
+    // from graceful closes; both are already observable in gateway.ts's close handler, just
+    // need to be counted separately."
+    let gracefulClose = false;
     // No trusted-proxy handling (`X-Forwarded-For`) — this project has no reverse-proxy
     // deployment story yet, so the raw socket's own remote address is the only value that
     // can't be spoofed by whoever is actually opening the TCP connection.
@@ -259,6 +290,35 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
      * under it.
      */
     async function handleHandshake(bytes: Uint8Array): Promise<void> {
+      // Runbook "Reconnection" metric group — measured over the WHOLE handshake (every sync
+      // mode: SNAPSHOT/CATCHUP/ALREADY_CURRENT), not CATCHUP alone, since "how long does a
+      // client wait to be admitted" is the property this exists to watch. `succeeded` is flipped
+      // true only once every step below (ticket/role lookup, warm start, WELCOME/state-sync/
+      // ALREADY_HAVE) has actually completed — every one of this function's several early
+      // `return`s (a decode error, an invalid ticket, a failed warm start, a revoked-in-the-gap
+      // session) therefore falls through to the `finally` below still `false`, which is exactly
+      // what reconcile.failure_rate is meant to count, with no need to annotate every individual
+      // failure branch by hand.
+      const handshakeStartedAtMs = Date.now();
+      totalHandshakeAttempts += 1;
+      let succeeded = false;
+      try {
+        await handleHandshakeInner(bytes);
+        succeeded = true;
+      } finally {
+        if (!succeeded) {
+          failedHandshakeAttempts += 1;
+        }
+        metrics
+          .gauge("reconcile.failure_rate")
+          .set(failedHandshakeAttempts / totalHandshakeAttempts);
+        if (succeeded) {
+          metrics.histogram("reconcile.duration").record(Date.now() - handshakeStartedAtMs);
+        }
+      }
+    }
+
+    async function handleHandshakeInner(bytes: Uint8Array): Promise<void> {
       if (peekChannel(bytes) !== Channel.CONTROL) {
         closeMalformed("first frame must be HELLO on the CONTROL channel");
         return;
@@ -403,6 +463,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         // — this raw close code is only ever a secondary, transport-level hint.
         disconnectForRevocation: () => {
           if (ws.readyState !== ws.OPEN) return;
+          gracefulClose = true; // server-initiated GOODBYE — an accounted-for departure, not "the socket just died."
           const frame = encodeControlFrame({
             kind: "goodbye",
             reason: GoodbyeReason.PERMISSION_REVOKED,
@@ -428,6 +489,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         // itself without a NEW grant.
         disconnectForRateLimit: () => {
           if (ws.readyState !== ws.OPEN) return;
+          gracefulClose = true; // server-initiated GOODBYE — an accounted-for departure, not "the socket just died."
           const frame = encodeControlFrame({
             kind: "goodbye",
             reason: GoodbyeReason.EVICTED,
@@ -498,6 +560,10 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           coordinator,
           ctrlMsg.lastServerSeq,
         );
+        // Runbook "Reconnection" metric group (reconcile.catchup_ops_p95 — the histogram is
+        // named without the percentile suffix; snapshot() derives _p50/_p95/_p99/_count from it,
+        // the same convention already used for gc.cycle_duration_p95/op.server_apply_p95/etc.).
+        metrics.histogram("reconcile.catchup_ops").record(begin.totalOps);
         queues.enqueue("control", encodeControlFrame(begin));
         for (const chunk of chunks) {
           queues.enqueue("control", encodeControlFrame(chunk));
@@ -509,6 +575,16 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
 
       const alreadyHave = await buildAlreadyHaveMessage(coordinator, ctrlMsg.unacked);
       queues.enqueue("control", encodeControlFrame(alreadyHave));
+      // Runbook "Reconnection" metric group — what fraction of this client's own unacked queue
+      // the server already had (so reconciliation could skip re-minting/resending it), API Spec
+      // §3.6.8. `ctrlMsg.unacked.length` is 0 for a fresh connection with nothing queued, which
+      // makes the ratio meaningless rather than zero — skipped in that case, exactly the same
+      // "don't record a misleading number" call FinalizeItem.receivedAtMs makes above.
+      if (ctrlMsg.unacked.length > 0) {
+        metrics
+          .gauge("reconcile.already_have_ratio")
+          .set(alreadyHave.alreadyHave.length / ctrlMsg.unacked.length);
+      }
 
       // Phase 24, Test Plan RC-32: PERMISSION_CHANGED is sent AFTER the rest of the handshake
       // completes — RC-32's own assertion order lists "HELLO succeeds, CATCHUP delivered"
@@ -581,6 +657,11 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           break;
         }
         case "syncComplete":
+          // Runbook "Reconnection" metric group (reconcile.resend_ops_p95 — see the
+          // reconcile.catchup_ops comment above for the histogram-naming convention).
+          // SyncCompleteMessage.resentCount is the only place a client reports how much of its
+          // own reconciliation it actually had to redo.
+          metrics.histogram("reconcile.resend_ops").record(ctrlMsg.resentCount);
           logger.info("ws.syncComplete", {
             documentId: coordinator.documentId,
             sessionId,
@@ -589,6 +670,7 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
           });
           break;
         case "leave":
+          gracefulClose = true; // explicit client LEAVE — an accounted-for departure, not "the socket just died."
           logger.info("ws.leave", {
             documentId: coordinator.documentId,
             sessionId,
@@ -687,7 +769,19 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
 
     ws.on("close", (code) => {
       queues.close();
+      metrics.gauge("ws.active_connections").dec();
       if (bound) {
+        // Runbook "Connections" metric group — a close WITHOUT a prior LEAVE frame (clean) or
+        // GOODBYE (server-initiated) is an ABNORMAL disconnect ("the socket just died"),
+        // tracked distinctly from a graceful one; see `gracefulClose`'s own doc comment above.
+        if (gracefulClose) {
+          gracefulDisconnectCount += 1;
+        } else {
+          abnormalDisconnectCount += 1;
+        }
+        metrics
+          .gauge("ws.abnormal_disconnect_rate")
+          .set(abnormalDisconnectCount / (abnormalDisconnectCount + gracefulDisconnectCount));
         disarmPresenceStaleTimer(bound.session);
         // Phase 31, Test Plan PRES-04: an abrupt close with no prior clean LEAVE (e.g. a SIGKILLed
         // browser process) removes presence IMMEDIATELY here, with reason STALE — "stale" names
@@ -711,6 +805,9 @@ export function createGateway(httpServer: HttpServer, deps: CreateGatewayDeps): 
         // the life of the process — recreating it on the next join would silently reset the
         // counter back to 1 and hand out an already-used id.
       } else {
+        // Runbook "Connections" metric group — closed before the handshake ever completed
+        // (never joined a coordinator at all).
+        metrics.counter("ws.handshake_incomplete").inc();
         logger.info("ws.disconnect", { sessionId, code });
       }
     });

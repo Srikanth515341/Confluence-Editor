@@ -12,6 +12,28 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 37 — Structured logging and metrics.** Every metric the Rollout
+& Runbook depends on is now real and live: a lightweight, in-process
+metrics registry (no Prometheus/Grafana — a solo/portfolio-appropriate
+choice, explicitly sanctioned) feeding a real dashboard
+(`GET /dashboard`, reachable from a phone on the same network) and a
+JSON endpoint (`GET /v1/metrics`) that a client-side RUM beacon also
+reports into, so server and client metrics render as one picture. All
+12 Runbook admin commands are wired through a rewritten `scripts/
+admin.ts` — 10 real (audit/replay/bisect/extract-case connect straight
+to Postgres; materialize/doc-stats/freeze/unfreeze/rebuild/gc talk to a
+running server's new admin HTTP surface) and 2 honest stubs
+(reconstruct/deploy-history, which depend on Phases 40/39 and return a
+real `501` naming exactly that, never a silent 404). The two required
+DoD drills were actually performed against a real, migrated Postgres
+instance: a real document's real snapshot was corrupted and the real
+audit scheduler's alert fired with a plain-English "the guarantee was
+violated" message; the real GC job was genuinely stopped and its own
+liveness metric alerted past a 10-minute threshold. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 37 entry for the full metric list,
+the choke-point instrumentation strategy, and the real, observed drill
+output.
+
 **Phase 36 — Per-user undo and redo.** Ctrl+Z now reverts the invoking
 user's own last change and nobody else's, with a defined, race-free
 outcome when another user has since deleted the same content — implemented
@@ -651,6 +673,7 @@ runs this at full scale on a schedule.
 | Cursor transform under remote edits        | ✅ **Phase 32** (`Engine.resolveCaret`, corrected for the Fugue tree engine; CaretTracker; CUR-01..05 all passing, incl. 3-replica determinism and a 600-sample zero-drift proof) — closes Test Plan blocker B19 |
 | Presence rendering (Milestone M4)          | ✅ **Phase 33** (real overlay layer, stable per-user colour via a pure function of the real authenticated user id, 3 density tiers; PRES-02/03/06/07 all passing, incl. a real-Postgres reconnect proof and 9/9 across real Chromium/Firefox/WebKit) |
 | Per-user undo/redo                         | ✅ **Phase 36** (Engine Spec §9/§4.6; inverse operations keyed by node identifier; UNDO-01..11 + UWIRE-02/03 all passing; found & fixed a real redo-resurrection bug, permanent fixture R0014) |
+| Structured logging + metrics dashboard     | ✅ **Phase 37** (in-process metrics registry, real phone-reachable dashboard, client RUM beacon, all 12 Runbook admin commands wired; both DoD drills — corrupted-snapshot audit alert, stopped-GC liveness alert — actually performed against real Postgres) |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

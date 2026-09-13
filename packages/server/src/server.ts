@@ -7,10 +7,12 @@ import {
   type AuthConfig,
   type CircuitBreakerConfig,
   type ConnectionRateLimitConfig,
+  type GcConfig,
   type OfflineWindowConfig,
   type RateLimitConfig,
 } from "./config.js";
 import { createGateway, type Gateway } from "./gateway.js";
+import type { GcRuntimeControl } from "./gcScheduler.js";
 import { createHttpApp } from "./httpApp.js";
 import { logger } from "./logger.js";
 import { startOfflineWindowScheduler } from "./offlineWindowScheduler.js";
@@ -66,6 +68,15 @@ export interface CreateCollabServerDeps {
    * pre-this-fix test) — the same generous defaults `loadConfig()` uses for a real server.
    */
   readonly offlineWindow?: OfflineWindowConfig;
+  /**
+   * Phase 37 `./admin gc --status`/`--run-once`/`--disable-all` — the admin HTTP surface
+   * (httpApp.ts's `/v1/admin/gc/*` routes) needs the SAME `gcConfig`/`GcRuntimeControl` instance
+   * `index.ts`'s own `startGcScheduler` call is using, or `--disable-all` would silently flip a
+   * flag nothing ever reads. Optional for the usual reason (every pre-Phase-37 test omits it,
+   * and the admin GC routes are simply never mounted when it's absent — the same pattern
+   * `authDeps` already established).
+   */
+  readonly adminGc?: { readonly gcConfig: GcConfig; readonly control: GcRuntimeControl };
 }
 
 /** Builds the Express app and WebSocket gateway on one shared HTTP server (so HTTP and WS share a single port). Does not start listening — call `listen()`. */
@@ -91,6 +102,7 @@ export function createCollabServer(deps: CreateCollabServerDeps = {}): CollabSer
     // property — spread only when actually present, so `deps.auth === undefined` (the default,
     // every pre-Phase-26 caller) genuinely omits the key rather than assigning `undefined` to it.
     ...(deps.auth && ticketStore ? { authDeps: { ...deps.auth, ticketStore } } : {}),
+    ...(deps.adminGc ? { adminGc: deps.adminGc } : {}),
   });
   const httpServer = createHttpServer(app);
   const gateway = createGateway(httpServer, {

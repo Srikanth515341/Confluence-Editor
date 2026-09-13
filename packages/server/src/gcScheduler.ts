@@ -10,10 +10,25 @@ import type { Gateway } from "./gateway.js";
 import type { DocumentCoordinator } from "./documentCoordinator.js";
 import type { GcConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { metrics } from "./metrics.js";
 import { maybeCrash, SimulatedCrash } from "./testOnlyCrashInjection.js";
 
 export interface GcScheduler {
   stop(): void;
+}
+
+/**
+ * Phase 37 `./admin gc --disable-all` / `--run-once` — a shared, mutable runtime switch checked
+ * by every scheduled cycle (never by an explicit `./admin gc --run-once`, which must still work
+ * even while the recurring schedule is disabled — an operator explicitly asking for one cycle
+ * right now is not "the schedule," it's a direct command). Plain object, not a class: the ONLY
+ * state is one boolean, and this needs to be the SAME object instance shared between
+ * `index.ts`'s `startGcScheduler` call and `httpApp.ts`'s admin routes (server.ts's own
+ * construction threads it through, mirroring how `ticketStore` is shared between `httpApp.ts` and
+ * `gateway.ts`, Phase 29).
+ */
+export interface GcRuntimeControl {
+  enabled: boolean;
 }
 
 /**
@@ -25,8 +40,15 @@ export interface GcScheduler {
  * the same reason: this is an in-process, currently-open-documents-only
  * control, not a sweep of every document that has ever existed.
  */
-export function startGcScheduler(gateway: Gateway, gcConfig: GcConfig): GcScheduler {
+export function startGcScheduler(
+  gateway: Gateway,
+  gcConfig: GcConfig,
+  control?: GcRuntimeControl,
+): GcScheduler {
   const timer = setInterval(() => {
+    if (control && !control.enabled) {
+      return; // `./admin gc --disable-all` — the scheduled sweep itself is off; a direct `--run-once` still works (see runOneDocument's own control-bypass parameter).
+    }
     void runAllOpenDocuments(gateway, gcConfig);
   }, gcConfig.gcIntervalMs);
   // Same reasoning as every other in-process scheduler in this codebase (snapshotter.ts's
@@ -51,6 +73,7 @@ export async function runOneDocument(
   gcConfig: GcConfig,
 ): Promise<void> {
   coordinator.lastGcAttemptAt = new Date();
+  const cycleStartedAtMs = Date.now();
   try {
     await coordinator.ready; // a coordinator can be in the map while still warming up
 
@@ -86,6 +109,10 @@ export async function runOneDocument(
     if (result.incomplete) {
       coordinator.gcCycleIncompleteCount += 1;
     }
+    // Runbook "GC" metric group: `gc.cycle_duration_p95`/`gc.nodes_collected_per_cycle` — a
+    // DISTRIBUTION across cycles, unlike `lastGcCollectedCount`'s own single most-recent value.
+    metrics.histogram("gc.cycle_duration").record(Date.now() - cycleStartedAtMs);
+    metrics.histogram("gc.nodes_collected_per_cycle").record(result.collectedCount);
 
     // Phase 30 (RFC §8.2 (T2)) — re-evaluated after every GC cycle too, not just after each
     // committed operation (writePath.ts's own reactive check): this is what lets a tripped

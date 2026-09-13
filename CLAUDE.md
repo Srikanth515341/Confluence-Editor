@@ -7021,6 +7021,303 @@ check:purity` was ALSO silently broken by two comments (one in
   original session's full detail) — flagged here so a future session
   doesn't mistake the gap for those phases never having happened.
 
+- **Phase 37 — Structured logging and metrics** (RFC §5 C-14; PRD FR-PS-6,
+  D-14; Test Plan §14.1). Emits every metric the Rollout & Runbook's own
+  §7.6 depends on, so that document can eventually be written from real
+  data rather than prediction, and wires up all 12 of its admin commands
+  (10 real, 2 legitimately-stubbed shapes for Phases 39/40). Dependencies:
+  Phases 16, 21, 31 (all load-bearing, as scoped).
+
+  **`packages/server/src/metrics.ts`** (new): an in-process
+  `MetricsRegistry` — `Counter`/`Gauge`/`Histogram` (a 1,000-sample
+  circular buffer, percentiles computed on read) — deliberately NOT
+  Prometheus/Grafana, per this phase's own explicit sanction ("a
+  lightweight approach is fine... as long as it's real, live, and
+  reachable from a phone browser," this being a solo/portfolio project).
+  Per-DOCUMENT metrics (GC/audit/structure/tombstone state) are
+  deliberately NOT stored in this registry at all — they are computed ON
+  READ, directly from each `DocumentCoordinator`'s own already-tracked
+  fields (`lastGcSuccessAt`, `engine.stats()`, etc., Phases 18/21/30),
+  aggregated across every open coordinator by `httpApp.ts`'s
+  `computeAggregateDocumentMetrics` at request time — avoiding a second,
+  parallel source of truth for state that already exists. Every metric
+  name this phase's own reference table lists is pre-registered at
+  startup (`registerAllKnownMetricNames`) specifically so the dashboard
+  shows the complete list from the very first request, rather than a
+  metric silently being ABSENT (indistinguishable from "not wired up")
+  until its first triggering event happens to occur.
+
+  **The exact metric list built — every name the reference table gave,
+  no more, no fewer**: Convergence (`audit.mismatch_count`,
+  `audit.minutes_since_last_successful_run`); Connections
+  (`ws.active_connections`, `ws.abnormal_disconnect_rate`,
+  `ws.connection_churn`, `ws.upgrade_rejection_rate`,
+  `ws.handshake_incomplete`); Latency (`op.remote_visibility_p50/p95/p99`,
+  `op.server_apply_p95`, `op.commit_latency_p95`, `presence.latency_p95`);
+  Reconnection (`reconcile.duration_p95`, `reconcile.catchup_ops_p95`,
+  `reconcile.resend_ops_p95`, `reconcile.already_have_ratio`,
+  `reconcile.failure_rate`, `reconcile.offline_window_exceeded_count`);
+  Queues (`queue.ops_depth`, `queue.presence_depth`,
+  `presence.shed_count`); GC (`gc.minutes_since_last_success`,
+  `gc.cycle_duration_p95`, `gc.nodes_collected_per_cycle`,
+  `gc.frontier_lag_seconds`); Documents (`doc.structure_size`,
+  `doc.tombstone_ratio`, `engine.replica_bytes_p95`); Authz
+  (`authz.op_rejected_count`, `authz.identity_mismatch_count`,
+  `authz.revocation_effect_p95`, `authz.cache_age_max`); Client RUM
+  (`binding.reconciliation`, `binding.desync_error`,
+  `binding.composition_watchdog_fired`, `binding.indexeddb_unavailable`,
+  `client.local_echo_p50/p95/p99`). Instrumented at the SHARED choke
+  points this project's own architecture already provides — `sendOpReject`
+  (writePath.ts) is the single function every rejection path calls, so
+  `authz.op_rejected_count`/`authz.identity_mismatch_count`/
+  `reconcile.offline_window_exceeded_count` needed exactly one hook, not
+  four; `authz.cache_age_max`/`authz.revocation_effect_p95` reuse the
+  Phase 28/29 authorization cache's own fixed TTL to derive an entry's
+  creation time without a new field, and hook the SINGLE existing
+  `invalidateAuthorizationCache`/`authorizeSession` pair rather than
+  adding new call sites throughout the codebase.
+
+  **Latency instrumentation threads a `receivedAtMs` timestamp through
+  BOTH of writePath.ts's fast and slow paths** (Phase 25's own DUR-06
+  fix already split these into two functions) — `op.server_apply`
+  records total time in `processIncomingOperation`; `op.remote_visibility`
+  records time from receipt to broadcast, at EACH path's own broadcast
+  point (the slow path's mixed-readiness batch broadcasts per finalized
+  item, individually, so this is recorded per item, not once per
+  message); `op.commit_latency` records time from a commit being
+  enqueued (`DocumentCoordinator.enqueueCommit`) to it resolving, at
+  each path's own commit-await point. A side-effect-resolved operation
+  (Phase 25's own `pendingOpOrigin` mechanism — an operation that
+  finalizes because a LATER message happened to supply its missing
+  dependency) has no `receivedAtMs` of its own to measure against and is
+  deliberately excluded from these two metrics rather than measured
+  against the wrong message's receipt time, which would understate its
+  true (longer) latency.
+
+  **`gateway.ts` gained the Connections group plus the reconnection
+  metrics**, at the two natural points a WebSocket server observes this
+  from: connection open/close (`ws.active_connections` inc/dec,
+  `ws.connection_churn` inc on open, `ws.handshake_incomplete` inc in the
+  pre-existing "closed before `bound`" branch) and `handleProtocols`
+  (`ws.upgrade_rejection_rate`, a gauge recomputed from plain
+  per-gateway counters on every upgrade attempt — deliberately NOT
+  registry-tracked raw counts, since the reference table names only the
+  derived RATE, and tracking two extra raw counters as registry entries
+  would violate this phase's own explicit "no more, no fewer" metric-
+  count instruction). **`ws.abnormal_disconnect_rate`'s own "distinct
+  from graceful" requirement** is implemented via a per-connection
+  `gracefulClose` flag, set `true` by exactly the two things that
+  legitimately explain a close (an explicit client LEAVE frame; a
+  server-initiated GOODBYE via `disconnectForRevocation`/
+  `disconnectForRateLimit`) — anything else reaching `ws.on("close")`
+  with that flag still `false` is "the socket just died," counted
+  separately. `reconcile.duration`/`catchup_ops`/`already_have_ratio`/
+  `resend_ops` are all measured around the real handshake-completion
+  code (`handleHandshakeInner`, wrapped by a `try/finally` in the outer
+  `handleHandshake` that also derives `reconcile.failure_rate` from
+  whether the wrapped call actually completed, covering every one of the
+  function's several early-return failure branches — decode errors,
+  invalid tickets, a failed warm start, a revoked-in-the-gap session —
+  without needing to annotate each one individually) and the real
+  `syncComplete` control-message handler (`resend_ops`, straight from
+  `SyncCompleteMessage.resentCount`, API Spec §3.6.8's own
+  Client→Server field, confirmed in Phase 23 to make this genuinely
+  server-measurable).
+
+  **`presenceManager.ts`** gained `presence.latency` (processing time
+  from `handleUpdate`'s own entry to its broadcast) and
+  `presence.shed_count` (incremented exactly where the existing
+  server-side ceiling already drops an update, Phase 31's own
+  enforcement point 3 — no new drop logic, only a counter at the
+  existing one).
+
+  **The client HTTP admin surface (`httpApp.ts`)**: `GET /v1/metrics`
+  (the full flat JSON snapshot the dashboard polls), `GET /dashboard` (a
+  single static HTML page, `dashboardHtml.ts` — polls `/v1/metrics`
+  every 5 seconds, groups by the Runbook's own table sections, no build
+  step, no external dependency, reachable from any phone on the same
+  network as the server), and `POST /v1/rum` (the client beacon
+  receiver — a batch of `{name, value, kind}` samples recorded straight
+  into the SAME shared registry every server-side metric already writes
+  into, so client and server metrics render as one unified picture, not
+  two separate systems). Six of the twelve admin commands got real HTTP
+  backing here, since they need LIVE in-memory coordinator state a
+  standalone CLI process cannot reach on its own (Phase 18's own
+  original DB-direct/live-server split, extended): `GET
+  /v1/admin/documents/:id/materialize`, `GET .../doc-stats`, `POST
+  .../freeze`/`.../unfreeze` (thin wrappers over `DocumentCoordinator`'s
+  own pre-existing `manualFreeze`/`manualUnfreeze`), `POST .../rebuild`
+  (over the pre-existing `rebuildFromLog`), and `GET/POST
+  /v1/admin/gc/status`/`run-once`/`disable-all`/`enable-all` — the last
+  four only mounted when the server was constructed with a shared
+  `GcRuntimeControl` object (a new, minimal `{enabled: boolean}` plain
+  object in `gcScheduler.ts`, threaded through `server.ts`'s
+  `adminGc`/`index.ts`'s direct-run path the SAME single-shared-instance
+  way Phase 29 already threads `InMemoryTicketStore` between `httpApp.ts`
+  and `gateway.ts` — a real, disclosed wiring risk this phase deliberately
+  avoided repeating). `--disable-all` stops only the SCHEDULED sweep
+  (checked once, cheaply, inside the interval callback); `--run-once`
+  deliberately bypasses that flag entirely — an operator's own explicit
+  "run one cycle right now" command must still work even while the
+  recurring schedule is off. `GET .../reconstruct?seq=` and `GET
+  .../deploy-history` implement the command SHAPE only, per this phase's
+  own explicit instruction, returning a real `501 not_yet_implemented`
+  naming the Phase (40/39 respectively) that will build the real
+  capability — a genuinely reachable, correctly-shaped route today, not
+  a 404.
+
+  **`scripts/admin.ts`** was fully rewritten for all 12 commands, dual-
+  mode exactly as Phase 18's own original design intended: `audit`/
+  `replay`/`bisect` connect directly to Postgres (unchanged in spirit
+  from Phase 18 — `replay`/`bisect` are new commands but reuse the same
+  DB-direct connection pattern `seed.ts`/the original `audit` command
+  already established); `materialize`/`doc-stats`/`freeze`/`unfreeze`/
+  `rebuild`/`gc` make real HTTP requests against a running server's new
+  admin surface above (`--server=http://host:port`, default
+  `127.0.0.1:8080`); `reconstruct`/`deploy-history` forward to the
+  stubbed routes and print the same honest "the shape works, the
+  capability doesn't exist yet" message to stderr. **`extract-case` is
+  the one genuinely NEW command** (every other DB-direct command wraps
+  existing functionality) — Runbook §7.6: "emit a regression-corpus
+  fixture." Extracts the real, durably-committed operation window around
+  `--around=<seq>` and writes it as a fixture matching this project's own
+  regression-corpus STRUCTURE (Test Plan §2.3: full operation stream,
+  provenance, date) — but deliberately does NOT auto-assign it the next
+  `R####` number and drop it directly into `tests/regression/`: Rule 1
+  ties a corpus entry to an actual landed fix, a human decision this tool
+  cannot make on its own. Instead it writes to `tests/regression/
+  extracted/`, the raw materials for a human investigator to root-cause
+  and promote into a real numbered entry. `bisect`'s own `--from`/`--to`
+  flags are accepted (matching the Runbook table's own command shape) but
+  not yet threaded into a custom search range — `audit.ts`'s own
+  `bisectSnapshotDivergence` (Phase 18) is not separately exported as an
+  independently-invokable function, only reachable as a step of a full
+  audit, so this command runs the same real audit and surfaces its real
+  bisect result directly, a reasonable, disclosed scope for what it needs
+  to answer ("which snapshot first disagrees") rather than a narrower
+  custom-range search.
+
+  **The client-side RUM beacon** (`packages/client/src/rum/beacon.ts`,
+  new): `RumBeacon` batches samples in memory and flushes them as one
+  POST on a fixed interval (default 5s, never per-event — a beacon firing
+  once per keystroke would itself become exactly the kind of hot-path
+  overhead PRD M3 exists to guard against), preferring
+  `navigator.sendBeacon` (survives page unload) with a `fetch` fallback
+  for environments without it (this project's own jsdom test environment
+  included). `attachRumBeaconPolling` wires the two metrics that live as
+  CUMULATIVE state on some other object rather than firing a natural
+  per-event callback — `MutationSentinel.metrics`
+  (`reconciliation`/`desync_error`, Phase 13, polled and reported as a
+  DELTA since the last poll, matching the registry's own counter
+  semantics) and `SyncClient.durableQueueUnavailable` (Phase 22, reported
+  exactly once, the first time it flips true, mirroring that field's own
+  "never reset" page-load-lifetime semantics). The other two RUM metrics
+  are wired as genuine per-event callbacks at their own natural call
+  sites, a smaller and more direct change than a polling loop for
+  something that already fires exactly when it should:
+  `CompositionController` gained an optional `onWatchdogFired` (Phase 34,
+  called at the exact point the watchdog already force-commits) and
+  `InputPipelineDeps` gained an optional `onLocalEcho: (ms) => void`
+  (Phase 12, `insertTextAt`/`deleteRangeAt` measure `performance.now()`
+  from `sync.localInsertText`/`localDelete` through the DOM mutation and
+  caret placement — PRD M3's own 16ms keystroke budget, now measurable in
+  the field, not just in this project's own benchmarks). `App.tsx` wires
+  all of this together as the real, shipped demo app's own behavior, not
+  a separate example.
+
+  **The two required empirical DoD drills were actually performed
+  against a real, migrated Postgres instance** (`packages/server/src/db/
+  dodDrills.db.test.ts`, new, permanent — `pnpm test:db`), not simulated
+  or merely reasoned about:
+  - **Drill 1**: a real 45-character document, committed through the
+    real write path, snapshotted for real (`writeSnapshotNow`), then its
+    real `snapshots.content` row deliberately corrupted via a direct
+    `UPDATE`. The REAL production `auditScheduler.ts`, running at an
+    accelerated interval (100ms, the same "same code, shorter constant"
+    precedent as every prior phase's own timing-acceleration technique),
+    detected it: `GET /v1/documents/:id/audit-runs` returned a real row
+    with `result: "mismatch"` and the real detail string — "genesis
+    replay through seq 45 does not match the latest snapshot's stored
+    content... its content is corrupt, its structure column disagrees
+    with what actually happened, or a bug wrote it wrong in the first
+    place" — stating plainly, in an operator-readable sentence, that the
+    guarantee was violated, for real content, not a placeholder. `GET
+    /v1/metrics`'s `audit.mismatch_count` was confirmed `>= 1` at the
+    same moment. Restoring the original content and waiting for the next
+    real tick confirmed the identical mechanism reports `"ok"` again,
+    closing the loop (Phase 18's own original corrupt-then-restore
+    convention, reused here for the metrics-visibility half of the same
+    claim).
+  - **Drill 2**: the REAL production `gcScheduler.ts`, running at an
+    accelerated interval, was allowed to complete at least one real,
+    successful cycle first (`minutesSinceLastSuccess: 0.0015`,
+    confirmed via a real `GET /v1/admin/gc/status`) — proving the metric
+    can tell "was healthy, then stopped" apart from "never ran at all."
+    The job was then genuinely stopped two ways at once (the real
+    `POST /v1/admin/gc/disable-all` endpoint, AND tearing down its own
+    timer), and — since GC's failure mode is deliberately silent by
+    design (nothing errors, memory just grows) — real elapsed idle time
+    was simulated the same documented way Phase 21's own M8-d test
+    already does (aging a real timestamp field into the past, the same
+    class of technique, not a new shortcut invented for this phase). The
+    real `/v1/admin/gc/status` and `/v1/metrics` endpoints both then
+    reported `minutesSinceLastSuccess`/`gc.minutes_since_last_success`
+    at 15 minutes, past the dashboard's own 10-minute alert threshold —
+    confirmed alerting, with `schedulerEnabled: false` visible alongside
+    it.
+
+  **The two required verbatim comments are in the code exactly as
+  specified** — `gc.minutes_since_last_success`'s own reasoning, above
+  `DocumentCoordinator`'s pre-existing GC fields (unchanged text, already
+  present since Phase 21's own liveness-metric design anticipated this
+  citation); `audit.minutes_since_last_successful_run`'s own reasoning,
+  above the analogous `lastAuditSuccessAt`/`auditMismatchCount` fields
+  added this phase.
+
+  **DoD verification**: `pnpm -r exec tsc --noEmit` clean across all 6
+  packages. The full default `pnpm test` suite passes clean, **682
+  passed, 2 skipped** (the same disclosed, deferred Fugue O(N²) GC-chain
+  tests, unchanged), across 71 files — up from Phase 36's own
+  end-of-phase count, the delta being this phase's own new
+  `metricsAndAdmin.test.ts` (10 tests, real HTTP/WS against a real
+  `createCollabServer()`, covering `/v1/metrics`, `/dashboard`,
+  `/v1/rum`, and every admin HTTP route including the 501-stub shapes and
+  the GC-control mount/no-mount split) plus zero regressions elsewhere.
+  `pnpm test:db`'s new `dodDrills.db.test.ts` (2/2, both drills, real
+  numbers quoted above) passes against a real, migrated Postgres
+  instance; the five most directly-adjacent `db/*.db.test.ts` files
+  (`gc`, `audit`, `snapshots`, `durability`, `schema`) were re-run
+  alongside it for regression confidence (the two already-disclosed,
+  pre-existing, unrelated 100,000-operation-scale timeouts — Open Item 3,
+  Fugue's own O(N²) cost — reconfirmed, not newly caused).
+
+  **What is deliberately NOT built this phase**: `logger.child()`'s own
+  bound-field capability (`logger.ts`, already built) is not yet threaded
+  into `gateway.ts`'s own individual log call sites for automatic
+  `sessionId`/`documentId` correlation on every line — the capability
+  exists, the wiring into each of that file's many existing `logger.info`/
+  `warn`/`error` calls does not, a real, disclosed gap in the "logs are
+  structured JSON and correlate by requestId" DoD line (the REST side,
+  `restErrors.ts`'s `requestIdMiddleware`, Phase 27, already does this
+  correctly for every HTTP request; the WS/gateway side does not yet).
+  `queue.ops_depth`/`queue.presence_depth` are aggregated at metrics-read
+  time from every currently-open session's own `ConnectionSendQueues.
+  lengths`, not maintained as live-updated gauges — correct in shape,
+  but recomputed on each `/v1/metrics` poll rather than pushed on
+  enqueue/dequeue, a deliberate, disclosed simplification given this
+  phase's own scope. `engine.replica_bytes_p95` is a disclosed, order-of-
+  magnitude ESTIMATE (a sampled JSON-stringified node size × total node
+  count), not a real client-reported figure — no client currently reports
+  its own actual resident memory. `documents.structure_size`/
+  `tombstone_count`'s own durable persistence remains the SAME
+  pre-existing, disclosed gap Phase 27/30 already found (still never
+  written by any code path; this phase's own metrics read live
+  `engine.stats()` instead, same as Phase 30's circuit breaker already
+  does). Any UI rendering of the dashboard's own data inside the actual
+  editor app (`ConnectionIndicator.tsx`/`EditorView.tsx` untouched beyond
+  the RUM instrumentation hooks) — the dashboard is its own separate
+  page, per Scope-IN, not embedded in the product itself.
+
 ## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
 
 This entry documents a real, load-bearing investigation that happened AFTER
@@ -8423,6 +8720,32 @@ is a Phase 32 finding, unrelated to Phase 25's own tag readiness.
 
 ## Current phase in progress
 
+**Phase 37 (Structured logging and metrics) — COMPLETE as of 2026-09-13.**
+Every metric the Rollout & Runbook's own §7.6 depends on is now emitted
+and visible on a real, live, phone-reachable dashboard (`GET /dashboard`,
+polling `GET /v1/metrics`) — see the "Phase 37" bullet in the Completed
+Phases list above for the full account, including the exact metric list
+built (no more, no fewer than the reference table named), the choke-point
+instrumentation strategy (`sendOpReject`, the authorization cache's own
+fixed TTL, both fast/slow write paths), and the client-side RUM beacon
+(`packages/client/src/rum/beacon.ts`) wired into the real, shipped demo
+app. All 12 Runbook admin commands are wired — 10 real (4 DB-direct,
+6 over a new HTTP admin surface), 2 legitimately-stubbed shapes
+returning honest `501`s for Phases 39/40 — via a fully rewritten
+`scripts/admin.ts`. The two required DoD drills were ACTUALLY PERFORMED
+against a real, migrated Postgres instance, not simulated: a real
+snapshot was corrupted and the real audit scheduler's own alert fired
+with a plain-English detail string; the real GC job was genuinely
+stopped and `gc.minutes_since_last_success` alerted past its own
+10-minute threshold. See that phase's own completed-phase entry for the
+real, observed output of both drills and exactly what's disclosed as not
+yet built (`logger.child()`'s bound-field capability is not yet threaded
+into `gateway.ts`'s own individual log call sites; queue-depth metrics
+are computed on read, not push-updated; `engine.replica_bytes_p95` is a
+disclosed estimate, not a real client-reported figure). No open item
+from this phase blocks anything — the next phase to pick up is whichever
+one is next in the Implementation Plan.
+
 **Phase 36 (Per-user undo and redo) — COMPLETE as of 2026-09-13.** Ctrl+Z
 now reverts the invoking user's own last change and nobody else's, with a
 defined, race-free outcome when another user has since deleted the same
@@ -9599,6 +9922,25 @@ whatever `DATABASE_URL` points at, exits 0 on `ok`, 1 on `mismatch`/
 db:migrate` (same as everything else on this page) but NOT a running
 server — it connects to Postgres directly, the same way `pnpm db:seed`
 does.
+
+**Phase 37's admin CLI, dashboard, and metrics** — `scripts/admin.ts` now
+supports all 12 Runbook §7.6 commands, dual-mode: `audit`/`replay`/
+`bisect`/`extract-case` connect to Postgres directly (no running server
+needed, same as Phase 18's own `audit`); `materialize`/`doc-stats`/
+`freeze`/`unfreeze`/`rebuild`/`gc` need a REAL RUNNING SERVER (`pnpm
+--filter @collab-editor/server run dev`) and talk to it over HTTP
+(`--server=http://host:port`, default `127.0.0.1:8080`); `reconstruct`/
+`deploy-history` are honest, reachable `501` stubs for Phases 40/39. Run
+via `pnpm --filter @collab-editor/server run admin -- <command> [flags]`
+(repo root: `pnpm admin -- <command> [flags]`) — see `scripts/admin.ts`'s
+own `usage()` output for the full flag list. **The dashboard**: with a
+real server running (`pnpm --filter @collab-editor/server run dev`),
+open `http://<your-machine's-LAN-IP>:8080/dashboard` on your phone (same
+Wi-Fi network) — it polls `GET /v1/metrics` every 5 seconds and groups
+every metric by the Runbook's own table sections; `gc.minutes_since_
+last_success`/`audit.minutes_since_last_successful_run`/`audit.
+mismatch_count` render in red once past their alert thresholds. `GET
+/v1/metrics` alone returns the same data as flat JSON, for scripting.
 
 **As of Phase 16, `pnpm run dev`'s server IS wired to this database for
 real** (`index.ts`'s direct-run block constructs a real
