@@ -468,39 +468,75 @@ describe("Adversarial suite — Engine-derived group (ADV-14…ADV-22)", () => {
     expect(receiver.text()).toBe("AxC");
   });
 
-  it("ADV-21 (PRD OQ-3 / Engine Spec §9.3): undelete of a node deleted later by another user is a no-op, regardless of arrival order", () => {
+  it("ADV-21 (PRD OQ-3 / Engine Spec §9.3/§4.6): undo of a delete superseded by someone else's causally-LATER delete is a no-op, regardless of arrival order — CORRECTED for the real, now-specified Engine Spec §4.6 rule (Phase 36)", () => {
+    // CORRECTION (Phase 36, 2026-09-13): the ORIGINAL version of this case (Phase 5) minted
+    // ALL THREE operations — the first delete, the undelete, and the second delete — from ONE
+    // shared engine/replica. That construction is INCOMPATIBLE with the real, now-specified
+    // Engine Spec §4.6 rule: "if n.deletedBy.replica = op.by" is a REPLICA-EQUALITY check, never
+    // a causal-order comparison between the undelete's own id and node.deletedBy (which is what
+    // the ORIGINAL construction actually exercised, and which was itself only ever a Phase-5
+    // placeholder — PRD OQ-3 was still an OPEN QUESTION at the time, with no real resolution
+    // text available). Hand-traced during Phase 36: under the real §4.6 rule, the original
+    // single-replica construction would have RESURRECTED ("ABC") on delivery orders where the
+    // undelete's own freshly-minted id happens to be the causally latest of the three (which,
+    // by construction, it always eventually is, since a fresh mint always exceeds every counter
+    // already observed) — passing its own assertions "AC" only by relying on the SAME counter
+    // placement the placeholder rule cared about, which the real rule does not.
+    //
+    // Corrected to a genuine two-different-replica scenario, matching the real UNDO-04/UNDO-05
+    // shape verbatim (Test Plan §6): X deletes B; Y (a DIFFERENT replica) CONCURRENTLY deletes B
+    // again, causally later; X undoes ITS OWN original delete via the real `Engine.undo()`
+    // (Engine Spec §9.1) — never another user's operation, matching FR-CE-11 by construction.
+    // This is now BOTH the corrected ADV-21 AND a faithful, real end-to-end exercise of
+    // `Engine.undo()` itself (Phase 36's own new public API), not hand-built raw operations.
     const seed = buildBase(100, "ABC");
     const bId = seed.nodes[1]!.id;
 
-    // Causal order: delete1, undelete, delete2 (delete2 is LATER than the undelete).
-    const delId1 = seed.mint();
-    const delOp1: Operation = { kind: "delete", id: delId1, target: bId };
-    const undelId = seed.mint();
-    const undelOp: Operation = { kind: "undelete", id: undelId, target: bId };
-    const delId2 = seed.mint();
-    const delOp2: Operation = { kind: "delete", id: delId2, target: bId };
+    const engineX = new Engine(10); // X — lower replica id
+    const engineY = new Engine(20); // Y — higher replica id
+    syncFromSeed(seed, engineX, engineY);
 
-    // Replica X applies in exact causal order.
-    const engineX = new Engine(1);
-    syncFromSeed(seed, engineX);
-    engineX.applyRemote(delOp1);
+    // Concurrent deletes: neither replica has seen the other's delete yet. A counter tie
+    // (both mint their first local op from the same synced base clock) is broken by replica id
+    // — Y's delete (r=20) is therefore causally LATER than X's (r=10), matching UNDO-04's own
+    // literal "Y ALSO deletes 'B', causally later" wording without needing to force it by hand.
+    const [delOpX] = engineX.localDelete(1, 1);
+    const [delOpY] = engineY.localDelete(1, 1);
     expect(engineX.text()).toBe("AC");
-    engineX.applyRemote(undelOp);
-    expect(engineX.text()).toBe("ABC"); // temporarily restored
-    engineX.applyRemote(delOp2);
-    expect(engineX.text()).toBe("AC"); // the later delete wins — net no-op
+    expect(engineY.text()).toBe("AC");
 
-    // Replica Y receives the SAME operations in a DIFFERENT arrival
-    // order (the undelete arrives LAST, after the later delete) — the
-    // causal id, not delivery order, must still decide the outcome.
-    const engineY = new Engine(2);
-    syncFromSeed(seed, engineY);
-    engineY.applyRemote(delOp1);
-    engineY.applyRemote(delOp2);
+    // Exchange BEFORE X undoes — X's own local view must already reflect Y's (causally later)
+    // attribution at the moment its own undo runs, exactly as a real live session would.
+    engineY.applyRemote(delOpX!);
+    engineX.applyRemote(delOpY!);
+    const bNode = engineX.nodes.find((n) => n.id.c === bId.c && n.id.r === bId.r)!;
+    expect(bNode.deletedBy).toEqual(delOpY!.id); // confirms Y really is the causally-latest attribution
+
+    // X undoes ITS OWN delete — a real Engine.undo() call, not a hand-built operation. Its own
+    // freshly-minted id is, by construction, causally LATER than everything seen so far — the
+    // exact condition that would WRONGLY resurrect under the retired causal-order-comparison
+    // placeholder, and the exact condition the real replica-equality rule must correctly refuse
+    // (X's replica ≠ Y's replica, the replica currently holding attribution).
+    const outcome = engineX.undo();
+    expect(outcome.kind).toBe("applied"); // an operation WAS transmitted and logged (Engine Spec §9.2)
+    expect(engineX.text()).toBe("AC"); // NO-OP — not resurrection
+    if (outcome.kind !== "applied") {
+      throw new Error("unreachable");
+    }
+    const undelOp = outcome.operation;
+
     engineY.applyRemote(undelOp);
-
     expect(engineY.text()).toBe("AC");
     expect(engineX.text()).toBe(engineY.text()); // text unchanged, and identical, on both replicas
+
+    // A DIFFERENT arrival order on a third, uninvolved replica — the causal id (via the total
+    // order I7 imposes on deletedBy), not delivery order, must still decide the outcome.
+    const engineZ = new Engine(30);
+    syncFromSeed(seed, engineZ);
+    engineZ.applyRemote(delOpY!);
+    engineZ.applyRemote(undelOp);
+    engineZ.applyRemote(delOpX!);
+    expect(engineZ.text()).toBe("AC");
   });
 
   it("ADV-22 (Engine Spec I0): 3,000 sequentially-typed characters, block-encoded -> compression > 1000x", () => {

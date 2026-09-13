@@ -23,6 +23,7 @@ import {
   wordAfter,
   wordBefore,
 } from "./graphemeSegmentation.js";
+import type { UndoRedoController } from "./undoRedoController.js";
 
 /**
  * Everything one `beforeinput` handler call needs — no hidden global state.
@@ -30,11 +31,15 @@ import {
  * through `sentinel.applyPatches()` (Phase 13, API Spec §7.7.1) rather than
  * calling `domWriter.insertText`/`deleteRange` bare, so a caller can never
  * accidentally reintroduce a DOM mutation the sentinel doesn't know about.
+ * `undoRedo` is likewise REQUIRED (Phase 36) — the same "a caller can't
+ * accidentally reintroduce a gap" discipline: without it, `historyUndo`/
+ * `historyRedo` would silently have nowhere to dispatch to.
  */
 export interface InputPipelineDeps {
   readonly domWriter: DomWriter;
   readonly sync: SyncClient;
   readonly sentinel: MutationSentinel;
+  readonly undoRedo: UndoRedoController;
 }
 
 interface VisRange {
@@ -350,9 +355,13 @@ export function handleBeforeInput(ev: InputEvent, deps: InputPipelineDeps): void
     // "insertCompositionText"/"deleteCompositionText" never reach this switch at all — see the
     // early return at the top of this function (Phase 34).
     case "historyUndo":
+      // Phase 36 (Engine Spec §9, API Spec §7.4.2/§7.8) — scheduled via the shared microtask
+      // guard (UndoRedoController), not called directly: a browser can ALSO fire a `keydown`
+      // for the same physical Ctrl+Z, and UWIRE-02 requires exactly one undo either way.
+      deps.undoRedo.scheduleUndo();
+      break;
     case "historyRedo":
-      // TODO(Phase 36): engine.undo()/engine.redo() (Engine Spec §9). Stubbed per API Spec
-      // §7.4.2 — this phase only prevents the browser's own undo/redo from touching the DOM.
+      deps.undoRedo.scheduleRedo();
       break;
     default:
       console.warn(`inputPipeline: unhandled inputType "${ev.inputType}" — ignored`);

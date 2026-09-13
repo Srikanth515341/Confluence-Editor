@@ -10,6 +10,32 @@ import type {
 import { isClusterContinuing } from "./grapheme.js";
 import { FugueTree } from "./fugueTree.js";
 
+/**
+ * Result of {@link Engine.undo}/{@link Engine.redo} (Phase 36, Engine Spec §9.1/§9.4).
+ *  - `"empty"`: nothing was on the relevant stack — a normal, expected state (a caller uses
+ *    this to disable a toolbar button, never to surface an error).
+ *  - `"unavailable"`: the top entry's target has been physically removed by garbage collection
+ *    (Engine Spec §9.5, Test Plan UNDO-11) — undo/redo is simply no longer possible for that
+ *    entry; NOT an error, and distinct from the ORDINARY no-op case below (which reports as
+ *    `"applied"`, since an operation genuinely WAS applied — it simply had no visible effect).
+ *  - `"applied"`: the inverse operation was minted and applied locally; `operation` is what the
+ *    caller must broadcast, exactly mirroring {@link Engine.localInsert}/
+ *    {@link Engine.localDelete}'s own "mint, apply, return for broadcast" shape.
+ */
+export type UndoOutcome =
+  | { readonly kind: "empty" }
+  | { readonly kind: "unavailable" }
+  | { readonly kind: "applied"; readonly operation: Operation };
+
+/**
+ * One entry on {@link Engine}'s private `undoStack`/`redoStack` (Phase 36) — see `undoStack`'s
+ * own doc comment for the full reasoning behind `hadEffect`.
+ */
+interface UndoStackEntry {
+  readonly op: Operation;
+  readonly hadEffect: boolean;
+}
+
 /** Structural metrics feeding PRD M8 / RFC §7.8's tombstone-ratio observability. */
 export interface EngineStats {
   readonly totalElements: number;
@@ -118,6 +144,47 @@ export class Engine {
    * used for every not-yet-real-auth decision since Phase 8/9.
    */
   private readonly maxCounterByReplica = new Map<number, number>();
+
+  /**
+   * Phase 36 (Engine Spec §9.1) — LOCALLY ORIGINATED operations only, in generation order.
+   * Populated exclusively by {@link localInsert}/{@link localDelete} (never by
+   * {@link applyRemote}/{@link doApply}, and never by {@link undo}/{@link redo} themselves,
+   * which manage this stack directly per the UNDO()/REDO() pseudocode below) — this is what
+   * makes FR-CE-11 ("undo reverts only the invoking user's own operations") hold BY
+   * CONSTRUCTION: an inverse can never name an operation this replica didn't itself perform,
+   * because nothing else ever gets pushed here.
+   *
+   * `hadEffect` records whether APPLYING `op` itself actually changed the target's visible
+   * (`deleted`) state — see {@link undo}/{@link redo}'s own shared doc comment for why this
+   * extra bit is load-bearing, not decorative: a genuinely local edit always has visible
+   * effect (inserting/deleting something always changes the document), so every entry pushed
+   * HERE by `localInsert`/`localDelete` is trivially `hadEffect: true`. The interesting case is
+   * entries `undo`/`redo` push onto EACH OTHER's stack, where `hadEffect` can legitimately be
+   * `false` (Engine Spec §9.2's own "possibly advances deletedBy... THE DOCUMENT IS UNCHANGED"
+   * idempotent-delete case) — see that shared doc comment for the real bug this distinction
+   * fixes, found and hand-traced during Phase 36 (`tests/regression/R0014`).
+   */
+  private readonly undoStack: UndoStackEntry[] = [];
+
+  /**
+   * Phase 36 (Engine Spec §9.4). Holds entries popped off {@link undoStack} by {@link undo},
+   * so {@link redo} can re-apply their effect. Cleared by every new LOCAL mutation
+   * ({@link localInsert}/{@link localDelete}) — Scope-IN's own "redo stack cleared on any new
+   * local operation" — but NOT by {@link undo} (which pushes onto it) or {@link redo} (which
+   * only pops from it), and NOT by a remote operation arriving (a peer's own edit has no
+   * bearing on whether THIS replica's own redo history is still meaningful).
+   */
+  private readonly redoStack: UndoStackEntry[] = [];
+
+  /** True iff {@link undo} has something to revert. Exposed for a caller (e.g. a toolbar button) to know whether to enable the affordance at all — Phase 36. */
+  get canUndo(): boolean {
+    return this.undoStack.length > 0;
+  }
+
+  /** True iff {@link redo} has something to reapply — Phase 36. See {@link canUndo}. */
+  get canRedo(): boolean {
+    return this.redoStack.length > 0;
+  }
 
   constructor(replicaId: number) {
     this.replicaId = replicaId;
@@ -238,23 +305,51 @@ export class Engine {
   }
 
   /**
-   * Structural inverse of applyDelete, using the same causally-latest
-   * comparison. Full resurrection semantics (interaction with redo
-   * history) are Phase 36 (Engine Spec §9.3) — this is deliberately the
-   * minimal shape that makes the operation type usable end to end.
+   * APPLY-UNDELETE (Engine Spec §4.6), exact pseudocode:
+   *   1  OBSERVE(op.at)
+   *   2  n <- K[op.target]
+   *   3  if n.deletedBy.replica = op.by:      -- only revive one's OWN deletion
+   *   4      n.deleted   <- false
+   *   5      n.deletedBy <- null
+   *   6  -- else: no-op -- someone else's later deletion stands
+   *
+   * Field-name mapping onto this engine's real, post-Fugue identity model (there is no
+   * pre-Fugue naming left to worry about here — `Identifier`/`deletedBy` have been `{c, r}`
+   * pairs since Phase 1): `op.by` is `op.id.r` (the replica that MINTED this Undelete's own
+   * identifier — always the replica invoking undo, Engine Spec §9.1's own `by: replicaId`),
+   * and `n.deletedBy.replica` is `node.deletedBy.r`. `OBSERVE(op.at)` (line 1) is
+   * `doApply`'s own `this.observe(op.id.c)` call, already performed by every caller of this
+   * method (`doApply` for the remote path; `undo`/`redo` mint their own inverse via
+   * `this.mint()`, which itself already advances the clock — there is nothing further to
+   * observe for a LOCALLY minted identifier).
+   *
+   * Revive only if this user's deletion is still the causally latest. If someone
+   * deleted it after us, that is a more recent expression of intent about the same
+   * content, made knowing it was already gone — overriding it would resurrect text
+   * a colleague deliberately removed. deletedBy holds the max of a totally ordered
+   * pair (I7), so every replica computes the same answer regardless of arrival
+   * order: this is a RULE, not a race. Engine Spec §9.3, PRD OQ-3.
+   *
+   * This REPLACES the pre-Phase-36 placeholder (a general causally-latest-id comparison
+   * between `op.id` and `node.deletedBy`, correct for no scenario actually specified by any
+   * approved document — Engine Spec §9.3 was still an OPEN QUESTION, PRD OQ-3, when that
+   * placeholder was written). The real rule is narrower and different in kind: a plain REPLICA
+   * EQUALITY check against whichever replica currently holds `deletedBy`, never a counter/
+   * causal-order comparison against the Undelete's OWN identifier. See CLAUDE.md's Phase 36
+   * entry for the two pre-existing tests (`ADV-21`, and a Phase 6 mutation-matrix targeted
+   * check) that encoded the old placeholder's semantics and needed correcting once this real
+   * rule arrived — both are hand-traced there against all their own delivery-order permutations.
    */
   private applyUndelete(op: UndeleteOperation): void {
     const node = this.tree.nodeByIdentifier(op.target);
     if (node === undefined) {
       throw new Error(`applyUndelete(): target ${serializeId(op.target)} is not present`);
     }
-    if (node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0) {
+    if (node.deletedBy !== null && node.deletedBy.r === op.id.r) {
       // GC hygiene (Phase 21): the node is no longer deleted, so whatever delete-context was
       // recorded for its (now-superseded) deletedBy no longer describes anything collectible —
       // drop it rather than let it linger forever across delete/undelete churn.
-      if (node.deletedBy !== null) {
-        this.deleteContext.delete(serializeId(node.deletedBy));
-      }
+      this.deleteContext.delete(serializeId(node.deletedBy));
       this.tree.setDeleted(op.target, false, null);
     }
   }
@@ -477,6 +572,13 @@ export class Engine {
     };
     this.applyInsert(op);
     this.applied.add(serializeId(op.id));
+    // Engine Spec §9.1/§9.4: every new local operation is a fresh undo unit, and invalidates
+    // whatever redo history existed (redoing something from before this edit could re-diverge
+    // from what the user now sees — the same "a new branch of history starts here" reasoning
+    // every undo/redo system uses). `hadEffect: true` trivially — a freshly-minted local insert
+    // always changes the document (see `undoStack`'s own doc comment for why this matters).
+    this.undoStack.push({ op, hadEffect: true });
+    this.redoStack.length = 0;
     return op;
   }
 
@@ -496,6 +598,12 @@ export class Engine {
    */
   localDelete(visibleIndex: number, count: number): readonly DeleteOperation[] {
     const ops: DeleteOperation[] = [];
+    // Cleared ONCE per call, not per removed character — clearing is idempotent (there is
+    // nothing left to clear the second time), and every removed character here is still its
+    // own separate undo unit below (Test Plan UNDO-02's own "operation granularity," not
+    // "one user action" granularity — matches this project's existing `localInsertText`, which
+    // already mints one `Insert` per character rather than one op per keystroke burst).
+    this.redoStack.length = 0;
     for (let k = 0; k < count; k++) {
       const target = this.tree.nodeAtVisible(visibleIndex);
       if (!target) {
@@ -504,9 +612,130 @@ export class Engine {
       const op: DeleteOperation = { kind: "delete", id: this.mint(), target: target.id };
       this.applyDelete(op);
       this.applied.add(serializeId(op.id));
+      this.undoStack.push({ op, hadEffect: true }); // a fresh local delete always changes the document
       ops.push(op);
     }
     return ops;
+  }
+
+  /**
+   * The standard Engine Spec §9.1/§9.4 kind-based inverse mapping — used whenever the entry
+   * being reversed is known to have had a REAL visible effect (`hadEffect: true`, see
+   * `undoStack`'s own doc comment): insert's inverse is a delete of the SAME node; a delete's
+   * (or undelete's) inverse is the opposite operation on the SAME target.
+   */
+  private standardInverse(op: Operation): { readonly kind: "delete" | "undelete"; readonly target: Identifier } {
+    switch (op.kind) {
+      case "insert":
+        return { kind: "delete", target: op.id };
+      case "delete":
+        return { kind: "undelete", target: op.target };
+      case "undelete":
+        return { kind: "delete", target: op.target };
+    }
+  }
+
+  /**
+   * Repeats `op`'s OWN kind against the SAME target, rather than inverting it — used whenever
+   * the entry being reversed is known to have had NO visible effect (`hadEffect: false`). See
+   * `stepUndoRedo`'s own doc comment (and `tests/regression/R0014`) for the real bug this
+   * exists to prevent: reversing a known no-op via the STANDARD inverse can newly succeed where
+   * the original didn't, because applying that no-op operation may itself have silently shifted
+   * `deletedBy` attribution (Engine Spec §9.2's own sanctioned "possibly advances deletedBy...
+   * THE DOCUMENT IS UNCHANGED"). `op` here is always itself a `delete` or `undelete` — never an
+   * `insert` — since only `standardInverse`'s OWN output ever becomes a LATER entry's `op`
+   * (an `insert` only ever appears as the very first, freshly-typed entry on `undoStack`, whose
+   * `hadEffect` is always trivially `true` — see `localInsert`'s own comment).
+   */
+  private repeatSameKind(op: Operation): { readonly kind: "delete" | "undelete"; readonly target: Identifier } {
+    switch (op.kind) {
+      case "delete":
+        return { kind: "delete", target: op.target };
+      case "undelete":
+        return { kind: "undelete", target: op.target };
+      case "insert":
+        throw new Error("unreachable: repeatSameKind() called on an insert");
+    }
+  }
+
+  /**
+   * Shared machinery for {@link undo} and {@link redo} (Engine Spec §9.1/§9.4) — the two are
+   * exact mirror images of each other (pop from one stack, push to the other), differing only
+   * in WHICH pair of stacks plays which role.
+   *
+   * Engine Spec §9.5 / Test Plan UNDO-11: if the target this reversal needs has since been
+   * PHYSICALLY REMOVED (Phase 21 garbage collection, past the undo horizon), reported as
+   * `{kind: "unavailable"}` rather than throwing — "the failure mode when the horizon is too
+   * short is a silently unavailable undo — degraded usability, not corruption." The consumed
+   * entry is NOT returned to `popFrom` in this case (its target is gone forever, so retrying it
+   * later can never succeed either) — but it does not block whatever's underneath it.
+   *
+   * **The `hadEffect` distinction (found and hand-traced during Phase 36, `tests/regression/
+   * R0014`)**: reversing an entry ALWAYS uses `standardInverse` when that entry's own
+   * application had a REAL visible effect — this is the ordinary, expected case, and remains
+   * fully subject to Engine Spec §9.3's OQ-3 rule (a genuine resurrection attempt can and
+   * should still be blocked by a legitimate intervening deletion from someone else). But when
+   * an entry's own application was a KNOWN NO-OP — Engine Spec §9.2's own idempotent-delete
+   * case, `applyDelete` on an already-deleted node — reversing it via `standardInverse` would
+   * mint an UNDELETE, and `applyDelete`'s own max-wins attribution logic (correct and necessary
+   * everywhere else) may have silently reassigned `deletedBy` to the UNDOING replica's own
+   * fresh mint as a side effect of that "harmless," idempotent delete. A later Undelete from
+   * that SAME replica would then satisfy Engine Spec §4.6's replica-equality check and
+   * RESURRECT content a third party legitimately, independently deleted — a real, silent
+   * violation of OQ-3's own guarantee ("overriding it would resurrect text a colleague
+   * deliberately removed"), not merely a cosmetic redo-symmetry mismatch. `repeatSameKind` is
+   * what closes this: a known no-op reverses into ANOTHER attempt of the SAME kind (another
+   * delete, never an undelete), which can never resurrect anything, faithfully reproducing the
+   * no-op through arbitrarily many further undo/redo cycles of that same entry.
+   */
+  private stepUndoRedo(popFrom: UndoStackEntry[], pushTo: UndoStackEntry[]): UndoOutcome {
+    const entry = popFrom.pop();
+    if (entry === undefined) {
+      return { kind: "empty" };
+    }
+    const { op, hadEffect } = entry;
+    const target = op.kind === "insert" ? op.id : op.target;
+    if (!this.tree.hasIdentifier(target)) {
+      return { kind: "unavailable" };
+    }
+    const shape = hadEffect ? this.standardInverse(op) : this.repeatSameKind(op);
+    const id = this.mint();
+    const deletedBefore = this.tree.nodeByIdentifier(target)!.deleted;
+    let inv: Operation;
+    if (shape.kind === "delete") {
+      inv = { kind: "delete", id, target: shape.target };
+      this.applyDelete(inv);
+    } else {
+      inv = { kind: "undelete", id, target: shape.target };
+      this.applyUndelete(inv);
+    }
+    this.applied.add(serializeId(inv.id));
+    const deletedAfter = this.tree.nodeByIdentifier(target)?.deleted ?? deletedBefore;
+    pushTo.push({ op: inv, hadEffect: deletedBefore !== deletedAfter });
+    return { kind: "applied", operation: inv };
+  }
+
+  /**
+   * Engine Spec §9.1 UNDO(). Pops this replica's own most recent local operation and applies
+   * its structural inverse, keyed by NODE IDENTIFIER (never by re-deriving a position — the
+   * whole point of this mechanism, since a position-based undo would be wrong the instant any
+   * concurrent edit has landed near it in the meantime). FR-CE-11 holds by construction:
+   * {@link undoStack} only ever contains operations THIS replica minted (see its own doc
+   * comment), so an inverse can never name another user's operation. See {@link stepUndoRedo}
+   * for the shared mechanics and the `hadEffect` distinction.
+   */
+  undo(): UndoOutcome {
+    return this.stepUndoRedo(this.undoStack, this.redoStack);
+  }
+
+  /**
+   * Engine Spec §9.4 REDO(): re-applies the effect {@link undo} (or a prior `redo`) produced,
+   * pushing the popped entry back onto {@link undoStack} so a further `undo()` can re-revert
+   * it — a plain, symmetric round trip. See {@link stepUndoRedo} for the shared mechanics and
+   * the `hadEffect` distinction that keeps a known no-op a no-op through repeated cycles.
+   */
+  redo(): UndoOutcome {
+    return this.stepUndoRedo(this.redoStack, this.undoStack);
   }
 
   /**

@@ -49,7 +49,23 @@ export interface HarnessDeleteOperation {
   readonly target: HarnessIdentifier;
 }
 
-export type HarnessOperation = HarnessInsertOperation | HarnessDeleteOperation;
+/** Phase 36 (Engine Spec §9) — undo()/redo()'s own emitted inverse operation kind. */
+export interface HarnessUndeleteOperation {
+  readonly kind: "undelete";
+  readonly id: HarnessIdentifier;
+  readonly target: HarnessIdentifier;
+}
+
+export type HarnessOperation =
+  | HarnessInsertOperation
+  | HarnessDeleteOperation
+  | HarnessUndeleteOperation;
+
+/** Phase 36 (Engine Spec §9) — the discriminated result of undo()/redo(), on both HarnessEngine and HarnessSyncClient. */
+export type HarnessUndoOutcome =
+  | { readonly kind: "empty" }
+  | { readonly kind: "unavailable" }
+  | { readonly kind: "applied"; readonly operation: HarnessOperation };
 
 export interface HarnessEngine {
   text(): string;
@@ -66,6 +82,11 @@ export interface HarnessEngine {
   /** Phase 34's own IME-02/03 fixtures — full node list (in document order), for seeding a second, independent engine to the same starting content, and for relaying a real remote operation directly (no wire encoding needed, the same "two simulated clients, no real network" technique this project's own DUR-01/audit tests use). Phase 35's GRA-01/02 suite also diffs this list before/after a real `beforeinput` dispatch to recover exactly which operation(s) a real keystroke minted, since a real dispatch's own return value is swallowed inside `inputPipeline.ts`. */
   readonly nodes: readonly HarnessNode[];
   applyRemote(op: HarnessOperation): unknown;
+  /** Phase 36 (Engine Spec §9.1/§9.4). */
+  undo(): HarnessUndoOutcome;
+  redo(): HarnessUndoOutcome;
+  readonly canUndo: boolean;
+  readonly canRedo: boolean;
 }
 
 export interface HarnessSyncClient {
@@ -75,6 +96,14 @@ export interface HarnessSyncClient {
   seedForTesting(engine: HarnessEngine): void;
   localInsertText(visibleIndex: number, text: string): readonly HarnessInsertOperation[];
   localDelete(visibleIndex: number, count: number): unknown;
+  /** Phase 36 — mirrors HarnessEngine's own undo()/redo(), plus real wire transmission. */
+  undo(): HarnessUndoOutcome;
+  redo(): HarnessUndoOutcome;
+}
+
+export interface HarnessUndoRedoController {
+  scheduleUndo(): void;
+  scheduleRedo(): void;
 }
 
 export interface HarnessCaretSnapshot {
@@ -151,8 +180,12 @@ declare global {
           domWriter: HarnessDomWriter;
           sync: HarnessSyncClient;
           sentinel: HarnessMutationSentinel;
+          undoRedo: HarnessUndoRedoController;
         },
       ) => () => void;
+      /** Phase 36 (Test Plan UWIRE-02/UWIRE-03). */
+      UndoRedoController: new (deps: { sync: HarnessSyncClient }) => HarnessUndoRedoController;
+      attachUndoRedoKeydownFallback: (root: Element, controller: HarnessUndoRedoController) => () => void;
       visToDom: (index: readonly HarnessRenderRun[], root: Element, v: number) => { node: Node; offset: number };
       domToVis: (index: readonly HarnessRenderRun[], node: Node, offset: number) => number;
       PresenceOverlay: new (deps: {
@@ -167,6 +200,7 @@ declare global {
         sync: HarnessSyncClient;
         sentinel: HarnessMutationSentinel;
         root: Element;
+        undoRedo: HarnessUndoRedoController;
         watchdogMs?: number;
       }) => HarnessCompositionController;
       attachCompositionHandlers: (root: Element, controller: HarnessCompositionController) => () => void;

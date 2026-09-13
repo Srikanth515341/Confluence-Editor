@@ -1,4 +1,4 @@
-import type { LoadedEngineModule } from "./loadMutantEngine.js";
+import type { EngineLike, LoadedEngineModule } from "./loadMutantEngine.js";
 
 /**
  * A deliberately small, hand-picked subset of the adversarial (Phase 5)
@@ -182,19 +182,29 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
     assertEqual(receiver.stats().totalElements, 3, "structure after duplicate delivery");
   });
 
-  // Catches M9_delete_first_wins. Interleaving an undelete between the
-  // delete and a later re-delete (as ADV-21 does) does NOT distinguish
-  // this mutant: applyDelete's snapshot of "already deleted" is taken
-  // fresh each time, so a delete that arrives right after an undelete
-  // still correctly updates attribution either way. What actually
-  // exposes "first wins" is TWO deletes with no undelete between them,
-  // followed by an undelete whose id sits BETWEEN the two deletes'
-  // ids: correct attribution (causally-latest, the second delete) makes
-  // that undelete fail (it isn't the latest); "first wins" attribution
-  // (the first delete) makes it wrongly succeed.
+  // Catches M9_delete_first_wins. CORRECTED (Phase 36, 2026-09-13): the ORIGINAL version of
+  // this check minted BOTH deletes AND the undelete from the SAME shared replica, relying on a
+  // CAUSAL-ORDER comparison between the undelete's own id and node.deletedBy (an undelete
+  // "older than the causally-latest delete must be a no-op"). That was only ever a valid test
+  // of the Phase-3-era placeholder rule for Engine Spec §9.3/PRD OQ-3 — the REAL, now-specified
+  // Engine Spec §4.6 rule is a plain REPLICA-EQUALITY check ("if n.deletedBy.replica = op.by"),
+  // never a causal-order comparison against the undelete's own identifier. Hand-traced during
+  // Phase 36: under the real rule, the original single-replica construction would no longer
+  // discriminate this mutant at all (an undelete from the SAME replica that authored BOTH
+  // deletes always matches `deletedBy.r`, whichever delete's attribution — first or
+  // latest — happens to be current, since both deletes share that one replica).
+  //
+  // Corrected to use two GENUINELY DIFFERENT replicas for the two competing deletes, matching
+  // this project's own real per-user-undo model (an Undelete is only ever minted by the SAME
+  // replica invoking undo of ITS OWN delete — Engine Spec §9.1's `by: replicaId`). What now
+  // discriminates the mutant: an undelete from the FIRST deleter's own replica (X) must FAIL
+  // under CORRECT attribution (the causally-latest delete is Y's, a different replica) but
+  // WRONGLY SUCCEED under "first wins" (which keeps X's own attribution regardless of Y's later
+  // delete) — see `tests/regression/R0014`'s CLAUDE.md cross-reference and the identical fix
+  // applied to `adversarial.test.ts`'s own ADV-21 for the full account of this correction.
   record(
     results,
-    "deletedBy is the causally-latest delete, not the first, across two deletes with no undelete between them",
+    "deletedBy is the causally-latest delete's OWN REPLICA, not the first, across two deletes from different replicas",
     () => {
       const seed = new Engine(100);
       seed.localInsert(0, cp("A"));
@@ -202,29 +212,38 @@ export function runTargetedChecks(mod: LoadedEngineModule): CheckResult[] {
       seed.localInsert(2, cp("C"));
       const bId = seed.nodes[1]!.id;
 
-      const delId1 = seed.mint(); // first delete
-      const undelId = seed.mint(); // causally BETWEEN the two deletes
-      const delId2 = seed.mint(); // second delete — causally latest of the two
-
-      const engine = new Engine(1);
-      for (const node of seed.nodes) {
-        const op = {
-          kind: "insert",
-          id: node.id,
-          value: node.value,
-          parent: node.parent,
-          side: node.side,
-          bind: node.bind,
-        };
-        engine.applyRemote(op);
+      function relayInsertsInto(engine: EngineLike): void {
+        for (const node of seed.nodes) {
+          engine.applyRemote({
+            kind: "insert",
+            id: node.id,
+            value: node.value,
+            parent: node.parent,
+            side: node.side,
+            bind: node.bind,
+          });
+        }
       }
-      engine.applyRemote({ kind: "delete", id: delId1, target: bId });
-      engine.applyRemote({ kind: "delete", id: delId2, target: bId }); // no undelete between the two deletes
-      engine.applyRemote({ kind: "undelete", id: undelId, target: bId }); // older than delId2 — must fail
+
+      const engineX = new Engine(10); // X — deletes FIRST (in wall-clock terms), concurrently with Y
+      const engineY = new Engine(20); // Y — deletes SECOND; a counter tie is broken by replica id (20 > 10), so Y's delete is causally LATER
+      relayInsertsInto(engineX);
+      relayInsertsInto(engineY);
+      const delOpX = engineX.localDelete(1, 1)[0]!;
+      const delOpY = engineY.localDelete(1, 1)[0]!;
+
+      const receiver = new Engine(1);
+      relayInsertsInto(receiver);
+      receiver.applyRemote(delOpX); // first delete applied
+      receiver.applyRemote(delOpY); // second, causally-later delete applied — correct engine: deletedBy becomes Y's
+      // An undelete FROM X (the FIRST deleter's own replica) must be a NO-OP under correct
+      // attribution (deletedBy is Y's, not X's) — but would WRONGLY SUCCEED under M9's "first
+      // wins" mutation (which keeps deletedBy = X's own delete regardless of Y's later one).
+      receiver.applyRemote({ kind: "undelete", id: { c: 9999, r: 10 }, target: bId });
       assertEqual(
-        engine.text(),
+        receiver.text(),
         "AC",
-        "an undelete older than the causally-latest delete must be a no-op",
+        "an undelete from the replica whose delete was NOT the causally-latest one must be a no-op",
       );
     },
   );

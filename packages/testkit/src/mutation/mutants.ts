@@ -105,7 +105,7 @@ export const MUTANTS: readonly MutantDefinition[] = [
       "  }\n" +
       "\n" +
       "  /**\n" +
-      "   * Structural inverse of applyDelete",
+      "   * APPLY-UNDELETE (Engine Spec §4.6), exact pseudocode:",
     replace:
       "    const newDeletedBy =\n" +
       "      node.deletedBy === null || compareIds(op.id, node.deletedBy) > 0 ? op.id : node.deletedBy;\n" +
@@ -114,7 +114,7 @@ export const MUTANTS: readonly MutantDefinition[] = [
       "  }\n" +
       "\n" +
       "  /**\n" +
-      "   * Structural inverse of applyDelete",
+      "   * APPLY-UNDELETE (Engine Spec §4.6), exact pseudocode:",
   },
   {
     id: "M7_no_readiness_check",

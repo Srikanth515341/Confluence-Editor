@@ -14,6 +14,13 @@ export {
   attachCompositionHandlers,
   CompositionController,
 } from "../../src/input/compositionController.js";
+// Phase 36 (Test Plan UWIRE-02/UWIRE-03) — real-browser undo/redo wiring needs the SAME
+// `UndoRedoController`/`attachUndoRedoKeydownFallback` pair `EditorView.tsx` composes, to prove
+// the actual dedup guard against real, simultaneous `beforeinput`/`keydown` browser dispatch.
+export {
+  attachUndoRedoKeydownFallback,
+  UndoRedoController,
+} from "../../src/input/undoRedoController.js";
 export { MutationSentinel } from "../../src/sentinel/mutationSentinel.js";
 // Phase 34 (Test Plan IME-02/IME-03) — the real-browser IME suite wires the SAME
 // capture/mount/restore reaction `EditorView.tsx`'s own `onRemoteOpsApplied` handler uses

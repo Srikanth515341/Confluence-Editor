@@ -5,6 +5,7 @@ import {
   type Identifier,
   type InsertOperation,
   type Operation,
+  type UndoOutcome,
 } from "@collab-editor/engine";
 import {
   Channel,
@@ -790,6 +791,50 @@ export class SyncClient {
       this.sendFrame(encodeFrame(msg));
     }
     return ops;
+  }
+
+  /**
+   * Phase 36 (Engine Spec §9.1 UNDO()) — reverts this replica's own most recent local operation
+   * still on `Engine`'s private undo stack. FR-CE-11 ("undo reverts only the invoking user's own
+   * operations") holds by construction all the way down at the engine level — see
+   * `Engine.undo`'s own doc comment. Same write-access/offline-window gating as
+   * {@link localInsert}/{@link localDelete}/{@link localInsertText}: an undo IS a new local
+   * mutation, and must go through the exact same durable-queue transmission path (Test Plan
+   * UNDO-10 — "the inverse operations must go through the DURABLE QUEUE exactly like ordinary
+   * operations... treating undo as local state rollback... loses undo entirely on
+   * reconnection") — `sendOperation` below is the SAME helper `localInsert`/`localDelete` use.
+   *
+   * Returns the engine's own {@link UndoOutcome} unchanged: `{kind: "empty"}` when there was
+   * nothing to undo (a normal state a caller uses to disable a toolbar affordance, never an
+   * error); `{kind: "unavailable"}` when the target has been garbage-collected past the undo
+   * horizon (Engine Spec §9.5, Test Plan UNDO-11 — "no error; undo is UNAVAILABLE, UI says so
+   * rather than failing silently"); `{kind: "applied", operation}` on success.
+   */
+  undo(): UndoOutcome {
+    const engine = this.requireEngine();
+    this.assertHasWriteAccess();
+    this.assertOfflineWindowNotExceeded();
+    const outcome = engine.undo();
+    if (outcome.kind === "applied") {
+      this.offlineWindow.noteOperationAccepted();
+      this.refreshOfflineWindowStatus();
+      this.sendOperation(outcome.operation);
+    }
+    return outcome;
+  }
+
+  /** Phase 36 (Engine Spec §9.4 REDO()) — see {@link undo}'s own doc comment; identical gating and wire treatment, mirrored for the opposite direction. */
+  redo(): UndoOutcome {
+    const engine = this.requireEngine();
+    this.assertHasWriteAccess();
+    this.assertOfflineWindowNotExceeded();
+    const outcome = engine.redo();
+    if (outcome.kind === "applied") {
+      this.offlineWindow.noteOperationAccepted();
+      this.refreshOfflineWindowStatus();
+      this.sendOperation(outcome.operation);
+    }
+    return outcome;
   }
 
   /**

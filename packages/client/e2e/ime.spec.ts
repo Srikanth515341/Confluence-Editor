@@ -54,11 +54,12 @@ async function setupHarness(page: Page, initialText = "", watchdogMs?: number): 
       });
       sentinel.applyPatches(() => domWriter.mount(editor, text));
       sentinel.start();
-      window.InputHarness.attachInputPipeline(editor, { domWriter, sync, sentinel });
+      const undoRedo = new window.InputHarness.UndoRedoController({ sync });
+      window.InputHarness.attachInputPipeline(editor, { domWriter, sync, sentinel, undoRedo });
       const composition = new window.InputHarness.CompositionController(
         watchdog === undefined
-          ? { domWriter, sync, sentinel, root: editor }
-          : { domWriter, sync, sentinel, root: editor, watchdogMs: watchdog },
+          ? { domWriter, sync, sentinel, root: editor, undoRedo }
+          : { domWriter, sync, sentinel, root: editor, undoRedo, watchdogMs: watchdog },
       );
       window.InputHarness.attachCompositionHandlers(editor, composition);
       window.__imeHarness = { editor, domWriter, sync, sentinel, composition };

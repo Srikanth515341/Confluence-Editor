@@ -38,6 +38,7 @@ interface HarnessState {
   readonly domWriter: import("./inputHarnessGlobal.js").HarnessDomWriter;
   readonly sync: import("./inputHarnessGlobal.js").HarnessSyncClient;
   readonly sentinel: import("./inputHarnessGlobal.js").HarnessMutationSentinel;
+  readonly undoRedo: import("./inputHarnessGlobal.js").HarnessUndoRedoController;
 }
 
 declare global {
@@ -60,8 +61,9 @@ async function setupHarness(page: import("@playwright/test").Page): Promise<void
     });
     sentinel.applyPatches(() => domWriter.mount(editor, ""));
     sentinel.start();
-    window.InputHarness.attachInputPipeline(editor, { domWriter, sync, sentinel });
-    window.__harness = { editor, domWriter, sync, sentinel };
+    const undoRedo = new window.InputHarness.UndoRedoController({ sync });
+    window.InputHarness.attachInputPipeline(editor, { domWriter, sync, sentinel, undoRedo });
+    window.__harness = { editor, domWriter, sync, sentinel, undoRedo };
   });
 }
 

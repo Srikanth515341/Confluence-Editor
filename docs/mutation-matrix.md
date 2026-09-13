@@ -1,6 +1,6 @@
 # Mutation matrix (Test Plan §2.8)
 
-Generated: 2026-09-05T15:06:29.694Z
+Generated: 2026-09-13T09:01:00.966Z
 
 Ten mutants (patches supplied verbatim from Test Plan §2.8), each string-patched into an isolated, freshly-transpiled copy of `packages/engine/src` — never the real source on disk — then run against four detection mechanisms: the convergence fuzzer with invariant assertions OFF (pure text/structure/pendingCount agreement — what existed since Phase 2), the same fuzzer with invariant assertions ON (Phase 4's `assertInvariants`, checked after every mutating call), a hand-picked subset of the Phase 5 adversarial suite re-targeted at the mutant engine, and a reduced-count reimplementation of PROP-1/PROP-2. See `packages/testkit/src/mutation/` for the harness.
 
@@ -12,7 +12,7 @@ Ten mutants (patches supplied verbatim from Test Plan §2.8), each string-patche
 | `M6_physical_delete` | I5 (tombstone retention) | killed (seed 0, 1 trial(s) run) | killed (seed 0, 1 trial(s) run) | survived | survived | **KILLED** |
 | `M7_no_readiness_check` | I4 (origin presence at integration time) — Engine Spec §4.2 | killed (seed 0, 1 trial(s) run) | killed (seed 0, 1 trial(s) run) | killed — readiness: an insert whose parent is missing must buffer, not apply; ADV-09-style: pending drains to a fixpoint across a 3-deep causal chain | survived | **KILLED** |
 | `M8_no_idempotence` | I1 (identifier uniqueness) — Engine Spec §6.3 | killed (seed 0, 1 trial(s) run) | killed (seed 0, 1 trial(s) run) | killed — ADV-08: duplicate delivery of the same insert is a no-op | killed — PROP-2 idempotence (300 trials) | **KILLED** |
-| `M9_delete_first_wins` | I7 (deletion attribution monotonicity) — Engine Spec §4.5 line 3 | survived (1000 trials) | survived (1000 trials) | killed — deletedBy is the causally-latest delete, not the first, across two deletes with no undelete between them | survived | **KILLED** |
+| `M9_delete_first_wins` | I7 (deletion attribution monotonicity) — Engine Spec §4.5 line 3 | survived (1000 trials) | survived (1000 trials) | killed — deletedBy is the causally-latest delete's OWN REPLICA, not the first, across two deletes from different replicas | survived | **KILLED** |
 | `M10_no_drain` | I9 (pending buffer drains at quiescence) — Engine Spec §4.2 Rule 4.2 | killed (seed 0, 1 trial(s) run) | killed (seed 0, 1 trial(s) run) | survived | survived | **KILLED** |
 
 ## Mutant descriptions

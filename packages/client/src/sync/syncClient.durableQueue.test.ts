@@ -266,6 +266,79 @@ describe("SyncClient — durable queue integration (Phase 22, DUR-07)", () => {
     expect(clientB.engine?.text()).toBe(""); // the un-flushed keystroke is genuinely gone, not silently duplicated or fabricated
     expect(clientB.unackedCount).toBe(0); // and the UI-facing count agrees — never overstating
   });
+
+  it("UNDO-10 (Phase 36, offline undo): 20 offline-typed characters, 10 undone while STILL offline, survive a simulated crash — the inverse deletes go through the SAME durable queue as ordinary operations, not a local-only rollback", async () => {
+    // Test Plan UNDO-10's own explicit warning: "an implementation treating undo as local state
+    // rollback passes every ONLINE test and loses undo entirely on reconnection." This test
+    // exists specifically to catch that class of bug — `SyncClient.undo()` reuses the exact
+    // same `sendOperation()` helper (durable-queue add, then wire send) that `localInsert` does,
+    // so there is no separate "local-only" code path for undo to have silently taken instead.
+    const clientA = makeClient();
+    clientA.connect();
+    await waitForSocket(sockets, 0);
+    const wsA = sockets[0]!;
+    wsA.triggerOpen();
+    wsA.triggerMessage(welcomeFrame(1));
+    wsA.triggerMessage(snapshotFrame(0));
+    wsA.triggerMessage(alreadyHaveFrame());
+    await Promise.resolve();
+    expect(clientA.state.value).toBe("synced");
+
+    wsA.close(1006, "severed at the proxy");
+    expect(clientA.state.value).toBe("reconnecting");
+
+    for (let i = 0; i < 20; i++) {
+      clientA.localInsert(i, 0x61 + i); // 20 distinct offline characters
+    }
+    expect(clientA.engine?.text()).toHaveLength(20);
+
+    // Undo the last 10 — WHILE STILL OFFLINE (Phase 22's relaxed requireEngine() allows minting
+    // during "reconnecting"/"offline", and undo/redo go through the identical gate).
+    for (let i = 0; i < 10; i++) {
+      const outcome = clientA.undo();
+      expect(outcome.kind).toBe("applied");
+    }
+    expect(clientA.engine?.text()).toHaveLength(10); // 20 inserted, 10 undone -- 10 remain locally
+    expect(clientA.unackedCount).toBe(30); // 20 inserts + 10 inverse deletes, ALL still unacked
+
+    await clientA["durableQueue"]?.flush();
+
+    const socketsBefore = sockets.length;
+    const clientB = makeClient();
+    clientB.connect();
+    await waitForSocket(sockets, socketsBefore);
+    const wsB = sockets[sockets.length - 1]!;
+    wsB.triggerOpen();
+
+    // ASSERT all 20 inserts AND 10 inverse deletes were durably transmitted — not just the
+    // inserts (which an implementation treating undo as local-only rollback would still get
+    // right, coincidentally) and not just net "10 characters" (which would prove nothing about
+    // whether the DELETES themselves ever reached the durable queue at all).
+    const hello = lastHello(wsB);
+    expect(hello.unacked).toHaveLength(30);
+
+    wsB.triggerMessage(welcomeFrame(2));
+    wsB.triggerMessage(snapshotFrame(0));
+    wsB.triggerMessage(alreadyHaveFrame());
+    await Promise.resolve();
+
+    // ASSERT the final document has exactly 10 characters — the 10 that were never undone.
+    expect(clientB.engine?.text()).toHaveLength(10);
+    const expected = Array.from({ length: 10 }, (_, i) => String.fromCharCode(0x61 + i)).join("");
+    expect(clientB.engine?.text()).toBe(expected);
+
+    // ASSERT all 30 reconciled operations (20 inserts + 10 deletes) were genuinely resent on
+    // reconnect — the same `resentCount` signal DUR-07's own test above checks, confirming a
+    // real peer (which would receive these exact 30 operations via the server's ordinary
+    // broadcast relay) has everything it needs to converge to the identical 10-character result.
+    const syncComplete = decodeControlFrame(wsB.sent[wsB.sent.length - 1]!, {
+      direction: "clientOrigin",
+    });
+    expect(syncComplete.kind).toBe("syncComplete");
+    if (syncComplete.kind === "syncComplete") {
+      expect(syncComplete.resentCount).toBe(30);
+    }
+  });
 });
 
 describe("SyncClient — IndexedDB unavailable (Phase 22, DUR-09)", () => {

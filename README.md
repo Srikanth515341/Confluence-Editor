@@ -12,6 +12,29 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 36 — Per-user undo and redo.** Ctrl+Z now reverts the invoking
+user's own last change and nobody else's, with a defined, race-free
+outcome when another user has since deleted the same content — implemented
+as inverse operations keyed by node identifier, never state rollback.
+Correcting `applyUndelete` to the real, now-specified resurrection rule
+(a replica-equality check, not a causal-order comparison) surfaced a real
+conflict in two pre-existing tests that had encoded the earlier
+placeholder's semantics, both corrected. This phase's own redo-symmetry
+test then surfaced a genuinely subtle bug of its own: undo's "harmless"
+idempotent delete can silently hand tombstone ownership to the undoer,
+letting a later redo resurrect content someone else legitimately deleted
+— found, hand-traced, and fixed the same session, with a permanent
+regression fixture. Client-side, undo/redo go through the exact same
+durable-queue transmission path as ordinary edits (so they survive an
+offline crash-and-restart), and a shared microtask guard collapses
+whichever combination of `beforeinput`/`keydown` events a given browser
+fires for one keystroke into exactly one action. Verified against 11
+engine-level scenarios, 18 real-browser runs across Chromium/Firefox/
+WebKit, and a real crash-and-restart durable-queue test. See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 36 entry for the full account,
+including both hand-traced corrections and a disclosed documentation gap
+(Phases 34-35 were never given their own CLAUDE.md entries).
+
 **Phase 33 — Presence rendering (Milestone M4, tag `v0.4.0-m4`).** Other
 participants' carets and selections now render, with stable per-user
 colours and graceful degradation as the room fills up. Colour is a pure
@@ -627,6 +650,7 @@ runs this at full scale on a schedule.
 | Presence (cursors/avatars for other users) | ✅ **Phase 31** (PRESENCE_UPDATE/JOIN/LEAVE/ROSTER, structurally isolated from the engine/persistence layer; 20/s cap enforced 3 independent ways) |
 | Cursor transform under remote edits        | ✅ **Phase 32** (`Engine.resolveCaret`, corrected for the Fugue tree engine; CaretTracker; CUR-01..05 all passing, incl. 3-replica determinism and a 600-sample zero-drift proof) — closes Test Plan blocker B19 |
 | Presence rendering (Milestone M4)          | ✅ **Phase 33** (real overlay layer, stable per-user colour via a pure function of the real authenticated user id, 3 density tiers; PRES-02/03/06/07 all passing, incl. a real-Postgres reconnect proof and 9/9 across real Chromium/Firefox/WebKit) |
+| Per-user undo/redo                         | ✅ **Phase 36** (Engine Spec §9/§4.6; inverse operations keyed by node identifier; UNDO-01..11 + UWIRE-02/03 all passing; found & fixed a real redo-resurrection bug, permanent fixture R0014) |
 | Version history                            | ⏳ not started                                                                                             |
 
 ## License

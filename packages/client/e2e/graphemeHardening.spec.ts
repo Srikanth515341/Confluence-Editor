@@ -105,6 +105,7 @@ async function setupDualHarness(
           domWriter: h.domWriter,
           sync: h.sync,
           sentinel: h.sentinel,
+          undoRedo: new window.InputHarness.UndoRedoController({ sync: h.sync }),
         });
       }
 

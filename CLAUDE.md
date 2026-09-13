@@ -6821,6 +6821,206 @@ check:purity` was ALSO silently broken by two comments (one in
   report's own "How to record the demo GIF" section for the exact
   commands/URL/steps.
 
+- **Phase 36 — Per-user undo and redo** (Engine Spec §9 entire, §4.6
+  APPLY-UNDELETE; API Spec §7.8; PRD FR-CE-11, FR-CE-12, OQ-3; Test Plan §6
+  UNDO-01..11, UWIRE-02/03). Ctrl+Z reverts the invoking user's own last
+  change and nobody else's, with a defined, race-free outcome when another
+  user has since deleted the same content. Implemented as inverse
+  operations keyed by node identifier (never state rollback, never history
+  rewriting) — `Engine` gained a private `undoStack`/`redoStack` (locally
+  originated operations only, in generation order) and public
+  `undo()`/`redo()` methods returning a new `UndoOutcome` discriminated
+  union (`"empty"` | `"unavailable"` | `"applied"`).
+
+  **APPLY-UNDELETE was REWRITTEN, not merely extended** — Phase 3's own
+  placeholder (a general causally-latest-id comparison between the
+  undelete's own identifier and `node.deletedBy`, "deliberately the
+  minimal shape... full resurrection semantics are Phase 36") is REPLACED
+  by the exact, now-supplied §4.6 rule: a plain REPLICA-EQUALITY check —
+  `node.deletedBy !== null && node.deletedBy.r === op.id.r` — with the
+  required verbatim comment in the code above it. This is a materially
+  different rule (equality of WHO currently holds attribution vs. the
+  undoing replica, never a counter/causal-order comparison against the
+  undelete's own id), and correcting it surfaced a real, load-bearing
+  conflict with TWO pre-existing tests that had encoded the OLD
+  placeholder's semantics:
+  - `packages/testkit/src/adversarial/adversarial.test.ts`'s ADV-21 (Phase
+    5, built against the then-open PRD OQ-3) minted all three operations
+    (both deletes and the undelete) from ONE shared replica — hand-traced
+    and confirmed it would have passed for the WRONG reason under the real
+    rule (resurrecting on one delivery order). Corrected, per the user's
+    own explicit confirmation, to a genuine two-different-replica
+    construction (X deletes+undoes on one replica, Y's concurrent delete
+    on a genuinely different one) using the REAL `Engine.undo()` API
+    directly rather than hand-built raw operations — doubling as a
+    faithful end-to-end exercise of the new public method. Re-verified as
+    a real discriminator: temporarily reverting `applyUndelete` to the old
+    causal-order rule makes this test fail exactly as predicted
+    (wrongly resurrects to `"ABC"`).
+  - `packages/testkit/src/mutation/targetedChecks.ts`'s `M9_delete_
+    first_wins` targeted check had the identical single-replica flaw.
+    Corrected the same way (distinct replica ids for the two competing
+    deletes); re-ran the full `pnpm test:mutation` matrix — still **8 of 8
+    mutants killed**, M9 now cited as "deletedBy is the causally-latest
+    delete's OWN REPLICA, not the first, across two deletes from different
+    replicas." One unrelated, purely mechanical fix was needed in the same
+    file: `M6_physical_delete`'s own `find`/`replace` anchor text still
+    matched the RETIRED pre-Phase-36 doc comment trailing `applyDelete`
+    (`"Structural inverse of applyDelete"`), which the new, much longer
+    APPLY-UNDELETE doc comment replaced — updated to anchor on the new
+    comment's own opening line instead.
+
+  **A second, genuinely subtle correctness finding, found by this phase's
+  own UNDO-07 (redo-symmetry) test — not anticipated, hand-traced and
+  fixed the same session, permanent regression fixture
+  `tests/regression/R0014`**: undo of a LOCAL insert already deleted by a
+  peer (UNDO-06/FR-CE-12) mints an "idempotent" Delete exactly as §9.2
+  specifies ("possibly advances deletedBy... THE DOCUMENT IS UNCHANGED")
+  — but `applyDelete`'s own correct, necessary max-wins attribution logic
+  (used identically for every ordinary concurrent delete) silently
+  reassigns `deletedBy` to the UNDOING replica as a side effect of that
+  "harmless" idempotent delete, since a freshly-minted identifier always
+  exceeds every counter already observed. A LATER `redo()` of that same
+  undo then mints an Undelete which satisfies §4.6's replica-equality
+  check against THAT reassigned attribution — resurrecting content a
+  third party legitimately, independently deleted, with no fault
+  injection, no reconnection, and no GC/undo-horizon interaction required.
+  A direct, silent violation of OQ-3's own stated guarantee. Given the
+  user's own explicit reasoning that weakening the test to accept this
+  would mean "documenting a real hole in OQ-3's guarantee as acceptable
+  behavior" — the fix was implemented, not the test loosened.
+
+  **The fix**: `undo()`/`redo()` now track, per stack entry
+  (`{op, hadEffect}`), whether that entry's own application actually
+  changed the target's visible (`deleted`) state — captured via a
+  before/after comparison at apply time, not inferred from the
+  operation's KIND. Reversing an entry with `hadEffect: true` uses the
+  standard §9.1/§9.4 kind-based inverse mapping (unchanged, still fully
+  subject to the real §4.6 OQ-3 check for legitimate cases). Reversing an
+  entry with `hadEffect: false` instead REPEATS the same operation kind
+  (delete→delete, undelete→undelete) rather than inverting it — this can
+  never mint the "dangerous" opposite-kind operation that could newly
+  succeed due to attribution drift, so a known no-op faithfully stays a
+  no-op through arbitrarily many further undo/redo cycles of the same
+  entry. `undo()` and `redo()` are now two one-line callers of a single
+  shared `stepUndoRedo(popFrom, pushTo)` — exact mirror images differing
+  only in which pair of stacks plays which role. Hand-traced against all
+  of UNDO-01/03/04/05/09 before implementation to confirm this is
+  ADDITIVE PRECISION, not a behavior change, for every already-correct
+  case (`hadEffect` is trivially `true` for every transition those cases
+  exercise; UNDO-04's own OQ-3 no-op branch was never vulnerable in the
+  first place, since `applyUndelete`'s no-op branch — unlike
+  `applyDelete`'s — never mutates `deletedBy` at all). Verified: the new
+  regression test (`packages/engine/src/regressionR0014.test.ts`, 5
+  repeated undo/redo cycles of the same entry, all staying a no-op) fails
+  exactly as predicted when the fix is temporarily reverted, then passes
+  clean once restored.
+
+  **§9.5/UNDO-11 (undo horizon)**: `undo()`/`redo()` check
+  `tree.hasIdentifier(target)` BEFORE attempting anything — if the target
+  has been physically removed by GC (Phase 21) past the undo horizon,
+  both report `{kind: "unavailable"}` rather than letting the underlying
+  `applyDelete`/`applyUndelete`'s own "target is not present" throw
+  escape — "no error; undo is UNAVAILABLE, UI says so rather than failing
+  silently," verified at both t=4min (inside the horizon, succeeds) and
+  t=6min (GC has already collected it, reports unavailable) via a real
+  `collect()` call, not a mocked clock.
+
+  **Client wiring**: `SyncClient.undo()`/`redo()` mirror
+  `localInsert`/`localDelete`'s own exact gating
+  (`assertHasWriteAccess`/`assertOfflineWindowNotExceeded`) and reuse the
+  SAME `sendOperation()` helper (durable-queue add, then wire send) —
+  UNDO-10's own explicit warning ("an implementation treating undo as
+  local state rollback passes every ONLINE test and loses undo entirely
+  on reconnection") is what this reuse exists to satisfy, verified
+  directly: 20 offline-typed characters, 10 undone while STILL offline,
+  survive a simulated crash-and-restart with all 30 operations (20
+  inserts + 10 inverse deletes) reported in the next client's
+  `HELLO.unacked` — confirmed as a genuine discriminator by temporarily
+  removing undo's own `sendOperation` call and observing the test fail
+  (18 vs. expected 30).
+
+  **`packages/client/src/input/undoRedoController.ts`** (new) —
+  `UndoRedoController`'s microtask-based dedup guard is what UWIRE-02
+  ("a browser firing BOTH historyUndo and keydown performs EXACTLY ONE
+  undo") actually requires: `beforeinput`'s `historyUndo`/`historyRedo`
+  cases (now wired for real in `inputPipeline.ts`, replacing the Phase
+  12-era `TODO(Phase 36)` stub) and a NEW `keydown` fallback
+  (`attachUndoRedoKeydownFallback`, attached alongside `attachInputPipeline`
+  on the same root, the same architectural split
+  `CompositionController`/`attachCompositionHandlers` already established
+  for IME) both schedule through the SAME guarded `scheduleUndo`/
+  `scheduleRedo` — whichever of the two event sources a given browser
+  fires first schedules the actual call on the next microtask; a second
+  trigger in the same synchronous turn is a no-op. Ctrl+Z/Cmd+Z (undo),
+  Ctrl+Shift+Z/Cmd+Shift+Z (redo), and Scope-IN's own explicit "Ctrl+Y
+  mapped to redo on Windows" (deliberately NOT extended to Cmd+Y on Mac).
+  A real, load-bearing gap was found and fixed the same day before this
+  ever shipped: `scheduleUndo`/`scheduleRedo`'s `queueMicrotask` callback
+  called `sync.undo()`/`redo()` with NO error handling — a VIEWER
+  pressing Ctrl+Z, or a client past the offline-window cap, would have
+  thrown `NoWriteAccessError`/`OfflineWindowExceededError` as an
+  unhandled exception inside a bare microtask callback, unlike
+  `inputPipeline.ts`'s own `insertTextAt`/`deleteRangeAt`, which already
+  catch-and-ignore these same two errors. Fixed via a shared
+  `runIgnoringGuardErrors` helper (exported for direct, synchronous unit
+  testing rather than exercising a real uncaught microtask throw).
+
+  **DoD verification**: UNDO-01 through UNDO-11 (all engine-level, no DOM
+  needed — these are operation-semantics/convergence claims, provable
+  with 2-3 real `Engine` instances relaying via `applyRemote`, the same
+  "engine-level companion" layering this project has used since Phase 5)
+  live in a new `packages/engine/src/engine.test.ts` describe block, 11
+  tests, INCLUDING UNDO-07's own redo-symmetry follow-up for
+  UNDO-01/03/04/06 and UNDO-05's full 6-permutation determinism check on
+  an uninvolved third replica. UWIRE-02/03 — genuinely real-browser
+  claims (does THIS browser actually dispatch both event sources for one
+  keystroke; does the browser's OWN native undo manager find nothing to
+  undo) — live in a new `packages/client/e2e/undoRedo.spec.ts`, 6 tests
+  × 3 real browsers = 18 real browser-runs, including a "deliberate
+  double-fire simulation" test that drives both a real
+  `beforeinput(historyUndo)` and a real `keydown(Ctrl+Z)` synchronously
+  in one tick regardless of whether this specific browser/OS combination
+  happens to double-fire naturally. `packages/client/src/input/
+  undoRedoController.test.ts` (new, 14 tests) proves the guard/keydown-
+  mapping/guard-error-handling LOGIC deterministically in jsdom.
+  `packages/client/src/sync/syncClient.durableQueue.test.ts` gained
+  UNDO-10's own dedicated test. Full regression: `pnpm typecheck` clean
+  across all 6 packages; default `pnpm test` — **672 passed, 2 disclosed
+  skips, 70 files** (up from 656/69 before this phase); `pnpm
+  test:properties` (6/6 suites, unaffected — the fuzz/property suites
+  never generate Undelete operations at all, so this phase's own
+  `applyUndelete` rewrite is genuinely unexercised by them, confirmed via
+  a direct grep before deciding NOT to spend a 70,000-seed convergence
+  run on a change it cannot observe); `pnpm test:mutation` (8/8 killed,
+  unchanged); the full 3-browser Playwright suite, 162 passed, 3
+  disclosed skips (2 pre-existing WebKit `DataTransfer` skips from Phase
+  12, 1 Chromium-only `deleteCompositionText` skip from Phase 35).
+
+  **What is deliberately NOT built this phase**: any UI for
+  enabling/disabling undo/redo toolbar buttons (Engine/SyncClient expose
+  `canUndo`/`canRedo` — the same "build the real capability now, a future
+  UI phase wires it up" precedent this project has followed since Phase
+  24's `offlineWindowStatus`); Rule 7.2's own interaction with undo (an
+  undo/redo-generated operation that arrives to find its OWN target
+  already garbage-collected is caught by `undo()`/`redo()`'s own
+  `hasIdentifier` check locally, but a REMOTELY-received undo/redo
+  operation whose target was collected still relies on the EXISTING
+  Phase 24 `offlineWindowScheduler.ts` sweep, unchanged by this phase).
+
+  **A documentation gap surfaced while starting this phase, disclosed
+  rather than silently backfilled**: this file has no completed-phase
+  entries for Phase 34 (IME composition) or Phase 35 (grapheme cluster
+  hardening and browser edge cases) — both phases were implemented and
+  merged (confirmed via `git log`: `0164b3d feat(client): implement IME
+  composition handling`, and this branch's own parent history includes
+  Phase 35's merge), but their own end-of-phase CLAUDE.md text was
+  apparently never actually applied to this file. Not backfilled as part
+  of this phase (out of this phase's own stated scope, and risks
+  inaccuracy if reconstructed from summary alone rather than the
+  original session's full detail) — flagged here so a future session
+  doesn't mistake the gap for those phases never having happened.
+
 ## ✅ PHASE 30 UPDATE (2026-09-11) — the disconnect trigger was empirically dead code, and the offline-window sweep had a real activation gap; both fixed and verified
 
 This entry documents a real, load-bearing investigation that happened AFTER
@@ -8223,6 +8423,44 @@ is a Phase 32 finding, unrelated to Phase 25's own tag readiness.
 
 ## Current phase in progress
 
+**Phase 36 (Per-user undo and redo) — COMPLETE as of 2026-09-13.** Ctrl+Z
+now reverts the invoking user's own last change and nobody else's, with a
+defined, race-free outcome when another user has since deleted the same
+content (Engine Spec §9, §4.6; PRD FR-CE-11/FR-CE-12/OQ-3). `Engine`
+gained `undo()`/`redo()` (inverse operations keyed by node identifier,
+never state rollback) and a rewritten `applyUndelete` implementing the
+EXACT, now-specified §4.6 replica-equality rule — replacing Phase 3's own
+placeholder, which turned out to have been silently encoded into two
+pre-existing tests (`adversarial.test.ts`'s ADV-21, and a mutation-matrix
+targeted check for `M9_delete_first_wins`), both corrected this phase with
+the user's explicit confirmation. This phase's own UNDO-07 (redo-symmetry)
+test surfaced a genuinely subtle, real correctness bug — undo's own
+"idempotent" Delete (§9.2's own sanctioned "possibly advances deletedBy")
+silently reassigns tombstone attribution to the undoing replica, letting a
+LATER redo resurrect content a third party legitimately deleted — fixed by
+tracking, per undo/redo stack entry, whether that entry's own application
+actually changed visible state, so a known no-op faithfully stays a no-op
+through repeated cycles (permanent regression fixture `tests/regression/
+R0014`). Client-side, `SyncClient.undo()`/`redo()` reuse the exact same
+durable-queue transmission path as ordinary edits (UNDO-10's own explicit
+warning against treating undo as local-only rollback), and a new
+`UndoRedoController` provides the microtask-guarded dedup UWIRE-02
+requires across both `beforeinput(historyUndo/historyRedo)` and a new
+`keydown` fallback (Ctrl+Z/Cmd+Z, Ctrl+Shift+Z/Cmd+Shift+Z, and Scope-IN's
+own explicit Ctrl+Y-on-Windows) — a real gap in its own error handling
+(an unhandled `NoWriteAccessError`/`OfflineWindowExceededError` inside a
+bare microtask callback) was found and fixed the same day, before ever
+shipping. See the "Phase 36" bullet in the Completed Phases list above for
+the full account, including the exact hand-traces for both corrections and
+the real, measured discrimination checks (each fix's own test confirmed to
+actually fail when the fix is temporarily reverted). No open item from
+this phase blocks anything — the next phase to pick up is whichever one is
+next in the Implementation Plan. A documentation gap was also found and
+disclosed (not fixed, out of this phase's own scope): this file has no
+completed-phase entries for Phase 34 (IME composition) or Phase 35
+(grapheme cluster hardening) despite both being merged — see that same
+bullet's own final paragraph.
+
 **Phase 33 (Presence rendering) — COMPLETE as of 2026-09-12. Milestone
 M4, tag `v0.4.0-m4` on merge.** Other participants' carets and
 selections now render, with stable per-user colours and graceful
@@ -8567,8 +8805,14 @@ gap Phase 27's own account already noted for `retryAfterMs`
 specifically); and any UI surfacing any of this (rate-limited/read-only
 states) to a real user.
 
-Undo/redo's real resurrection semantics beyond Undelete's structural
-inverse (Phase 36). Tombstone garbage collection is now BUILT (Phase 21,
+**Per-user undo/redo is now BUILT as of Phase 36** (Engine Spec §9, §4.6;
+PRD FR-CE-11/FR-CE-12/OQ-3) — `Engine.undo()`/`redo()`, real client wiring
+(`beforeinput`, a `keydown` fallback, the microtask dedup guard UWIRE-02
+requires), and the durable-queue-backed transmission UNDO-10 requires; see
+the "Phase 36" bullet in the Completed Phases list above for the full
+account, including a real, subtle correctness bug (undo's own idempotent
+delete silently enabling a later redo to resurrect a third party's
+legitimate deletion) found and fixed the same phase. Tombstone garbage collection is now BUILT (Phase 21,
 Engine Spec §7.3/§7.4/§7.6/§7.7) — `Engine.collect()`, the real stability
 frontier (API Spec §6.5), Rule 7.1 eviction, and the undo horizon are all
 live; Rule 7.2's own "explicit rejection, content preserved and
@@ -8720,8 +8964,8 @@ actual scope (Phase 13 built ONLY MutationObserver-based reconciliation;
 an earlier phase's documentation had speculatively attributed IME support
 to "Phase 13's sentinel," which this correction retracts) and remains
 unbuilt, unassigned to a specific phase number in this document yet.
-`historyUndo`/`historyRedo` are prevented but stubbed with no engine call
-(Phase 36).
+`historyUndo`/`historyRedo` are now REAL as of Phase 36 (Engine Spec §9)
+— see that phase's own Completed Phases entry.
 
 **Milestone M1 status, stated plainly (Phase 14's own DoD requirement to
 list what's still missing)**: the core promise — two or more real
@@ -8746,8 +8990,9 @@ allows minting edits while `reconnecting`/`offline`, and
 `reconcileOfflineQueue.ts`'s re-mint-and-resend-on-reconnect mechanism;
 see that phase's own completed-phase entry for the full account,
 including the disclosed identifier-change nuance and the four real bugs
-(one pre-existing, in `gapTracker.ts`) found building it. Still stubbed:
-**undo/redo** (Phase 36) and **IME composition** (never emits an
+(one pre-existing, in `gapTracker.ts`) found building it. **Undo/redo is now BUILT as of Phase 36** (Engine Spec §9) — see that
+phase's own Completed Phases entry. Still stubbed:
+**IME composition** (never emits an
 operation, unbuilt, unassigned to a phase number). Cursor transformation
 under remote edits and its own rendering are now BUILT, as of Phases 32
 and 33 respectively (see above). The

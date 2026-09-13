@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { compareIds } from "./identifier.js";
-import { Engine } from "./engine.js";
+import { Engine, type UndoOutcome } from "./engine.js";
 import { assertInvariants } from "./invariants.js";
-import type { DeleteOperation } from "./operation.js";
+import type { DeleteOperation, InsertOperation, Operation } from "./operation.js";
 
 describe("Engine — identifier generation (Engine Spec §3.2, Invariant I0)", () => {
   it("mint() produces strictly consecutive counters across 10,000 calls", () => {
@@ -824,6 +824,328 @@ describe("Engine — resolveCaret() (Phase 32, API Spec §7.5.3 corrected for th
         expect(engine.resolveCaret(id)).toBe(naiveResolveCaret(engine, id));
       }
       expect(engine.resolveCaret(null)).toBe(naiveResolveCaret(engine, null));
+    }
+  });
+});
+
+/**
+ * Phase 36 (Engine Spec §9, §4.6; PRD FR-CE-11/FR-CE-12/OQ-3; Test Plan §6 UNDO-01..11).
+ * Per-user undo/redo — inverse operations keyed by node identifier, never state rollback or
+ * history rewriting. FR-CE-11 ("undo reverts only the invoking user's own operations") holds
+ * BY CONSTRUCTION: `Engine`'s own `undoStack` (private) is populated exclusively by
+ * `localInsert`/`localDelete`, never by `applyRemote` — there is no code path by which another
+ * replica's operation could ever land on it.
+ */
+describe("Engine — undo/redo (Phase 36, Engine Spec §9, Test Plan §6)", () => {
+  /** Relays every node in `seed`'s current structure into each of `replicas`, as plain Insert
+   * operations — the same "two simulated clients, no real network" technique this project's
+   * adversarial/DUR-01/audit suites already use to seed multiple replicas identically. */
+  function relayFromSeed(seed: Engine, ...replicas: Engine[]): void {
+    for (const node of seed.nodes) {
+      const op: Operation = {
+        kind: "insert",
+        id: node.id,
+        value: node.value,
+        parent: node.parent,
+        side: node.side,
+        bind: node.bind,
+      };
+      for (const replica of replicas) {
+        replica.applyRemote(op);
+      }
+    }
+  }
+
+  function expectApplied(outcome: UndoOutcome): Operation {
+    if (outcome.kind !== "applied") {
+      throw new Error(`expected an "applied" outcome, got ${JSON.stringify(outcome)}`);
+    }
+    return outcome.operation;
+  }
+
+  function permutationsOf3<T>(values: readonly [T, T, T]): T[][] {
+    const [a, b, c] = values;
+    return [
+      [a, b, c],
+      [a, c, b],
+      [b, a, c],
+      [b, c, a],
+      [c, a, b],
+      [c, b, a],
+    ];
+  }
+
+  it("basic mechanics: undo()/redo() on an empty stack report \"empty\", never throw; canUndo/canRedo track stack contents", () => {
+    const engine = new Engine(1);
+    expect(engine.canUndo).toBe(false);
+    expect(engine.canRedo).toBe(false);
+    expect(engine.undo()).toEqual({ kind: "empty" });
+    expect(engine.redo()).toEqual({ kind: "empty" });
+
+    engine.localInsert(0, cp("a"));
+    expect(engine.canUndo).toBe(true);
+    expect(engine.canRedo).toBe(false);
+  });
+
+  it("UNDO-01: undo reverts only the invoking user's own concurrent insert, leaving the peer's own untouched", () => {
+    const seed = new Engine(1);
+    seed.localInsert(0, cp("A"));
+    seed.localInsert(1, cp("B"));
+    const a = new Engine(10);
+    const b = new Engine(20);
+    relayFromSeed(seed, a, b);
+
+    // A and B concurrently insert at the same window (between A and B).
+    const opA = a.localInsert(1, cp("a"));
+    const opB = b.localInsert(1, cp("b"));
+    a.applyRemote(opB);
+    b.applyRemote(opA);
+    expect(a.text()).toBe("AabB");
+    expect(b.text()).toBe("AabB");
+
+    const before = a.text();
+    const inv = expectApplied(a.undo());
+    expect(a.text()).toBe("AbB"); // A's own 'a' is gone
+    b.applyRemote(inv);
+    expect(b.text()).toBe("AbB"); // B's own 'b' is still there — never touched
+
+    // UNDO-07 (redo symmetry): redo returns EXACTLY to the pre-undo state.
+    const redoInv = expectApplied(a.redo());
+    expect(a.text()).toBe(before);
+    b.applyRemote(redoInv);
+    expect(b.text()).toBe(before);
+    assertInvariants(a);
+    assertInvariants(b);
+  });
+
+  it("UNDO-02: 10 undos of an interleaved 40-op session revert exactly A's own last 10 (in reverse creation order), leaving all 20 of B's intact — converging after every step", () => {
+    const a = new Engine(10);
+    const b = new Engine(20);
+    const aOps: InsertOperation[] = [];
+    for (let i = 0; i < 20; i++) {
+      const opA = a.localInsert(a.text().length, cp("a"));
+      aOps.push(opA);
+      b.applyRemote(opA);
+      const opB = b.localInsert(b.text().length, cp("b"));
+      a.applyRemote(opB);
+      expect(a.text()).toBe(b.text()); // convergence after every individual local op too
+    }
+    expect(a.text()).toHaveLength(40);
+
+    for (let i = 0; i < 10; i++) {
+      const outcome = a.undo();
+      const inv = expectApplied(outcome);
+      // Reverse creation order: the i-th undo must target A's (20 - 1 - i)-th minted op.
+      expect((inv as { readonly target: { readonly c: number; readonly r: number } }).target).toEqual(
+        aOps[19 - i]!.id,
+      );
+      b.applyRemote(inv);
+      expect(a.text()).toBe(b.text()); // convergence after EACH individual undo, not only at the end
+    }
+    const bCount = [...a.text()].filter((ch) => ch === "b").length;
+    const aCount = [...a.text()].filter((ch) => ch === "a").length;
+    expect(bCount).toBe(20); // ALL of B's 20 remain
+    expect(aCount).toBe(10); // exactly A's FIRST 10 remain — its last 10 were undone
+  });
+
+  it("UNDO-03: undo of a delete resurrects the SAME node — same identifier, not a new insert — and converges", () => {
+    const seed = new Engine(1);
+    typeString(seed, "ABC");
+    const a = new Engine(10);
+    const b = new Engine(20);
+    relayFromSeed(seed, a, b);
+    const totalNodesBefore = a.nodes.length;
+    const bNodeId = a.nodes.find((n) => n.value === cp("B"))!.id;
+
+    const delOp = a.localDelete(1, 1)[0]!;
+    b.applyRemote(delOp);
+    expect(a.text()).toBe("AC");
+    expect(b.text()).toBe("AC");
+
+    const inv = expectApplied(a.undo());
+    expect(a.text()).toBe("ABC");
+    // Same origin stamp — the exact same node object's identifier, never a freshly-minted one.
+    const bNodeAfter = a.nodes.find((n) => n.value === cp("B"))!;
+    expect(bNodeAfter.id).toEqual(bNodeId);
+    expect(a.nodes).toHaveLength(totalNodesBefore); // no NEW node was created
+
+    b.applyRemote(inv);
+    expect(b.text()).toBe("ABC");
+
+    // UNDO-07 (redo symmetry): identical text AND identical structure length after redo.
+    const structureLenBeforeRedo = a.nodes.length;
+    const redoInv = expectApplied(a.redo());
+    expect(a.text()).toBe("AC");
+    expect(a.nodes).toHaveLength(structureLenBeforeRedo);
+    b.applyRemote(redoInv);
+    expect(b.text()).toBe("AC");
+  });
+
+  it("UNDO-04 (OQ-3, no-op branch): undo of a delete superseded by someone else's causally-LATER delete is a no-op, not resurrection — the operation is still applied and transmitted", () => {
+    const seed = new Engine(1);
+    typeString(seed, "ABC");
+    const x = new Engine(10); // X
+    const y = new Engine(20); // Y — higher replica id, so a counter tie resolves in Y's favor
+    relayFromSeed(seed, x, y);
+
+    const delOpX = x.localDelete(1, 1)[0]!; // X deletes 'B'
+    const delOpY = y.localDelete(1, 1)[0]!; // Y ALSO deletes 'B', concurrently
+    y.applyRemote(delOpX);
+    x.applyRemote(delOpY);
+    expect(x.text()).toBe("AC");
+    expect(y.text()).toBe("AC");
+    // Confirm Y's delete really is the causally-latest attribution (the scenario's own precondition).
+    const bNode = x.nodes.find((n) => n.value === cp("B"))!;
+    expect(bNode.deletedBy).toEqual(delOpY.id);
+
+    const outcome = x.undo();
+    expect(outcome.kind).toBe("applied"); // an operation WAS minted/applied/transmitted — no error surface
+    expect(x.text()).toBe("AC"); // UNCHANGED — no-op, not resurrection
+    const inv = expectApplied(outcome);
+    y.applyRemote(inv);
+    expect(y.text()).toBe("AC");
+
+    // UNDO-07 (redo symmetry): redoing a no-op undo is itself a no-op, still convergent.
+    const redoOutcome = x.redo();
+    expect(redoOutcome.kind).toBe("applied");
+    expect(x.text()).toBe("AC");
+    y.applyRemote(expectApplied(redoOutcome));
+    expect(y.text()).toBe("AC");
+  });
+
+  it("UNDO-05: the OQ-3 outcome is delivery-order-independent — all 6 permutations of {X's delete, Y's delete, X's undo} converge to AC on an uninvolved third replica", () => {
+    const seed = new Engine(1);
+    typeString(seed, "ABC");
+    const x = new Engine(10);
+    const y = new Engine(20);
+    relayFromSeed(seed, x, y);
+
+    const delOpX = x.localDelete(1, 1)[0]!;
+    const delOpY = y.localDelete(1, 1)[0]!;
+    y.applyRemote(delOpX);
+    x.applyRemote(delOpY);
+    const undelOp = expectApplied(x.undo());
+
+    for (const perm of permutationsOf3([delOpX, delOpY, undelOp] as const)) {
+      const z = new Engine(99);
+      relayFromSeed(seed, z);
+      for (const op of perm) {
+        z.applyRemote(op);
+      }
+      expect(z.text()).toBe("AC");
+      expect(z.pending).toHaveLength(0);
+      assertInvariants(z);
+    }
+  });
+
+  it("UNDO-06 (FR-CE-12): undo of an insert a peer has already deleted is a harmless no-op — the resulting Delete is idempotent", () => {
+    const a = new Engine(10);
+    const b = new Engine(20);
+    const opA = a.localInsert(0, cp("x")); // A inserts 'x'
+    b.applyRemote(opA);
+    expect(b.text()).toBe("x");
+    const delOpB = b.localDelete(0, 1)[0]!; // B deletes it
+    a.applyRemote(delOpB);
+    expect(a.text()).toBe("");
+    expect(b.text()).toBe("");
+
+    const outcome = a.undo(); // A undoes ITS OWN original insert
+    expect(outcome.kind).toBe("applied"); // no error, no exception, no corruption
+    expect(a.text()).toBe(""); // THE DOCUMENT IS UNCHANGED
+    const inv = expectApplied(outcome); // a Delete naming an already-tombstoned node
+    b.applyRemote(inv); // idempotent — sets deleted<-true (already true), possibly advances deletedBy
+    expect(b.text()).toBe("");
+
+    // UNDO-07 (redo symmetry): redoing this no-op undo is itself a no-op, still convergent.
+    const redoInv = expectApplied(a.redo());
+    expect(a.text()).toBe("");
+    b.applyRemote(redoInv);
+    expect(b.text()).toBe("");
+  });
+
+  it("UNDO-08: a new local operation clears the redo stack — a subsequent redo does nothing", () => {
+    const engine = new Engine(1);
+    engine.localInsert(0, cp("a"));
+    expectApplied(engine.undo());
+    expect(engine.text()).toBe("");
+    expect(engine.canRedo).toBe(true);
+
+    engine.localInsert(0, cp("b")); // a NEW local op
+    expect(engine.canRedo).toBe(false);
+    expect(engine.redo()).toEqual({ kind: "empty" });
+    expect(engine.text()).toBe("b"); // unaffected by the no-op redo
+  });
+
+  it("UNDO-09: 50 ops / 50 undos / 50 redos / 50 undos, with a peer applying throughout — converges after EVERY step, and ends exactly where the first 50 undos left it", () => {
+    const a = new Engine(10);
+    const b = new Engine(20);
+    for (let i = 0; i < 50; i++) {
+      const op = a.localInsert(a.text().length, cp("a"));
+      b.applyRemote(op);
+      expect(a.text()).toBe(b.text());
+    }
+    expect(a.text()).toBe("a".repeat(50));
+
+    for (let i = 0; i < 50; i++) {
+      const inv = expectApplied(a.undo());
+      b.applyRemote(inv);
+      expect(a.text()).toBe(b.text());
+    }
+    const stateAfterFirst50Undos = a.text();
+    expect(stateAfterFirst50Undos).toBe("");
+
+    for (let i = 0; i < 50; i++) {
+      const inv = expectApplied(a.redo());
+      b.applyRemote(inv);
+      expect(a.text()).toBe(b.text());
+    }
+    expect(a.text()).toBe("a".repeat(50));
+
+    for (let i = 0; i < 50; i++) {
+      const inv = expectApplied(a.undo());
+      b.applyRemote(inv);
+      expect(a.text()).toBe(b.text());
+    }
+    expect(a.text()).toBe(stateAfterFirst50Undos);
+    assertInvariants(a);
+    assertInvariants(b);
+  });
+
+  it("UNDO-11 (undo horizon, Engine Spec §9.5): undo succeeds while inside the horizon, and reports UNAVAILABLE — never throws — once GC has physically removed the target past it", () => {
+    // Scenario A: t = 4 minutes — still inside the 5-minute horizon; GC does not collect it.
+    {
+      const engine = new Engine(10);
+      engine.localInsert(0, cp("X")); // a "paragraph" stand-in — one character is enough to prove the mechanism
+      const delOp = engine.localDelete(0, 1)[0]!;
+      engine.setDeleteContext(delOp.id, { seq: 1n, atMs: 0 });
+      const gc = engine.collect(1n, {
+        nowMs: 4 * 60 * 1000,
+        maxAgeMs: 5 * 60 * 1000,
+        maxOpsPerReplica: 200,
+      });
+      expect(gc.collectedCount).toBe(0); // still protected by the horizon
+      const outcome = engine.undo();
+      expect(outcome.kind).toBe("applied");
+      expect(engine.text()).toBe("X"); // the paragraph returns
+    }
+
+    // Scenario B: t = 6 minutes — past the horizon; GC has ALREADY physically removed the
+    // tombstone before the user gets around to pressing Ctrl+Z.
+    {
+      const engine = new Engine(10);
+      engine.localInsert(0, cp("X"));
+      const delOp = engine.localDelete(0, 1)[0]!;
+      engine.setDeleteContext(delOp.id, { seq: 1n, atMs: 0 });
+      const gc = engine.collect(1n, {
+        nowMs: 6 * 60 * 1000,
+        maxAgeMs: 5 * 60 * 1000,
+        maxOpsPerReplica: 200,
+      });
+      expect(gc.collectedCount).toBe(1); // physically removed
+      expect(engine.stats().totalElements).toBe(0);
+      const outcome = engine.undo(); // no error, no exception
+      expect(outcome).toEqual({ kind: "unavailable" }); // UI says so, rather than failing silently
+      expect(engine.text()).toBe(""); // nothing changes
     }
   });
 });

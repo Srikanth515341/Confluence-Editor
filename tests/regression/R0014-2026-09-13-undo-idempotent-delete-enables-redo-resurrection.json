@@ -1,0 +1,77 @@
+{
+  "id": "R0014",
+  "date": "2026-09-13",
+  "commitFirstFailed": "phase-36-per-user-undo (Engine.undo()/redo(), first implementation)",
+  "status": "FIXED — same phase, before merge",
+  "severity": "HIGH — a real, silent violation of Engine Spec §9.3/PRD OQ-3's own guarantee ('overriding it would resurrect text a colleague deliberately removed'), reachable via entirely ordinary use of the shipped undo/redo feature (no fault injection, no reconnection, no GC horizon involved)",
+  "oneLineDescription": "Undo of a LOCAL insert that a peer has already deleted (Test Plan UNDO-06 / PRD FR-CE-12) mints an idempotent Delete per Engine Spec §9.2 ('possibly advances deletedBy... THE DOCUMENT IS UNCHANGED') — but applyDelete's own correct, necessary max-wins attribution logic silently reassigns deletedBy to the UNDOING replica as a side effect of that 'harmless' idempotent delete. A LATER redo of that same undo then mints an Undelete which satisfies Engine Spec §4.6's replica-equality check against that newly-reassigned attribution, resurrecting content a third party legitimately and independently deleted — exactly the outcome OQ-3 exists to forbid.",
+
+  "discoveredDuring": "Phase 36 implementation, writing the engine-level UNDO-07 (redo-symmetry) test for the UNDO-06 scenario (undo of an insert already deleted by someone else). The test's own redo assertion failed: text came back as the original character instead of staying empty.",
+
+  "mechanism": {
+    "step1": "Replica A inserts 'x' (opA). Replica B deletes it independently (delOpB, target=opA.id). A applies delOpB: A's own local state is now deleted, deletedBy=delOpB.id (B).",
+    "step2": "A undoes ITS OWN original insert (Engine Spec §9.1, case 'insert' -> Delete{target: op.id}). A mints a fresh Delete (invD1, replica A) and applies it. applyDelete's general, CORRECT, necessary causally-latest-wins logic (Engine Spec §4.5, used identically for every concurrent delete in the system) compares invD1 against the CURRENT deletedBy (delOpB, B) — since invD1 is a freshly minted identifier, its counter always exceeds every counter this replica has already observed, so invD1 UNCONDITIONALLY WINS the comparison and deletedBy silently becomes invD1 (A) — even though the node's `deleted` flag itself does not change (it was already `true`). Engine Spec §9.2 explicitly sanctions this exact side effect as harmless in isolation: 'This sets deleted <- true (already true) and possibly advances deletedBy... THE DOCUMENT IS UNCHANGED.'",
+    "step3": "A later redoes that same undo (Engine Spec §9.4: 'for an insert-then-undo, this is an Undelete of the original node'). A mints a fresh Undelete (invU1, replica A) targeting opA.id and applies it. Engine Spec §4.6's own rule fires: 'if n.deletedBy.replica = op.by' — deletedBy is now invD1 (A, from step 2's silent reassignment) and op.by is A (the redo's own replica) — THEY MATCH — so the node is resurrected (deleted <- false), even though the CONTENT-LEVEL reason it was deleted was always B's own, entirely separate, still-standing deletion.",
+    "consequence": "The document shows the resurrected character again, silently overriding B's legitimate, independent deletion — with no fault injection, no reconnection, and no interaction with garbage collection or the undo horizon required. This is a direct violation of OQ-3's own stated justification: 'Overriding it would resurrect text a colleague deliberately removed, into a document they are still editing.'"
+  },
+
+  "minimalReproduction": {
+    "description": "Fully deterministic, no real time or network required. Verified passing (asserting the FIXED behavior) as packages/engine/src/engine.test.ts's own 'UNDO-06 (FR-CE-12)' + its UNDO-07 redo-symmetry follow-up, and as a dedicated permanent regression test, packages/engine/src/regressionR0014.test.ts (in the default pnpm test suite).",
+    "engineConstruction": "Two Engine instances, replica A (id 10) and replica B (id 20).",
+    "operationStreamPreFix": [
+      {
+        "step": "a.localInsert(0, 'x')",
+        "result": {
+          "kind": "insert",
+          "id": { "c": 1, "r": 10 },
+          "value": 120,
+          "parent": null,
+          "side": "R",
+          "bind": false
+        }
+      },
+      { "step": "b.applyRemote(opA)", "result": "b.text() === 'x'" },
+      {
+        "step": "b.localDelete(0, 1)",
+        "result": { "kind": "delete", "id": { "c": 2, "r": 20 }, "target": { "c": 1, "r": 10 } }
+      },
+      {
+        "step": "a.applyRemote(delOpB)",
+        "result": "a.text() === ''; deletedBy === {c:2,r:20} (B)"
+      },
+      {
+        "step": "a.undo()",
+        "result": "{ kind: 'applied', operation: { kind: 'delete', id: {c:3,r:10}, target: {c:1,r:10} } }",
+        "note": "PRE-FIX: applyDelete's max-wins logic silently reassigns deletedBy to {c:3,r:10} (A) here. a.text() is still '' (no visible change), matching UNDO-06's own expectation in isolation."
+      },
+      {
+        "step": "a.redo()",
+        "result": "PRE-FIX (BUG): { kind: 'applied', operation: { kind: 'undelete', id: {c:4,r:10}, target: {c:1,r:10} } }, a.text() === 'x'",
+        "note": "WRONG — resurrects content B legitimately deleted, because deletedBy.r (A, from the undo's own silent reassignment) now matches this Undelete's own op.id.r (A)."
+      }
+    ],
+    "operationStreamPostFix": [
+      "Identical steps 1-4 above.",
+      {
+        "step": "a.undo()",
+        "result": "{ kind: 'applied', operation: { kind: 'delete', id: {c:3,r:10}, target: {c:1,r:10} } }",
+        "note": "Same wire operation as before (§9.2 is still followed literally — a real Delete is still minted, applied, and transmitted) — but the engine now ALSO records, internally, that this specific application had NO visible effect (deleted was already true before and after)."
+      },
+      {
+        "step": "a.redo()",
+        "result": "FIXED: { kind: 'applied', operation: { kind: 'delete', id: {c:4,r:10}, target: {c:1,r:10} } }, a.text() === ''",
+        "note": "CORRECT — because the entry being reversed is known to have been a no-op, redo mints ANOTHER DELETE (repeating the same kind), never an Undelete, so it can never resurrect anything. B's independent deletion is never overridden."
+      }
+    ]
+  },
+
+  "fix": {
+    "summary": "Engine.undo()/redo() now track, per stack entry, whether that entry's own application actually changed the target's visible (`deleted`) state (`hadEffect: boolean`, captured via a before/after comparison at apply time) — not just the entry's operation KIND. Reversing an entry with `hadEffect: true` uses the standard Engine Spec §9.1/§9.4 kind-based inverse mapping (unchanged from the original implementation, and still fully subject to Engine Spec §4.6/OQ-3's own replica-equality check for legitimate cases). Reversing an entry with `hadEffect: false` instead REPEATS the same operation kind (delete->delete, undelete->undelete) rather than inverting it — this can never mint the 'dangerous' opposite-kind operation that could newly succeed due to attribution drift, so a known no-op faithfully stays a no-op through arbitrarily many further undo/redo cycles of that same entry.",
+    "filesChanged": ["packages/engine/src/engine.ts"],
+    "verifiedAgainst": "The full new Phase 36 undo/redo test suite (packages/engine/src/engine.test.ts, UNDO-01 through UNDO-11, all with UNDO-07 redo-symmetry checks where applicable) — confirmed the fix is ADDITIVE PRECISION, not a behavior change, for every already-correct case (UNDO-01/03/04/05/09, all of which have `hadEffect: true` on every transition that matters, or — for UNDO-04's own OQ-3 no-op branch — were never vulnerable in the first place, since applyUndelete's own no-op branch, unlike applyDelete's, never mutates `deletedBy` at all)."
+  },
+
+  "whyThisIsDifferentFromR0008ThroughR0013": "R0008-R0011 were defects in the CRDT placement/ordering algorithm itself (YATA-family, since replaced by Fugue); R0012/R0013 concern tombstone garbage-collection eligibility and its interaction with a live client. This is neither — Engine.applyDelete's max-wins attribution and Engine.applyUndelete's §4.6 replica-equality check are EACH individually correct, exactly as specified. This is an emergent interaction between two individually-correct, individually-specified rules (§9.2's 'advancing deletedBy is harmless' and §4.6's OQ-3 check) that neither rule's own text addresses when COMPOSED across an undo followed by a later redo — the kind of finding only surfaces by actually building and exercising the full undo/redo round trip the Test Plan's own UNDO-07 item requires, not by reviewing either rule in isolation.",
+
+  "reproducibilityCaveat": "None — this fully satisfies Test Plan §2.3 Rule 3 (a complete, byte-exact, deterministic operation stream). No fault injection, timing, network, or randomness of any kind is required to reproduce it, before or after the fix."
+}
