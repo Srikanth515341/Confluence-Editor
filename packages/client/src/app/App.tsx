@@ -10,6 +10,7 @@ import type { ConnectionState } from "../sync/connectionState.js";
 import { SyncClient } from "../sync/syncClient.js";
 import { EditorView } from "../editor/index.js";
 import type { MutationSentinel } from "../sentinel/index.js";
+import { attachRumBeaconPolling, RumBeacon } from "../rum/beacon.js";
 import { ConnectionIndicator } from "./ConnectionIndicator.js";
 import { getOrCreateDocumentId, getServerUrl } from "./urlParams.js";
 
@@ -42,6 +43,30 @@ export function App(): React.JSX.Element {
   const handleSentinelReady = useCallback((sentinel: MutationSentinel | null) => {
     sentinelRef.current = sentinel;
   }, []);
+  // Phase 37 (RFC §5 C-14) — one beacon for this component's whole lifetime, same
+  // stable-across-re-renders reasoning as `handleSentinelReady` above.
+  const [rumBeacon] = useState(() => new RumBeacon());
+  const handleLocalEcho = useCallback(
+    (ms: number) => rumBeacon.recordTiming("client.local_echo", ms),
+    [rumBeacon],
+  );
+  const handleCompositionWatchdogFired = useCallback(
+    () => rumBeacon.recordCounter("binding.composition_watchdog_fired"),
+    [rumBeacon],
+  );
+
+  useEffect(() => {
+    rumBeacon.start();
+    const detachRumPolling = attachRumBeaconPolling({
+      beacon: rumBeacon,
+      getSentinelMetrics: () => sentinelRef.current?.metrics ?? { reconciliation: 0, desync_error: 0 },
+      getDurableQueueUnavailable: () => sync.durableQueueUnavailable,
+    });
+    return () => {
+      detachRumPolling();
+      rumBeacon.stop();
+    };
+  }, [rumBeacon, sync]);
 
   useEffect(() => {
     const unsubscribe = sync.state.subscribe(setState);
@@ -135,7 +160,13 @@ export function App(): React.JSX.Element {
           durableQueueUnavailable={sync.durableQueueUnavailable}
         />
       </header>
-      <EditorView sync={sync} className="editor-root" onSentinelReady={handleSentinelReady} />
+      <EditorView
+        sync={sync}
+        className="editor-root"
+        onSentinelReady={handleSentinelReady}
+        onLocalEcho={handleLocalEcho}
+        onCompositionWatchdogFired={handleCompositionWatchdogFired}
+      />
     </div>
   );
 }

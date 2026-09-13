@@ -15,6 +15,7 @@ import {
   type RateLimitConfig,
 } from "./config.js";
 import { logger } from "./logger.js";
+import { metrics } from "./metrics.js";
 import { InMemoryRateLimiter } from "./rateLimiter.js";
 
 /**
@@ -148,7 +149,16 @@ export interface CoordinatorSession {
  */
 export class DocumentCoordinator {
   readonly documentId: string;
-  readonly engine = new Engine(SERVER_REPLICA_ID);
+  /**
+   * NOT `readonly` as of Phase 37 — `rebuildFromLog()` is the ONLY place this is ever
+   * reassigned, an emergency-recovery operation (`./admin rebuild --from-log`), never an
+   * ordinary code path. Every other consumer across this codebase only ever READS
+   * `coordinator.engine.*` fresh at each call, so a swap is safe for them by construction —
+   * `rebuildFromLog()`'s own doc comment covers the one thing that ISN'T automatically safe
+   * (already-open sessions holding closures over the OLD object), which is why it disconnects
+   * them.
+   */
+  engine = new Engine(SERVER_REPLICA_ID);
   readonly operationStore: OperationStore;
 
   /**
@@ -262,6 +272,45 @@ export class DocumentCoordinator {
    * (that cycle DID succeed; it just didn't finish the whole sweep).
    */
   gcCycleIncompleteCount = 0;
+
+  /**
+   * Phase 37 (Runbook "Convergence" metric group) — the audit-cycle analogue of the GC fields
+   * above, same reasoning: `auditScheduler.ts` sets `lastAuditSuccessAt` on every "ok" result
+   * (never on "mismatch"/"error"), so `audit.minutes_since_last_successful_run` can grow even
+   * while the scheduler keeps firing on time — an audit that stopped running reports zero
+   * mismatches, which looks IDENTICAL to perfect health; the absence of an alert is not
+   * evidence. `auditMismatchCount` is cumulative, incremented on every non-"ok" result — the
+   * scheduled audit's own real-time discovery of a divergence, distinct from a manually
+   * `./admin audit`-triggered one-off check.
+   */
+  lastAuditSuccessAt: Date | null = null;
+  auditMismatchCount = 0;
+
+  /**
+   * Phase 37 `./admin freeze`/`--unfreeze` — a MANUAL override of the Phase 30 circuit breaker,
+   * independent of the automatic structure-size trip: an operator can freeze a document
+   * regardless of its current size (e.g. while investigating a suspected divergence, to stop
+   * further writes from complicating the picture), and unfreeze it explicitly once done. Checked
+   * alongside (never instead of) the automatic size-based trip in `isCircuitBreakerTripped()` —
+   * either condition alone is sufficient to freeze the document, and unfreezing this flag alone
+   * does NOT override a genuine size-based trip still in effect.
+   */
+  private manuallyFrozen = false;
+
+  manualFreeze(): void {
+    this.manuallyFrozen = true;
+    logger.warn("documentCoordinator.manualFreeze", { documentId: this.documentId });
+  }
+
+  manualUnfreeze(): void {
+    this.manuallyFrozen = false;
+    logger.warn("documentCoordinator.manualUnfreeze", { documentId: this.documentId });
+  }
+
+  get isManuallyFrozen(): boolean {
+    return this.manuallyFrozen;
+  }
+
   /**
    * RFC §13.2's cadence (500 ops / 30s), as instance fields rather than
    * only the module-level constants (snapshotter.ts) — test-only
@@ -360,6 +409,20 @@ export class DocumentCoordinator {
   static readonly AUTH_DECISION_TTL_MS = 2000;
 
   /**
+   * Phase 37 (`authz.revocation_effect_p95`) — "how long after a PERMISSION_CHANGED commit does
+   * the FIRST subsequent operation get correctly rejected." Set by `invalidateAuthorizationCache`
+   * (called on EVERY role change, promotion or demotion — this map does not know which), and
+   * resolved in `authorizeSession`: whichever comes first — a rejection (records the elapsed
+   * time, this IS what the metric measures) or an ALLOWED decision (a promotion, or a demotion
+   * whose first subsequent op happened to race ahead of the invalidation somehow — either way,
+   * nothing to time, the entry is just dropped). This is literally re-measuring SEC-04/SEC-06's
+   * own guarantees as an ongoing metric, not new behavior — real effect should track the
+   * `AUTH_DECISION_TTL_MS` bound closely (near-zero when `lookupRole` is configured, since the
+   * cache is invalidated immediately rather than waiting out the TTL).
+   */
+  private readonly pendingRevocationAtMs = new Map<string, number>();
+
+  /**
    * Step 1 of writePath.ts's write path (API Spec §6.3 line 1) — re-evaluated on every call, not
    * read once at connect. As of Phase 29, when this coordinator was constructed with a real
    * {@link lookupRole} (a real server, `auth` deps present), a cache MISS performs a genuine,
@@ -377,6 +440,7 @@ export class DocumentCoordinator {
   async authorizeSession(session: CoordinatorSession, now: number = Date.now()): Promise<boolean> {
     const cached = this.authDecisionCache.get(session.sessionId);
     if (cached && cached.expiresAt > now) {
+      this.noteAuthorizationResult(session.sessionId, cached.allowed, now);
       return cached.allowed;
     }
     let allowed: boolean;
@@ -391,12 +455,39 @@ export class DocumentCoordinator {
       allowed,
       expiresAt: now + DocumentCoordinator.AUTH_DECISION_TTL_MS,
     });
+    this.noteAuthorizationResult(session.sessionId, allowed, now);
     return allowed;
   }
 
-  /** Drops any cached authorization decision for one session — called whenever that session's own role changes, so the very next operation re-evaluates rather than possibly reusing a decision cached under the OLD role for up to `AUTH_DECISION_TTL_MS` longer. */
-  invalidateAuthorizationCache(sessionId: string): void {
+  /** See `pendingRevocationAtMs`'s own doc comment. */
+  private noteAuthorizationResult(sessionId: string, allowed: boolean, nowMs: number): void {
+    const revokedAtMs = this.pendingRevocationAtMs.get(sessionId);
+    if (revokedAtMs === undefined) {
+      return;
+    }
+    this.pendingRevocationAtMs.delete(sessionId);
+    if (!allowed) {
+      metrics.histogram("authz.revocation_effect").record(nowMs - revokedAtMs);
+    }
+  }
+
+  /** Drops any cached authorization decision for one session — called whenever that session's own role changes, so the very next operation re-evaluates rather than possibly reusing a decision cached under the OLD role for up to `AUTH_DECISION_TTL_MS` longer. Also arms `authz.revocation_effect_p95`'s own timer (see `pendingRevocationAtMs`'s doc comment) — every role change invalidates the cache, so this is the one shared choke point for both. */
+  invalidateAuthorizationCache(sessionId: string, nowMs: number = Date.now()): void {
     this.authDecisionCache.delete(sessionId);
+    this.pendingRevocationAtMs.set(sessionId, nowMs);
+  }
+
+  /** `authz.cache_age_max` (Runbook) — the oldest a currently-cached authorization decision was when it was CREATED, derived from `expiresAt - AUTH_DECISION_TTL_MS` (the cache stores no separate "created at" field — the TTL is fixed, so this is recoverable without one). Should never exceed `AUTH_DECISION_TTL_MS` by construction; a real overage would mean a decision outlived its own expiry check somehow. `null` when nothing is currently cached. */
+  maxAuthDecisionCacheAgeMs(nowMs: number = Date.now()): number | null {
+    let max: number | null = null;
+    for (const entry of this.authDecisionCache.values()) {
+      const createdAtMs = entry.expiresAt - DocumentCoordinator.AUTH_DECISION_TTL_MS;
+      const age = nowMs - createdAtMs;
+      if (max === null || age > max) {
+        max = age;
+      }
+    }
+    return max;
   }
 
   /**
@@ -752,7 +843,10 @@ export class DocumentCoordinator {
   }
 
   isCircuitBreakerTripped(): boolean {
-    return this.circuitBreakerState.tripped;
+    // Phase 37 `./admin freeze` — either condition alone is sufficient (see `manualFreeze`'s own
+    // doc comment); unfreezing this flag alone never overrides a genuine size-based trip still
+    // in effect underneath it.
+    return this.circuitBreakerState.tripped || this.manuallyFrozen;
   }
 
   /** Read-only introspection for httpApp.ts's `/security-status` endpoint. */
@@ -760,15 +854,19 @@ export class DocumentCoordinator {
     readonly circuitBreakerTripped: boolean;
     readonly circuitBreakerTrippedAtMs: number | null;
     readonly circuitBreakerReason: string | null;
+    readonly manuallyFrozen: boolean;
     readonly structureSize: number;
     readonly tombstoneCount: number;
     readonly circuitBreakerConfig: CircuitBreakerConfig;
   } {
     const stats = this.engine.stats();
     return {
-      circuitBreakerTripped: this.circuitBreakerState.tripped,
+      circuitBreakerTripped: this.isCircuitBreakerTripped(),
       circuitBreakerTrippedAtMs: this.circuitBreakerState.trippedAtMs,
-      circuitBreakerReason: this.circuitBreakerState.reason,
+      circuitBreakerReason: this.manuallyFrozen
+        ? (this.circuitBreakerState.reason ?? "manually frozen via ./admin freeze")
+        : this.circuitBreakerState.reason,
+      manuallyFrozen: this.manuallyFrozen,
       structureSize: stats.totalElements,
       tombstoneCount: stats.tombstones,
       circuitBreakerConfig: this.circuitBreakerConfig,
@@ -802,5 +900,56 @@ export class DocumentCoordinator {
       sessionId: s.sessionId,
       receivedFrameCount: s.receivedFrameCount,
     }));
+  }
+
+  /** Phase 37 — every currently-connected session, for metrics aggregation (queue depths) across all of this document's open connections. Diagnostic-only, mirroring `listReceivedFrameCounts`'s own read-only shape. */
+  allSessions(): readonly CoordinatorSession[] {
+    return Array.from(this.sessions.values());
+  }
+
+  /**
+   * Phase 37 `./admin rebuild --from-log` — an emergency-recovery operation, not something any
+   * ordinary code path calls. Replays the FULL persisted operation log into a brand-new `Engine`
+   * and compares its materialized text against the currently-live `engine`'s own text:
+   *   - identical: the live engine already matches what the log says it should be — reports
+   *     `changed: false` and touches NOTHING (the safe, and overwhelmingly common, outcome).
+   *   - different: the live engine has genuinely diverged from its own durable source of truth
+   *     (the actual scenario this command exists for). Swaps `this.engine` to the freshly-
+   *     rebuilt one and disconnects every currently-open session (mirroring
+   *     `disconnectAllSessions()`'s own real-GOODBYE-then-close mechanism, Phase 27) so every
+   *     client reconnects fresh against the corrected state, rather than continuing to reference
+   *     in-flight closures over the now-replaced engine object.
+   * Throws if the fresh replay itself doesn't reach `pendingCount() === 0` (Engine Spec I9) —
+   * rebuilding FROM a log that is itself missing a causal dependency would just swap one broken
+   * state for another; refusing is safer than guessing.
+   */
+  async rebuildFromLog(): Promise<{
+    readonly changed: boolean;
+    readonly textBefore: string;
+    readonly textAfter: string;
+  }> {
+    const ops = await this.operationStore.loadFullOperationLog(this.documentId);
+    const rebuilt = new Engine(SERVER_REPLICA_ID);
+    for (const op of ops) {
+      rebuilt.applyRemote(op);
+    }
+    if (rebuilt.pending.length !== 0) {
+      throw new Error(
+        `DocumentCoordinator.rebuildFromLog: ${rebuilt.pending.length} operation(s) never became ready replaying the persisted log for document ${this.documentId} — refusing to rebuild from a log missing a causal dependency`,
+      );
+    }
+    const textBefore = this.engine.text();
+    const textAfter = rebuilt.text();
+    if (textBefore === textAfter) {
+      return { changed: false, textBefore, textAfter };
+    }
+    logger.error("documentCoordinator.rebuildChangedState", {
+      documentId: this.documentId,
+      textBeforeLength: textBefore.length,
+      textAfterLength: textAfter.length,
+    });
+    this.engine = rebuilt;
+    this.disconnectAllSessions();
+    return { changed: true, textBefore, textAfter };
   }
 }

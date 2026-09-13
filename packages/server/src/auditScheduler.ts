@@ -50,9 +50,18 @@ async function runAllOpenDocuments(gateway: Gateway): Promise<void> {
   for (const coordinator of gateway.coordinators.values()) {
     try {
       await coordinator.ready; // a coordinator can be in the map while still warming up
-      await auditDocument(coordinator.documentId, coordinator.operationStore, {
+      const result = await auditDocument(coordinator.documentId, coordinator.operationStore, {
         liveText: coordinator.engine.text(),
       });
+      // Runbook "Convergence" metric group — see DocumentCoordinator.lastAuditSuccessAt's own
+      // doc comment for why this mirrors gcScheduler.ts's identical liveness-not-error-rate
+      // reasoning: a scheduler that stopped running reports zero mismatches forever, which is
+      // indistinguishable from perfect health without this "did it actually run recently" signal.
+      if (result.result === "ok") {
+        coordinator.lastAuditSuccessAt = new Date();
+      } else {
+        coordinator.auditMismatchCount += 1;
+      }
     } catch (err) {
       // One document's audit failing (or even its own warm start failing) must never stop the
       // rest of this tick's sweep from running.

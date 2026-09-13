@@ -40,6 +40,14 @@ export interface InputPipelineDeps {
   readonly sync: SyncClient;
   readonly sentinel: MutationSentinel;
   readonly undoRedo: UndoRedoController;
+  /**
+   * Phase 37 (Runbook "Client (RUM beacon)" metric group: local-echo p50/p95/p99) — called, when
+   * present, with the elapsed milliseconds from a local insert/delete's own `sync.localInsertText`/
+   * `localDelete` call through this same keystroke's own DOM mutation and caret placement — "how
+   * long did MY OWN edit take to become visible," PRD M3's own 16ms budget made measurable in the
+   * field, not just in this project's own benchmarks. Optional and purely observational.
+   */
+  readonly onLocalEcho?: (ms: number) => void;
 }
 
 interface VisRange {
@@ -148,6 +156,7 @@ function insertTextAt(deps: InputPipelineDeps, at: number, text: string): void {
   if (text.length === 0) {
     return;
   }
+  const startedAtMs = deps.onLocalEcho ? performance.now() : 0;
   try {
     deps.sync.localInsertText(at, text);
   } catch (err) {
@@ -166,6 +175,7 @@ function insertTextAt(deps: InputPipelineDeps, at: number, text: string): void {
     deps.domWriter.insertText(at, text, deps.sync.engine?.text());
   });
   placeCaretAt(deps, at + Array.from(text).length); // Array.from: scalar count, not UTF-16 length
+  deps.onLocalEcho?.(performance.now() - startedAtMs);
 }
 
 /** Exported for {@link CompositionController} (Phase 34) — IME-04's "the selection deletion is emitted as an ordinary operation BEFORE the IME takes the region." */
@@ -173,6 +183,7 @@ export function deleteRangeAt(deps: InputPipelineDeps, at: number, count: number
   if (count <= 0) {
     return;
   }
+  const startedAtMs = deps.onLocalEcho ? performance.now() : 0;
   try {
     deps.sync.localDelete(at, count);
   } catch (err) {
@@ -185,6 +196,7 @@ export function deleteRangeAt(deps: InputPipelineDeps, at: number, count: number
     deps.domWriter.deleteRange(at, count, deps.sync.engine?.text());
   });
   placeCaretAt(deps, at);
+  deps.onLocalEcho?.(performance.now() - startedAtMs);
 }
 
 /** `insertText`/`insertReplacementText`/`insertFromPaste`/`insertFromDrop`/`insertLineBreak`/`insertParagraph` (API Spec §7.4.2) all reduce to: resolve the range that would be replaced (possibly empty), delete it, then insert the type's own text at its start. */

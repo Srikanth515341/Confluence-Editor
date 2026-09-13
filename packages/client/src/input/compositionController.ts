@@ -97,6 +97,8 @@ export interface CompositionControllerDeps extends InputPipelineDeps {
    * `compositionController.test.ts`.
    */
   readonly watchdogMs?: number;
+  /** Phase 37 (Runbook "Client (RUM beacon)" metric group: `binding.composition_watchdog_fired`) — called once, synchronously, whenever the watchdog actually force-commits. Optional and purely observational: omitting it changes nothing about the force-commit behavior itself. */
+  readonly onWatchdogFired?: () => void;
 }
 
 /**
@@ -263,6 +265,7 @@ export class CompositionController {
       console.warn(
         `CompositionController: a composition was left open longer than ${this.watchdogMs}ms — force-committing whatever has been observed so far (Test Plan IME-05, API Spec §7.6).`,
       );
+      this.deps.onWatchdogFired?.();
       this.commit(this.lastData);
     }, this.watchdogMs);
   }

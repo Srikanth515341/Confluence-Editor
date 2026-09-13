@@ -20,6 +20,7 @@ import {
   type SessionRole,
 } from "@collab-editor/protocol";
 import { InMemoryRateLimiter } from "./rateLimiter.js";
+import { metrics } from "./metrics.js";
 
 /** Server-side ceiling (§9.3-9.5 enforcement point 3): "a server-side ceiling that DROPS excess, never queues." 20/s per session, matching the client's own hard cap (§9.3 point 2) — this is the backstop for a client that ignores or bypasses its own two enforcement points, not the primary mechanism. */
 const PRESENCE_SERVER_RULE = { max: 20, windowMs: 1000 };
@@ -123,6 +124,9 @@ export class PresenceRoom {
     const participant = this.participants.get(sessionId);
     if (!participant) return;
     if (!this.rateLimiter.consume(`presence:${sessionId}`, PRESENCE_SERVER_RULE, nowMs)) {
+      // Runbook "Queues" metric group: presence.shed_count -- this IS the server-side ceiling
+      // shedding an update, not an error (see this method's own doc comment above).
+      metrics.counter("presence.shed_count").inc();
       return; // dropped, not queued (§9.3-9.5 enforcement point 3)
     }
     const frame = encodePresenceFrame(
@@ -130,6 +134,10 @@ export class PresenceRoom {
       { direction: "serverOrigin" },
     );
     this.broadcastExcept(sessionId, frame);
+    // Runbook "Latency" metric group: presence.latency_p95 -- server-side receive-to-broadcast
+    // processing time (there is no client-supplied send timestamp on the wire to measure the
+    // true end-to-end figure against, API Spec §3.8).
+    metrics.histogram("presence.latency").record(Date.now() - nowMs);
   }
 
   private broadcastExcept(exceptSessionId: string, frame: Uint8Array): void {

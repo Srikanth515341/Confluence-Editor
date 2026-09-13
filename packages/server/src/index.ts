@@ -60,7 +60,12 @@ export {
   startAuditScheduler,
   type AuditScheduler,
 } from "./auditScheduler.js";
-export { startGcScheduler, runOneDocument as runOneGcCycle, type GcScheduler } from "./gcScheduler.js";
+export {
+  startGcScheduler,
+  runOneDocument as runOneGcCycle,
+  type GcScheduler,
+  type GcRuntimeControl,
+} from "./gcScheduler.js";
 export {
   startOfflineWindowScheduler,
   runOneDocument as runOneOfflineWindowSweep,
@@ -186,7 +191,7 @@ import { createPool } from "./db/pool.js";
 import { PostgresOperationStore } from "./db/operationStore.js";
 import { createCollabServer } from "./server.js";
 import { startAuditScheduler } from "./auditScheduler.js";
-import { startGcScheduler } from "./gcScheduler.js";
+import { startGcScheduler, type GcRuntimeControl } from "./gcScheduler.js";
 
 // Only start listening when this module is run directly (`node dist/index.js`
 // or `tsx src/index.ts`, Phase 14's `pnpm --filter @collab-editor/server run
@@ -209,6 +214,10 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   // two separate connection pools to the same database.
   const pool = createPool(config.databaseUrl);
   const operationStore = new PostgresOperationStore(pool);
+  // Phase 37 `./admin gc --disable-all`/`--status`/`--run-once` — ONE shared instance, threaded
+  // into both the scheduler below AND the HTTP admin surface (httpApp.ts's `/v1/admin/gc/*`
+  // routes) — see GcRuntimeControl's own doc comment for why it must be the same object.
+  const gcControl: GcRuntimeControl = { enabled: true };
   const server = createCollabServer({
     operationStore,
     auth: { pool, authConfig: config.auth },
@@ -222,6 +231,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     // `offlineWindow` doc comment for why it's treated differently from GC/audit below); this is
     // just threading the REAL config through instead of leaving it at the generous default.
     offlineWindow: config.offlineWindow,
+    adminGc: { gcConfig: config.gc, control: gcControl },
   });
   void server.listen(config.port);
   // Phase 18: the continuously-running production control — audits every currently-open
@@ -231,7 +241,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   startAuditScheduler(server.gateway);
   // Phase 21: tombstone garbage collection — same "only the direct-run block starts this"
   // reasoning as the audit scheduler immediately above.
-  startGcScheduler(server.gateway, config.gc);
+  startGcScheduler(server.gateway, config.gc, gcControl);
   // Phase 24/30's offline-window sweep is NO LONGER started here — `createCollabServer()` itself
   // now starts it unconditionally (structurally impossible to construct a server without it),
   // using the real `config.offlineWindow` passed in above. Starting it a second time here would

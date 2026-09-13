@@ -34,6 +34,11 @@ import {
 } from "./documentService.js";
 import { getUserRole, type DocumentRole } from "./db/documentStore.js";
 import type { InMemoryTicketStore } from "./ticketStore.js";
+import type { GcConfig } from "./config.js";
+import type { GcRuntimeControl } from "./gcScheduler.js";
+import { runOneDocument as runOneGcCycle } from "./gcScheduler.js";
+import { metrics, registerAllKnownMetricNames } from "./metrics.js";
+import { dashboardHtml } from "./dashboardHtml.js";
 
 /**
  * Phase 28/29 (API Spec §4.7/§4.8/§3.6.9: "pushes PERMISSION_CHANGED to every open session for
@@ -111,6 +116,14 @@ export interface HttpAppDeps {
     readonly authConfig: AuthConfig;
     readonly ticketStore: InMemoryTicketStore;
   };
+  /**
+   * Phase 37 `./admin gc --status`/`--run-once`/`--disable-all` — see
+   * `CreateCollabServerDeps.adminGc`'s own doc comment (server.ts) for why this must be the SAME
+   * `GcRuntimeControl` instance `index.ts`'s `startGcScheduler` call is using. Optional — when
+   * absent (every pre-Phase-37 test), the `/v1/admin/gc/*` routes are simply never mounted, the
+   * same "an unmounted route just 404s" pattern `authDeps` already established.
+   */
+  readonly adminGc?: { readonly gcConfig: GcConfig; readonly control: GcRuntimeControl };
 }
 
 /** Builds the exact `Set-Cookie` value API Spec §4.1/§4.2 requires: `HttpOnly; Secure; SameSite=Strict; Path=/v1/auth/refresh`. `maxAgeSeconds: 0` (logout, or any dead-end auth failure) clears the cookie in every real browser — the standard "expire a cookie" idiom, since there is no separate "delete cookie" primitive in the Set-Cookie spec itself. */
@@ -900,5 +913,321 @@ export function createHttpApp(deps: HttpAppDeps): Express {
       tombstoneCountAlertThreshold: status.circuitBreakerConfig.tombstoneCountAlertThreshold,
     });
   });
+
+  mountMetricsAndAdminRoutes(app, deps);
   return app;
+}
+
+/**
+ * Phase 37 — the metrics JSON endpoint, the dashboard HTML page, the client RUM beacon receiver,
+ * and the HTTP admin surface (materialize/freeze/unfreeze/rebuild/doc-stats/gc-control) six of
+ * the Runbook §7.6 admin commands actually need — the other six (replay/bisect/extract-case/
+ * audit, which are DB-direct per Phase 18's own design, and reconstruct/deploy-history, which are
+ * legitimately not-yet-implemented stubs for Phases 40/39) never touch this file at all. None of
+ * these routes are behind `requireAuth` — the same "no security concern yet, nothing exposed
+ * publicly" stance every other diagnostic endpoint in this file already carries
+ * (`/gc-status`/`/audit-runs`/`/security-status`/`/replay*`) — an operator-only surface, not a
+ * user-facing one.
+ */
+function mountMetricsAndAdminRoutes(app: Express, deps: HttpAppDeps): void {
+  registerAllKnownMetricNames();
+  const getCoordinators = deps.getCoordinators;
+
+  /**
+   * Runbook "Documents"/"Convergence"/"GC"/"Authz" metric groups — computed ON READ, aggregated
+   * across every currently-open coordinator (see metrics.ts's own header comment for why these
+   * live here, not in the registry, as a second source of truth). `doc.structure_size`/
+   * `doc.tombstone_ratio` are SUMMED/AVERAGED across documents (a single-number dashboard tile,
+   * not a per-document breakdown — `/v1/admin/documents/:id/doc-stats` below is where a specific
+   * document's own numbers live). `audit.minutes_since_last_successful_run`/
+   * `gc.minutes_since_last_success` report the WORST (most stale) value across documents — the
+   * whole point of both metrics is "is anything silently broken," and averaging away one broken
+   * document's own signal would defeat that.
+   */
+  function computeAggregateDocumentMetrics(): Record<string, number | null> {
+    const coordinators = Array.from(getCoordinators().values());
+    const nowMs = Date.now();
+    let totalStructureSize = 0;
+    let totalTombstones = 0;
+    let auditMismatchCount = 0;
+    let maxAuditMinutesSinceSuccess: number | null = null;
+    let maxGcMinutesSinceSuccess: number | null = null;
+    let maxGcFrontierLagSeconds: number | null = null;
+    let maxAuthzCacheAgeMs: number | null = null;
+    for (const c of coordinators) {
+      const stats = c.engine.stats();
+      totalStructureSize += stats.totalElements;
+      totalTombstones += stats.tombstones;
+      auditMismatchCount += c.auditMismatchCount;
+      // Runbook: "audit.minutes_since_last_successful_run: an audit that stopped running reports
+      // zero mismatches, which looks identical to perfect health. The absence of the alert is not
+      // evidence."
+      const auditMinutes = c.lastAuditSuccessAt
+        ? (nowMs - c.lastAuditSuccessAt.getTime()) / 60_000
+        : Number.POSITIVE_INFINITY; // never audited at all — worse than any real elapsed time.
+      maxAuditMinutesSinceSuccess = Math.max(maxAuditMinutesSinceSuccess ?? 0, auditMinutes);
+      // Runbook: "gc.minutes_since_last_success: GC's failure mode is SILENT. If the job stops,
+      // nothing errors; memory just grows and a document is slow weeks later for reasons nobody
+      // connects to a dead cron. Monitor liveness, not error rate."
+      const gcMinutes = c.lastGcSuccessAt
+        ? (nowMs - c.lastGcSuccessAt.getTime()) / 60_000
+        : Number.POSITIVE_INFINITY;
+      maxGcMinutesSinceSuccess = Math.max(maxGcMinutesSinceSuccess ?? 0, gcMinutes);
+      if (c.frontierLastAdvancedAt) {
+        const lagSeconds = (nowMs - c.frontierLastAdvancedAt.getTime()) / 1_000;
+        maxGcFrontierLagSeconds = Math.max(maxGcFrontierLagSeconds ?? 0, lagSeconds);
+      }
+      const cacheAgeMs = c.maxAuthDecisionCacheAgeMs(nowMs);
+      if (cacheAgeMs !== null) {
+        maxAuthzCacheAgeMs = Math.max(maxAuthzCacheAgeMs ?? 0, cacheAgeMs);
+      }
+      // Runbook "Queues" metric group — every open session's own per-queue backlog, summed across
+      // every document this process currently has open.
+      for (const session of c.allSessions()) {
+        const lengths = session.queues.lengths;
+        metrics.gauge("queue.ops_depth").inc(lengths.ops);
+        metrics.gauge("queue.presence_depth").inc(lengths.presence);
+      }
+      // Runbook "Documents" metric group: engine.replica_bytes_p95 — no real client RUM sample of
+      // its own resident memory exists server-side, so this is a disclosed, order-of-magnitude
+      // ESTIMATE (each node's own JS object graph, JSON-stringified, as a rough proxy for its
+      // wire/memory footprint) rather than a real client-measured figure.
+      if (stats.totalElements > 0) {
+        const sampleSize = Math.min(50, c.engine.nodes.length);
+        let sampledBytes = 0;
+        for (let i = 0; i < sampleSize; i++) {
+          sampledBytes += Buffer.byteLength(JSON.stringify(c.engine.nodes[i]));
+        }
+        const avgBytesPerNode = sampleSize > 0 ? sampledBytes / sampleSize : 0;
+        metrics.histogram("engine.replica_bytes").record(avgBytesPerNode * stats.totalElements);
+      }
+    }
+    // `queue.ops_depth`/`queue.presence_depth` above are reset to 0 first (a fresh gauge each
+    // request would double-count on the second call otherwise) — done via `.set(0)` before the
+    // loop reads real values would be cleaner, but the gauge is shared with nothing else, so
+    // resetting right here, once, before aggregating, is equivalent and keeps the loop itself
+    // simple.
+    return {
+      "doc.structure_size": totalStructureSize,
+      "doc.tombstone_ratio": totalStructureSize === 0 ? 0 : totalTombstones / totalStructureSize,
+      "audit.mismatch_count": auditMismatchCount,
+      "audit.minutes_since_last_successful_run":
+        maxAuditMinutesSinceSuccess === null || !Number.isFinite(maxAuditMinutesSinceSuccess)
+          ? null
+          : maxAuditMinutesSinceSuccess,
+      "gc.minutes_since_last_success":
+        maxGcMinutesSinceSuccess === null || !Number.isFinite(maxGcMinutesSinceSuccess)
+          ? null
+          : maxGcMinutesSinceSuccess,
+      "gc.frontier_lag_seconds": maxGcFrontierLagSeconds,
+      "authz.cache_age_max": maxAuthzCacheAgeMs,
+    };
+  }
+
+  /** Runbook dashboard/alerting JSON payload — every metric this phase's own table names, in one flat object. */
+  app.get("/v1/metrics", (_req, res) => {
+    metrics.gauge("queue.ops_depth").set(0);
+    metrics.gauge("queue.presence_depth").set(0);
+    const aggregate = computeAggregateDocumentMetrics();
+    res.status(200).json({ ...metrics.snapshot(), ...aggregate });
+  });
+
+  /**
+   * Phase 37 — the client-side RUM beacon receiver (Scope-IN: "the RUM beacon for local echo
+   * (client-only, batched)"). Accepts a batch of `{name, value}` samples and records each
+   * directly into the SAME shared registry every server-side metric uses — a client-reported
+   * `binding.reconciliation` counter increment and a server-reported `authz.op_rejected_count`
+   * increment are both just entries in one flat dashboard. No auth (an unauthenticated beacon is
+   * the same "no security concern yet" stance as every other route in this file) and no
+   * validation beyond basic shape — a malformed batch is silently dropped, never a 500, since a
+   * broken beacon must never be capable of breaking the client it's reporting from.
+   */
+  app.post("/v1/rum", (req, res) => {
+    const body = (req.body ?? {}) as { samples?: unknown };
+    if (Array.isArray(body.samples)) {
+      for (const sample of body.samples) {
+        if (
+          typeof sample !== "object" ||
+          sample === null ||
+          typeof (sample as { name?: unknown }).name !== "string" ||
+          typeof (sample as { value?: unknown }).value !== "number"
+        ) {
+          continue;
+        }
+        const { name, kind } = sample as { name: string; kind?: unknown };
+        const value = (sample as { value: number }).value;
+        if (kind === "counter") {
+          metrics.counter(name).inc(value);
+        } else {
+          // Default to histogram — every RUM metric this phase names (binding.reconciliation,
+          // binding.desync_error, binding.composition_watchdog_fired,
+          // binding.indexeddb_unavailable, local-echo latency) is either a per-event COUNT (which
+          // a histogram of 1s still lets the dashboard sum via `_count`) or a genuine latency
+          // sample — a histogram serves both without the beacon needing to know which.
+          metrics.histogram(name).record(value);
+        }
+      }
+    }
+    res.status(204).end();
+  });
+
+  /** The dashboard itself — a single static HTML page, reachable from a phone browser on the same network as this server. See dashboardHtml.ts's own header comment for the tooling choice. */
+  app.get("/dashboard", (_req, res) => {
+    res.status(200).type("html").send(dashboardHtml);
+  });
+
+  // --- Admin HTTP surface (Runbook §7.6) — the commands that need LIVE in-memory coordinator
+  // state a standalone, DB-direct CLI process (scripts/admin.ts) cannot reach on its own. ---
+
+  app.get("/v1/admin/documents/:documentId/materialize", (req, res) => {
+    const coordinator = getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    res.status(200).json({ text: coordinator.engine.text() });
+  });
+
+  app.get("/v1/admin/documents/:documentId/doc-stats", (req, res) => {
+    const coordinator = getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    const stats = coordinator.engine.stats();
+    res.status(200).json({
+      structureSize: stats.totalElements,
+      tombstones: stats.tombstones,
+      tombstoneRatio: stats.totalElements === 0 ? 0 : stats.tombstones / stats.totalElements,
+      // Compression is measured against the real SNAPSHOT block wire format
+      // (packages/protocol/src/snapshotBody.test.ts, Phase 30 SEC-09) offline, against a specific
+      // fixture shape (sequential typing vs. scattered edits) — not something this live endpoint
+      // recomputes on every call, since it would mean re-encoding the whole document per request.
+      compressionNote:
+        "not computed live here — see packages/protocol/src/snapshotBody.test.ts for real, measured compression numbers under Fugue's chain block format",
+      sessionCount: coordinator.sessionCount,
+    });
+  });
+
+  app.post("/v1/admin/documents/:documentId/freeze", (req, res) => {
+    const coordinator = getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    coordinator.manualFreeze();
+    res.status(200).json({ documentId: req.params.documentId, manuallyFrozen: true });
+  });
+
+  app.post("/v1/admin/documents/:documentId/unfreeze", (req, res) => {
+    const coordinator = getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    coordinator.manualUnfreeze();
+    res.status(200).json({ documentId: req.params.documentId, manuallyFrozen: false });
+  });
+
+  app.post("/v1/admin/documents/:documentId/rebuild", async (req, res) => {
+    const coordinator = getCoordinators().get(req.params.documentId);
+    if (!coordinator) {
+      res.status(404).json({ error: "document not found" });
+      return;
+    }
+    try {
+      const result = await coordinator.rebuildFromLog();
+      res.status(200).json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // --- ./admin reconstruct --doc --seq (Phase 40, not yet built) and ./admin deploy-history
+  // (Phase 39, not yet built) — the command SHAPE is implemented now, per this phase's own
+  // explicit instruction ("implement the command shape now but it may legitimately return 'not
+  // yet implemented' until that phase lands; document this explicitly"). Both return 501, never
+  // 404 — the ROUTE exists and is correctly reachable; the CAPABILITY behind it doesn't yet. ---
+
+  app.get("/v1/admin/documents/:documentId/reconstruct", (req, res) => {
+    if (req.query.seq === undefined) {
+      res.status(400).json({ error: "?seq= is required" });
+      return;
+    }
+    res.status(501).json({
+      error: "not_yet_implemented",
+      detail: "Historical-state reconstruction at an arbitrary seq is Phase 40's own job — this route's shape exists now (Phase 37) so the Runbook's admin table is fully wired, but the capability behind it doesn't exist yet.",
+    });
+  });
+
+  app.get("/v1/admin/deploy-history", (_req, res) => {
+    res.status(501).json({
+      error: "not_yet_implemented",
+      detail: "Deploy-timestamp tracking is Phase 39's own job — this route's shape exists now (Phase 37) so the Runbook's admin table is fully wired, but the capability behind it doesn't exist yet.",
+    });
+  });
+
+  // --- GC control (./admin gc --status/--run-once/--disable-all) — only mounted when this
+  // server was constructed with the SAME GcRuntimeControl instance index.ts's own scheduler is
+  // using (see HttpAppDeps.adminGc's own doc comment for why this can't just be a fresh object). ---
+  if (deps.adminGc) {
+    const { gcConfig, control } = deps.adminGc;
+    app.get("/v1/admin/gc/status", (req, res) => {
+      const documentId = typeof req.query.doc === "string" ? req.query.doc : undefined;
+      const base = { schedulerEnabled: control.enabled };
+      if (!documentId) {
+        res.status(200).json(base);
+        return;
+      }
+      const coordinator = getCoordinators().get(documentId);
+      if (!coordinator) {
+        res.status(404).json({ error: "document not found" });
+        return;
+      }
+      const stats = coordinator.engine.stats();
+      const nowMs = Date.now();
+      res.status(200).json({
+        ...base,
+        lastAttemptAt: coordinator.lastGcAttemptAt?.toISOString() ?? null,
+        lastSuccessAt: coordinator.lastGcSuccessAt?.toISOString() ?? null,
+        minutesSinceLastSuccess: coordinator.lastGcSuccessAt
+          ? (nowMs - coordinator.lastGcSuccessAt.getTime()) / 60_000
+          : null,
+        nodesCollectedLastCycle: coordinator.lastGcCollectedCount,
+        totalElements: stats.totalElements,
+        tombstones: stats.tombstones,
+      });
+    });
+
+    app.post("/v1/admin/gc/run-once", async (req, res) => {
+      const documentId = typeof req.body?.doc === "string" ? req.body.doc : req.query.doc;
+      if (typeof documentId !== "string") {
+        res.status(400).json({ error: "doc is required" });
+        return;
+      }
+      const coordinator = getCoordinators().get(documentId);
+      if (!coordinator) {
+        res.status(404).json({ error: "document not found" });
+        return;
+      }
+      // Deliberately bypasses `control.enabled` — an explicit, direct "run one cycle right now"
+      // command must work even while the recurring schedule is disabled (see GcRuntimeControl's
+      // own doc comment).
+      await runOneGcCycle(coordinator, gcConfig);
+      res.status(200).json({
+        documentId,
+        nodesCollected: coordinator.lastGcCollectedCount,
+      });
+    });
+
+    app.post("/v1/admin/gc/disable-all", (_req, res) => {
+      control.enabled = false;
+      res.status(200).json({ schedulerEnabled: false });
+    });
+
+    app.post("/v1/admin/gc/enable-all", (_req, res) => {
+      control.enabled = true;
+      res.status(200).json({ schedulerEnabled: true });
+    });
+  }
 }
