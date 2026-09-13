@@ -12,6 +12,31 @@ production by a log-replay integrity audit.
 
 ## Status
 
+**Phase 38 — Load characterization and the M7 curve.** PRD M7's own
+framing: "measured, not asserted." A real load harness
+(`packages/testkit/src/load/loadHarness.ts`) drives synthetic editor/
+viewer clients over real WebSocket connections against a real, in-process
+server, at a real 50,000-character baseline document, with a real
+NTP-style clock-offset correction (Test Plan §4.2) computing M4's own
+mint-to-visible latency. The dominant finding, measured at every
+concurrency level: **building that one ordinary-sized document took 188
+seconds, and a single new client joining it took 17.5 to 64 seconds** —
+confirmed to be pure, single-threaded engine-apply cost (the whole server
+process is unresponsive for the entire duration), not fanout — the
+single most concrete evidence yet for the project's own already-disclosed
+Fugue O(N²) redesign item. The measured M7 curve: p95 remote-visibility
+latency holds well under the 250ms target through 4 concurrent editors
+(49.0ms, 62.0ms) but **explodes to 23,958.5ms at 8 editors** — the
+measured level at which PRD A-4's own "holds through 8 editors" target is
+missed, driven by the identical seeding-cost mechanism, whose signature is
+already visible in level 4's own 20,626.5ms p99 tail. Correctness held at
+every level; no multi-node work is warranted (the bottleneck is
+confirmed local CPU cost, not network/fanout). See
+[`CLAUDE.md`](./CLAUDE.md)'s Phase 38 entry and
+[`docs/benchmarks.md`](./docs/benchmarks.md) for the full curve, the
+disclosed reduced-duration methodology, and the exact command to run the
+full, literal 10-minute/level sweep (including levels 16/32) separately.
+
 **Phase 37 — Structured logging and metrics.** Every metric the Rollout
 & Runbook depends on is now real and live: a lightweight, in-process
 metrics registry (no Prometheus/Grafana — a solo/portfolio-appropriate

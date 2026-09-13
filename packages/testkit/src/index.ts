@@ -13,3 +13,12 @@ export {
   type FaultRelay,
   type FaultRelayOptions,
 } from "./faultrelay/faultRelay.js";
+export {
+  computeRtt,
+  computeOffset,
+  estimateClockOffset,
+  ClockOffsetTracker,
+  ClockOffsetInsufficientSamplesError,
+  type ClockOffsetSample,
+  type ClockOffsetEstimate,
+} from "./load/clockOffset.js";

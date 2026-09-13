@@ -334,7 +334,7 @@ describe("SyncClient — sequence gap handling (API Spec §3.7.5)", () => {
     for (let i = 0; i < 5; i++) {
       vi.advanceTimersByTime(PING_INTERVAL_MS);
       ws.triggerMessage(
-        encodeControlFrame({ kind: "pong", clientTimeMs: 0, serverSeq: 0 }),
+        encodeControlFrame({ kind: "pong", clientTimeMs: 0, serverSeq: 0, serverTimeMs: 0 }),
       );
     }
     expect(ws.closed).toBe(false);
